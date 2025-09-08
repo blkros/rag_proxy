@@ -1,0 +1,1 @@
+{ "model":"qwen3-30b-a3b-fp8", "messages":[{"role":"user","content":"신청방법 요약"}] }

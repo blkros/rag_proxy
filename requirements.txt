@@ -1,0 +1,21 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.3,<3.0
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-huggingface
+sentence-transformers
+faiss-cpu
+beautifulsoup4
+lxml
+pypdf
+python-pptx
+openpyxl
+chardet
+pandas==2.3.2
+python-multipart
