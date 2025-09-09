@@ -14,6 +14,7 @@ import faiss
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
+from src.config import settings
 
 
 def _drop_think(text: str) -> str:
@@ -47,11 +48,11 @@ def build_rag_chain(data_path: str = "data/민생.csv",
                     index_dir: str = "faiss_index") -> Tuple:
     load_dotenv(override=True)
 
-    # 1) LLM (vLLM/OpenAI 호환)
+    # 1) LLM
     llm = ChatOpenAI(
-        base_url=os.environ["OPENAI_BASE_URL"].rstrip("/"),
-        api_key=os.environ.get("OPENAI_API_KEY", "local-any"),
-        model=os.environ["OPENAI_MODEL"],      # 예: qwen3-30b-a3b-fp8
+        base_url=settings.OPENAI_BASE_URL.rstrip("/"),
+        api_key=settings.OPENAI_API_KEY,
+        model=settings.OPENAI_MODEL,
         temperature=0,
     )
 
@@ -69,12 +70,10 @@ def build_rag_chain(data_path: str = "data/민생.csv",
         for c in parts:
             chunked_docs.append(Document(page_content=c, metadata=d.metadata))
 
-    # 3) 임베딩 + 벡터스토어
-    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-small")
-    DEVICE = os.getenv("EMBEDDING_DEVICE", "cuda")
+    # 3) 임베딩
     emb = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": DEVICE},
+        model_name=settings.EMBEDDING_MODEL,
+        model_kwargs={"device": settings.EMBEDDING_DEVICE},
         encode_kwargs={"batch_size": 64, "normalize_embeddings": True}
     )
 

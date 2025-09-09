@@ -8,6 +8,9 @@ import shutil, os, logging, re
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document  # 파이프라인은 그대로 둠
 from src.loaders import load_docs_any
+from fastapi.middleware.cors import CORSMiddleware
+from src.config import settings
+import asyncio, hashlib
 
 # empty FAISS 빌드를 위한 보조들
 import faiss
@@ -20,6 +23,13 @@ META_PAT  = re.compile(r"(주제|개요|요약|무엇|무슨\s*내용)", re.I)
 TITLE_PAT = re.compile(r"(제목|title|문서명|파일명)", re.I)
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 logger = logging.getLogger("rag-proxy")
 log = logging.getLogger(__name__)
 
@@ -28,13 +38,13 @@ retriever = None
 vectorstore: Optional[FAISSStore] = None
 drop_think_fn = None
 
-INDEX_DIR = os.getenv("INDEX_DIR", "faiss_index")
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
-DATA_CSV = os.getenv("DATA_CSV", "data/민생.csv")  # 없으면 빈 인덱스로 시작
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-small")
-EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cpu")
+INDEX_DIR = settings.INDEX_DIR
+UPLOAD_DIR = settings.UPLOAD_DIR
+CHUNK_SIZE = settings.CHUNK_SIZE
+CHUNK_OVERLAP = settings.CHUNK_OVERLAP
+EMBEDDING_MODEL = settings.EMBEDDING_MODEL
+EMBEDDING_DEVICE = settings.EMBEDDING_DEVICE
+DATA_CSV = settings.DATA_CSV
 
 def ensure_dirs():
     Path(INDEX_DIR).mkdir(parents=True, exist_ok=True)
@@ -61,6 +71,40 @@ def _empty_faiss() -> FAISSStore:
 def _reload_retriever():
     global retriever
     retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 5, "fetch_k": 40})
+
+# 인덱싱 동시성 방지 락
+index_lock = asyncio.Lock()
+
+# 문서 고유 ID (중복 방지용)
+def _doc_id(d: Document) -> str:
+    src   = str(d.metadata.get("source", ""))
+    page  = str(d.metadata.get("page", ""))
+    kind  = str(d.metadata.get("kind", ""))
+    chunk = str(d.metadata.get("chunk", ""))
+    # 내용 기반 해시를 섞어 동일 page/kind라도 서로 다르게
+    h = hashlib.sha1((d.page_content or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"{src}|p{page}|k{kind}|c{chunk}|h{h}"
+
+def _upsert_docs_no_dup(docs: List[Document]) -> int:
+    global vectorstore
+    if not docs:
+        return 0
+    exist = set(getattr(vectorstore.docstore, "_dict", {}).keys())
+    batch = set()  # ← 한 번의 add_documents 안에서의 중복을 걸러냄
+    new_docs, ids = [], []
+    for d in docs:
+        did = _doc_id(d)
+        if did in exist or did in batch:
+            continue
+        new_docs.append(d)
+        ids.append(did)
+        batch.add(did)
+    if not new_docs:
+        return 0
+    vectorstore.add_documents(new_docs, ids=ids)
+    vectorstore.save_local(INDEX_DIR)
+    _reload_retriever()
+    return len(new_docs)
 
 def build_openai_messages(question: str, k: int = 5) -> List[Dict[str, Any]]:
     global retriever, vectorstore
@@ -187,6 +231,59 @@ async def upload(file: UploadFile = File(...), overwrite: bool = Form(False)):
         await file.close()
     return {"saved": {"filename": file.filename, "path": str(dest), "bytes": dest.stat().st_size}}
 
+@app.post("/ingest")
+async def ingest(
+    file: UploadFile = File(...),
+    overwrite: bool = Form(False),
+    parser: str = Form("auto"),
+):
+    """파일 저장 + 파싱/청킹 + 임베딩/업서트까지 원샷."""
+    global vectorstore
+    if vectorstore is None:
+        raise HTTPException(500, "vectorstore is not ready.")
+
+    ensure_dirs()
+    dest = Path(UPLOAD_DIR) / file.filename
+    if dest.exists() and not overwrite:
+        raise HTTPException(409, f"File exists: {dest}. Set overwrite=true")
+
+    try:
+        with dest.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+    finally:
+        await file.close()
+
+    # 로딩/청킹
+    try:
+        docs = load_docs_any(
+            dest,
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            parser=parser,
+        )
+        if not docs:
+            raise HTTPException(400, f"no docs parsed from {dest}")
+    except ValueError as ve:
+        raise HTTPException(415, str(ve))
+    except Exception as e:
+        raise HTTPException(500, f"parse failed: {e}")
+
+    # 업서트 (중복 방지 + 락)
+    try:
+        async with index_lock:
+            before = len(vectorstore.docstore._dict)
+            added = _upsert_docs_no_dup(docs)
+            after = len(vectorstore.docstore._dict)
+        return {
+            "saved": {"path": str(dest), "bytes": dest.stat().st_size},
+            "indexed": len(docs),
+            "added": added,
+            "doc_total": after,
+            "parser": parser,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"index failed: {e}")
+
 @app.post("/update")
 async def update_index(payload: dict):
     """
@@ -224,17 +321,16 @@ async def update_index(payload: dict):
     except Exception as e:
         raise HTTPException(500, f"load failed: {e}")
 
-    # 2) 업서트 + 저장 + 리트리버 갱신
+     # 2) 업서트 + 저장 + 리트리버 갱신
     try:
-        before = len(vectorstore.docstore._dict)
-        vectorstore.add_documents(docs)
-        vectorstore.save_local(INDEX_DIR)
-        _reload_retriever()
-        after = len(vectorstore.docstore._dict)
+        async with index_lock:
+            before = len(vectorstore.docstore._dict)
+            added = _upsert_docs_no_dup(docs)
+            after = len(vectorstore.docstore._dict)
         return {
             "ok": True,
             "indexed": len(docs),
-            "added": after - before,
+            "added": added,
             "doc_total": after,
             "source": str(path),
             "chunks": CHUNK_SIZE,
@@ -263,8 +359,16 @@ async def delete_index(payload: Optional[dict] = None):
 
     if mode == "all":
         try:
-            if Path(INDEX_DIR).exists():
-                shutil.rmtree(INDEX_DIR)
+            root = Path(INDEX_DIR)
+            if root.exists():
+                for child in root.iterdir():
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        try:
+                            child.unlink()
+                        except Exception:
+                            pass
             vectorstore = _empty_faiss()
             vectorstore.save_local(INDEX_DIR)
             _reload_retriever()

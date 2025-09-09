@@ -10,6 +10,7 @@ import chardet
 from pypdf import PdfReader
 from pptx import Presentation
 import openpyxl
+from src.config import settings
 
 # -----------------------------
 # 공통: 청킹
@@ -268,7 +269,7 @@ def _load_pdf_auto(path: Path) -> List[Document]:
                     ))
 
     # 3) 표가 거의 없으면 기본 파서와 병합
-    threshold = int(os.getenv("PDF_TABLE_THRESHOLD", "5"))
+    threshold = settings.PDF_TABLE_THRESHOLD
     if table_sentence_cnt < threshold:
         legacy = load_pdf(path)
         docs = _dedup(legacy + docs)
