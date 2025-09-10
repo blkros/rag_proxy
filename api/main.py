@@ -6,11 +6,12 @@ from pathlib import Path
 import shutil, os, logging, re
 
 from src.utils import proxy_get, call_chat_completions, drop_think
-from src.rag_pipeline import build_rag_chain, Document  # 파이프라인은 그대로 둠
+from src.rag_pipeline import build_rag_chain, Document
 from src.loaders import load_docs_any
 from fastapi.middleware.cors import CORSMiddleware
 from src.config import settings
 import asyncio, hashlib
+from collections import Counter
 
 # empty FAISS 빌드를 위한 보조들
 import faiss
@@ -56,6 +57,26 @@ def _make_embedder() -> HuggingFaceEmbeddings:
         model_kwargs={"device": EMBEDDING_DEVICE},
         encode_kwargs={"normalize_embeddings": True}
     )
+
+def _load_or_init_vectorstore() -> FAISSStore:
+    try:
+        faiss_file = Path(INDEX_DIR) / "index.faiss"
+        pkl_file   = Path(INDEX_DIR) / "index.pkl"
+        if faiss_file.exists() and pkl_file.exists():
+            emb = _make_embedder()
+            vs = FAISSStore.load_local(
+                INDEX_DIR,
+                embeddings=emb,
+                allow_dangerous_deserialization=True
+            )
+            log.info("Loaded existing FAISS index from %s", INDEX_DIR)
+            return vs
+    except Exception as e:
+        log.warning("load_local failed, starting empty: %s", e)
+    # 없거나 로드 실패 → 빈 인덱스
+    vs = _empty_faiss()
+    log.info("Initialized empty FAISS index")
+    return vs
 
 def _empty_faiss() -> FAISSStore:
     emb = _make_embedder()
@@ -185,8 +206,7 @@ def _startup():
             )
         else:
             # 빈 인덱스 (PDF 등 업로드 후 /update로 채우기)
-            vectorstore = _empty_faiss()
-            vectorstore.save_local(INDEX_DIR)
+            vectorstore = _load_or_init_vectorstore()
         _reload_retriever()
         logger.info("Startup complete. Index at %s", INDEX_DIR)
     except Exception as e:
@@ -391,3 +411,102 @@ async def delete_index(payload: Optional[dict] = None):
             raise HTTPException(500, f"delete by source failed: {e}")
 
     raise HTTPException(400, "Invalid payload. Use {'mode':'all'} or {'source':'uploads/파일.ext'}.")
+
+@app.get("/index/stats")
+def index_stats():
+    """인덱스 요약(총 문서/벡터 수, 차원, 소스별/종류별 카운트)"""
+    if vectorstore is None:
+        raise HTTPException(500, "vectorstore is not ready.")
+    try:
+        ds = getattr(vectorstore, "docstore", None)
+        dct = getattr(ds, "_dict", {}) if ds else {}
+        total_docs = len(dct)
+
+        by_source = Counter(str(d.metadata.get("source","")) for d in dct.values())
+        by_kind   = Counter(str(d.metadata.get("kind","chunk")) for d in dct.values())
+
+        # faiss index 통계
+        idx = getattr(vectorstore, "index", None)
+        dim = int(getattr(idx, "d", 0)) if idx is not None else None
+        ntotal = int(getattr(idx, "ntotal", 0)) if idx is not None else None
+
+        return {
+            "doc_total": total_docs,
+            "vector_total": ntotal,
+            "dim": dim,
+            "sources": [{"source": s or "(unknown)", "count": c} for s, c in by_source.most_common()],
+            "kinds": [{"kind": k, "count": c} for k, c in by_kind.most_common()],
+            "index_dir": INDEX_DIR,
+            "uploads_dir": UPLOAD_DIR,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"stats failed: {e}")
+
+@app.get("/index/sources")
+def index_sources():
+    """소스 파일(예: uploads/test.pdf)별 청크 수 목록"""
+    if vectorstore is None:
+        raise HTTPException(500, "vectorstore is not ready.")
+    ds = vectorstore.docstore._dict
+    by_source = Counter(str(d.metadata.get("source","")) for d in ds.values())
+    items = [{"source": s or "(unknown)", "count": c} for s, c in by_source.most_common()]
+    return {"total_sources": len(items), "items": items}
+
+@app.get("/index/list")
+def index_list(
+    limit: int = 50,
+    offset: int = 0,
+    source: Optional[str] = None,
+    kind: Optional[str] = None,
+    contains: Optional[str] = None,
+):
+    """개별 청크 미리보기(페이지네이션/필터)"""
+    if vectorstore is None:
+        raise HTTPException(500, "vectorstore is not ready.")
+    ds = vectorstore.docstore._dict
+
+    rows = []
+    for doc_id, doc in ds.items():
+        src  = str(doc.metadata.get("source",""))
+        knd  = doc.metadata.get("kind", "chunk")
+        text = doc.page_content or ""
+
+        if source and src != source:
+            continue
+        if kind and knd != kind:
+            continue
+        if contains and contains not in text:
+            continue
+
+        rows.append({
+            "id": doc_id,
+            "source": src,
+            "kind": knd,
+            "page": doc.metadata.get("page"),
+            "chars": len(text),
+            "preview": (text[:200] + ("…" if len(text) > 200 else "")),
+        })
+
+    total = len(rows)
+    items = rows[offset: offset + limit]
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
+
+@app.delete("/uploads/reset")
+async def uploads_reset():
+    try:
+        root = Path(UPLOAD_DIR)
+        if not root.exists():
+            return {"status":"ok", "deleted":0}
+        count = 0
+        for child in root.iterdir():
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+                count += 1
+            except Exception:
+                pass
+        return {"status":"ok", "deleted":count}
+    except Exception as e:
+        raise HTTPException(500, f"uploads reset failed: {e}")
