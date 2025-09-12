@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import shutil, os, logging, re
+from fastapi.responses import RedirectResponse
 
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
@@ -510,3 +511,8 @@ async def uploads_reset():
         return {"status":"ok", "deleted":count}
     except Exception as e:
         raise HTTPException(500, f"uploads reset failed: {e}")
+    
+@app.api_route("/query", methods=["POST"], include_in_schema=False)
+async def _alias_query_to_ask():
+    # 307을 써야 POST 본문/메서드가 그대로 유지됩니다.
+    return RedirectResponse(url="/ask", status_code=307)
