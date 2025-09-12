@@ -15,6 +15,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from src.config import settings
+from FlagEmbedding import FlagReranker
+
+
+
 
 
 def _drop_think(text: str) -> str:
@@ -62,8 +66,11 @@ def build_rag_chain(data_path: str = "data/민생.csv",
     if p.exists():
         docs = _load_docs_from_csv(p)
 
-    # (선택) 추가 청킹
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+    # 2-1) 청킹 —  하드코딩 → 설정값 사용
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.CHUNK_SIZE,
+        chunk_overlap=settings.CHUNK_OVERLAP
+    )
     chunked_docs = []
     for d in docs:
         parts = splitter.split_text(d.page_content)
@@ -77,21 +84,46 @@ def build_rag_chain(data_path: str = "data/민생.csv",
         encode_kwargs={"batch_size": 64, "normalize_embeddings": True}
     )
 
+    # 3-1) 벡터스토어
     index_path = Path(index_dir)
     index_path.mkdir(parents=True, exist_ok=True)
     if _has_faiss_files(index_path):
-        # 실제 인덱스 파일이 있을 때만 로드
         vectorstore = FAISS.load_local(index_path, emb, allow_dangerous_deserialization=True)
     elif chunked_docs:
-        # 문서가 있으면 새로 만들어 저장
         vectorstore = FAISS.from_documents(chunked_docs, emb)
         vectorstore.save_local(index_path)
     else:
-        # 문서도, 인덱스 파일도 없으면 '빈 인덱스'로 시작
         vectorstore = _empty_faiss(emb)
         vectorstore.save_local(index_path)
 
-    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 5, "fetch_k": 40})
+    # 3-2) 리트리버 —  파라미터화
+    retriever = vectorstore.as_retriever(
+        search_type=settings.SEARCH_TYPE,
+        search_kwargs={"k": settings.RETRIEVER_K, "fetch_k": settings.RETRIEVER_FETCH_K}
+    )
+
+    # (옵션) 3-3) 재랭커 준비
+    reranker = None
+    if settings.ENABLE_RERANKER:
+        try:
+            reranker = FlagReranker(settings.RERANKER_MODEL, use_fp16=True)
+        except Exception as e:
+            print(f"[RAG] Reranker init failed: {e}; fallback to no rerank")
+            reranker = None
+
+    def _retrieve_and_format(q: str) -> str:
+        docs0 = retriever.invoke(q)
+        docs1 = docs0
+        if reranker:
+            pairs = [(q, d.page_content) for d in docs0]
+            try:
+                scores = reranker.compute_score(pairs, normalize=True)
+                ranked = [d for _, d in sorted(zip(scores, docs0), key=lambda x: x[0], reverse=True)]
+                docs1 = ranked[: settings.RERANKER_TOP_N]
+            except Exception as e:
+                print(f"[RAG] Rerank failed: {e}; using raw retriever")
+                docs1 = docs0
+        return _format_docs(docs1)
 
     # 4) 프롬프트
     prompt = ChatPromptTemplate.from_messages([
@@ -102,9 +134,9 @@ def build_rag_chain(data_path: str = "data/민생.csv",
         ("user", "{question}")
     ])
 
-    # 5) 체인
+    # 5) 체인 —  컨텍스트 생성 함수를 교체
     rag_chain = (
-        {"context": retriever | RunnableLambda(_format_docs),
+        {"context": RunnableLambda(_retrieve_and_format),
          "question": RunnablePassthrough()}
         | prompt
         | llm

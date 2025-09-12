@@ -16,6 +16,12 @@ def _as_list(val: str) -> List[str]:
         return ["*"]
     return [x.strip() for x in raw.split(",") if x.strip()]
 
+def _as_bool(val: str, default=False) -> bool:
+    s = (val or "").strip().lower()
+    if not s:
+        return default
+    return s in {"1","true","yes","y","on"}
+
 @dataclass(frozen=True)
 class Settings:
     # RAG / 인덱스
@@ -24,8 +30,18 @@ class Settings:
     DATA_CSV: str = field(default_factory=lambda: os.getenv("DATA_CSV", "data/민생.csv"))
     CHUNK_SIZE: int = field(default_factory=lambda: int(os.getenv("CHUNK_SIZE", "800")))
     CHUNK_OVERLAP: int = field(default_factory=lambda: int(os.getenv("CHUNK_OVERLAP", "120")))
-    EMBEDDING_MODEL: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-small"))
+    EMBEDDING_MODEL: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-large-instruct"))
     EMBEDDING_DEVICE: str = field(default_factory=lambda: os.getenv("EMBEDDING_DEVICE", "cpu"))  # or cuda
+
+    # 검색 튜닝
+    RETRIEVER_K: int = field(default_factory=lambda: int(os.getenv("RETRIEVER_K", "5")))
+    RETRIEVER_FETCH_K: int = field(default_factory=lambda: int(os.getenv("RETRIEVER_FETCH_K", "40")))
+    SEARCH_TYPE: str = field(default_factory=lambda: os.getenv("SEARCH_TYPE", "mmr"))
+
+    # 재랭커
+    ENABLE_RERANKER: bool = field(default_factory=lambda: _as_bool(os.getenv("ENABLE_RERANKER"), False))
+    RERANKER_MODEL: str = field(default_factory=lambda: os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base"))
+    RERANKER_TOP_N: int = field(default_factory=lambda: int(os.getenv("RERANKER_TOP_N", "5")))
 
     # LLM (vLLM/OpenAI 호환)
     OPENAI_API_KEY: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", "local-anything"))
