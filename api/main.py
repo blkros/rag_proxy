@@ -512,7 +512,39 @@ async def uploads_reset():
     except Exception as e:
         raise HTTPException(500, f"uploads reset failed: {e}")
     
-@app.api_route("/query", methods=["POST"], include_in_schema=False)
-async def _alias_query_to_ask():
-    # 307을 써야 POST 본문/메서드가 그대로 유지됩니다.
-    return RedirectResponse(url="/ask", status_code=307)
+@app.post("/query", include_in_schema=False)
+async def query_compat(payload: dict):
+    """
+    Open WebUI가 호출하는 /query 바디를 /ask 형태로 정규화해 처리.
+    지원 키: question | query | q | messages (OpenAI 포맷)
+    선택 파라미터: k | top_k
+    """
+    q = (payload or {}).get("question") \
+        or (payload or {}).get("query") \
+        or (payload or {}).get("q") \
+        or ""
+
+    # messages 포맷(최근 user 메시지) 지원
+    if (not q.strip()) and isinstance((payload or {}).get("messages"), list):
+        msgs = payload["messages"]
+        for m in reversed(msgs):
+            if m.get("role") == "user" and m.get("content"):
+                q = m["content"]
+                break
+
+    if not q.strip():
+        raise HTTPException(400, "question/query/q/messages is required")
+
+    k = (payload or {}).get("k") or (payload or {}).get("top_k") or 5
+    try:
+        k = int(k)
+    except Exception:
+        k = 5
+
+    msgs = build_openai_messages(q, k=k)
+    res = await call_chat_completions(messages=msgs, temperature=0)
+    try:
+        content = res["choices"][0]["message"]["content"]
+    except Exception:
+        content = str(res)
+    return {"answer": drop_think(content)}
