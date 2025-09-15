@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil, os, logging, re
 from fastapi.responses import RedirectResponse
 from fastapi import Body
+import time
 
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
@@ -25,8 +26,25 @@ from langchain_community.docstore.in_memory import InMemoryDocstore
 META_PAT  = re.compile(r"(주제|개요|요약|무엇|무슨\s*내용)", re.I)
 TITLE_PAT = re.compile(r"(제목|title|문서명|파일명)", re.I)
 
-THIS_FILE_PAT = re.compile(r"(이\s*(파일|문서)|첨부(한)?\s*(파일|문서)|방금\s*(올린|업로드한)\s*(파일|문서))", re.I)
+THIS_FILE_PAT = re.compile(
+    r"(이\s*(?:pdf|엑셀|hwp|한글|워드|ppt|파워포인트)?\s*(?:파일|문서|자료)|"
+    r"해당\s*(?:파일|문서|자료|pdf)|"
+    r"첨부(?:한)?\s*(?:파일|문서|자료|pdf)|"
+    r"방금\s*(?:올린|업로드한)\s*(?:파일|문서|자료|pdf)|"
+    r"위\s*(?:파일|문서|자료))",
+    re.I
+)
 last_source: Optional[str] = None
+# >>> [ADD] 최근 소스 잠금 상태 (연속 질문 안정화용)
+current_source: Optional[str] = None
+current_source_until: float = 0.0
+STICKY_SECS = 180  # 최근 파일 기준 3분 잠금
+
+def _set_sticky(src: str, secs: int = STICKY_SECS):
+    """해당 소스를 잠시 기본 대상으로 고정(연속 질문 시 섞임 방지)"""
+    global current_source, current_source_until
+    current_source = _norm_source(src)
+    current_source_until = time.time() + secs
 
 def _norm_source(s: str) -> str:
     s = (s or "").replace("\\", "/")
@@ -306,6 +324,8 @@ async def ingest(
             after = len(vectorstore.docstore._dict)
             global last_source
             last_source = _norm_source(str(dest))
+            # >>> [ADD] 업로드 직후 최근 소스 잠금
+            _set_sticky(last_source)
         return {
             "saved": {"path": str(dest), "bytes": dest.stat().st_size},
             "indexed": len(docs),
@@ -340,6 +360,8 @@ async def update_index(payload: dict):
     
     global last_source
     last_source = _norm_source(str(path))
+    # >>> [ADD] 업데이트 직후 최근 소스 잠금
+    _set_sticky(last_source)
 
     # 1) 문서 로딩
     try:
@@ -552,10 +574,17 @@ async def query(payload: dict = Body(...)):
     src_list   = (payload or {}).get("sources")
     src_set    = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
 
+    # >>> [ADD] 스티키가 살아있으면 우선 적용
+    now = time.time()
+    if not src_filter and not src_set and current_source and now < current_source_until:
+        src_filter = current_source
+
     # "이 파일/첨부한 파일" 지시어면 최근 업로드 파일로 고정
     global last_source
     if not src_filter and not src_set and last_source and THIS_FILE_PAT.search(q):
         src_filter = last_source
+        # >>> [ADD] 지시어 등장 시 스티키 연장
+        _set_sticky(last_source)
 
     # 3-A) 후보 선택은 MMR로(기존 그대로)
     try:
@@ -577,10 +606,26 @@ async def query(payload: dict = Body(...)):
     # 1) "xxx.pdf"가 질문에 포함되면 동일 소스만 우선
     m = re.search(r'([^\s"\'()]+\.pdf)', q, re.I)
     fname = m.group(1).lower() if m else None
+    # >>> [ADD] 질문에 파일명이 있으면 동일 basename 소스로 바로 고정
     if fname:
-        same = [d for d in docs if fname in str(d.metadata.get("source","")).lower()]
-        if same:
-            docs = same
+        bn = Path(fname).name.lower()
+        try:
+            ds = getattr(vectorstore, "docstore", None)
+            all_docs = getattr(ds, "_dict", {}) if ds else {}
+            cands = [
+                _norm_source(str(doc.metadata.get("source","")))
+                for doc in all_docs.values()
+                if Path(str(doc.metadata.get("source",""))).name.lower() == bn
+            ]
+            if cands:
+                src_filter = cands[0]
+                _set_sticky(src_filter)
+        except Exception:
+            pass
+    # if fname:
+    #     same = [d for d in docs if fname in str(d.metadata.get("source","")).lower()]
+    #     if same:
+    #         docs = same
 
     # 2) 확장자 없이도 매칭(질문에 포함된 토큰이 소스 파일명에 들어가면)
     if not fname:
@@ -595,16 +640,6 @@ async def query(payload: dict = Body(...)):
             if hit: break
         if hit:
             docs = [d for d in docs if hit in Path(str(d.metadata.get("source",""))).name.lower()]
-
-    # 2.5) [NEW] 지배적 소스 자동 수렴 (4-B)
-    # - 명시적 source 지정이 없고, 검색 상위 결과가 특정 파일로 쏠리면 그 파일만 남김
-    if not src_set and not src_filter and docs:
-        cand = docs[:max(12, k*2)]
-        cnt = Counter(_norm_source(str((d.metadata or {}).get("source",""))) for d in cand)
-        if cnt:
-            best, freq = cnt.most_common(1)[0]
-            if freq / len(cand) >= 0.6:  # 상위 결과의 60% 이상이 동일 소스면 잠금
-                docs = [d for d in docs if _norm_source(str((d.metadata or {}).get("source",""))) == best]
 
     # 3) 소스 필터 후 상위 k (4-C: 정규화 비교로 교체)
     if src_set:
@@ -628,6 +663,7 @@ async def query(payload: dict = Body(...)):
     try:
         pairs = vectorstore.similarity_search_with_score(q, k=max(k*8, 80))
         # source/sources가 지정된 경우: 해당 소스만 대상으로 재선정
+        # >>> [ADD] 지배적 소스 자동잠금: 유사도 상위 큰 풀(pairs)로 판단
         try:
             wanted = None
             if src_set:
@@ -641,6 +677,17 @@ async def query(payload: dict = Body(...)):
                     docs = ranked[:k]
         except Exception:
             pass
+        
+        if not src_set and not src_filter and pairs:
+            topN = pairs[:30]  # 표본 확장
+            cnt = Counter(_norm_source(str((d.metadata or {}).get("source",""))) for d, _ in topN)
+            if cnt:
+                best, freq = cnt.most_common(1)[0]
+                denom = max(1, len(topN))
+                if freq / denom >= 0.5:  # 50% 이상 쏠리면 그 소스로 잠금
+                    docs = [d for d, _ in pairs if _norm_source(str((d.metadata or {}).get("source",""))) == best][:k]
+                    _set_sticky(best)
+
 
         for d, dist in pairs:
             # 유사도 변환 + 클램프
@@ -684,6 +731,15 @@ async def query(payload: dict = Body(...)):
             "kind": md.get("kind", "chunk"),
             "score": entry["score"],
         })
+    # >>> [ADD] 디버깅 로그(원하면 사용)
+    try:
+        log.info(
+            "Q=%r src_filter=%r sticky=%r hits=%d chosen=%s",
+            q, src_filter, current_source, len(docs),
+            dict(Counter(_norm_source(str((d.metadata or {}).get('source',''))) for d in docs))
+        )
+    except Exception:
+        pass
 
     return {
         "hits": len(items),
