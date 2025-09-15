@@ -554,6 +554,32 @@ async def query(payload: dict = Body(...)):
             docs = [d for d, _ in vectorstore.similarity_search_with_score(q, k=max(k*2, 10))]
         except Exception:
             docs = []
+    # ... docs를 뽑은 직후, src 필터 적용 전에 추가
+    q_lc = q.lower()
+
+    # 1) "xxx.pdf"가 질문에 포함되면 동일 소스만 우선
+    m = re.search(r'([^\s"\'()]+\.pdf)', q, re.I)
+    fname = m.group(1).lower() if m else None
+    if fname:
+        same = [d for d in docs if fname in str(d.metadata.get("source","")).lower()]
+        if same:
+            docs = same
+
+    # 2) 확장자 없이도 매칭(질문에 포함된 토큰이 소스 파일명에 들어가면)
+    if not fname:
+        # 후보들의 소스명(파일명) 목록
+        sources = [str(d.metadata.get("source","")) for d in docs]
+        basenames = {Path(s).name.lower(): s for s in sources}
+        # 질문 토큰 중 파일명에 등장하는 것을 찾기
+        tokens = re.findall(r'[\w\.\-\(\)가-힣]+', q_lc)
+        hit = None
+        for t in tokens:
+            for bn in basenames.keys():
+                if t and t in bn:
+                    hit = t; break
+            if hit: break
+        if hit:
+            docs = [d for d in docs if hit in Path(str(d.metadata.get("source",""))).name.lower()]
 
     # 소스 필터 후 상위 k
     if src_set:
@@ -574,6 +600,21 @@ async def query(payload: dict = Body(...)):
 
     try:
         pairs = vectorstore.similarity_search_with_score(q, k=max(k*8, 80))
+        # source/sources가 지정된 경우: 해당 소스만 대상으로 재선정
+        try:
+            wanted = None
+            if src_set:
+                wanted = set(src_set)
+            elif src_filter:
+                wanted = {str(src_filter)}
+
+            if wanted:
+                ranked = [d for d, _ in pairs if str((d.metadata or {}).get("source","")) in wanted]
+                if ranked:
+                    docs = ranked[:k]
+        except Exception:
+            pass
+
         for d, dist in pairs:
             # 유사도 변환 + 클램프
             try:
