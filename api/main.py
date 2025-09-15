@@ -514,16 +514,9 @@ async def uploads_reset():
     except Exception as e:
         raise HTTPException(500, f"uploads reset failed: {e}")
     
+
 @app.post("/query", include_in_schema=False)
 async def query(payload: dict = Body(...)):
-    """
-    Open WebUI 호환 /query:
-    입력: {"query"|"question"|"q"|messages, "k"| "top_k", "source"(옵션)}
-    출력: 
-      - hits: int
-      - items: [{text, metadata, score}]
-      - contexts/context_texts/documents/chunks: 호환용 별칭
-    """
     global vectorstore, retriever
     if vectorstore is None:
         raise HTTPException(500, "vectorstore is not ready.")
@@ -531,70 +524,102 @@ async def query(payload: dict = Body(...)):
     # 1) 쿼리 추출
     q = (payload or {}).get("question") \
         or (payload or {}).get("query") \
-        or (payload or {}).get("q") \
-        or ""
+        or (payload or {}).get("q") or ""
     if (not q.strip()) and isinstance((payload or {}).get("messages"), list):
         for m in reversed(payload["messages"]):
             if m.get("role") == "user" and m.get("content"):
-                q = m["content"]
-                break
+                q = m["content"]; break
     if not q.strip():
         raise HTTPException(400, "question/query/q/messages is required")
 
-    # 2) k / source 필터
+    # 2) k / source
     k = (payload or {}).get("k") or (payload or {}).get("top_k") or 5
-    try:
-        k = int(k)
-    except Exception:
-        k = 5
-    src_filter = (payload or {}).get("source")    # 기존 단일
-    src_list = (payload or {}).get("sources")     # ← 새로: 복수
-    src_set = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
+    try: k = int(k)
+    except: k = 5
+    src_filter = (payload or {}).get("source")
+    src_list   = (payload or {}).get("sources")
+    src_set    = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
 
-    # 3) 리트리버(MMR)로 통일
+    # 3-A) 후보 선택은 MMR로(기존 그대로)
     try:
         docs = (retriever.get_relevant_documents(q)
                 if hasattr(retriever, "get_relevant_documents")
                 else retriever.invoke(q))
     except Exception:
+        docs = []
+
+    # 빈 결과면 fallback (또는 예외 시에도)
+    if not docs:
         try:
-            # 필터 적용 전에 후보를 넉넉히 확보
-            docs = vectorstore.similarity_search(q, k=max(k*8, 40))
+            docs = [d for d, _ in vectorstore.similarity_search_with_score(q, k=max(k*2, 10))]
         except Exception:
             docs = []
 
-    # 4) 소스 필터(옵션) + 상위 k
+    # 소스 필터 후 상위 k
     if src_set:
-        docs = [d for d in docs if str(d.metadata.get("source", "")) in src_set]
+        docs = [d for d in docs if str(d.metadata.get("source","")) in src_set]
     elif src_filter:
-        docs = [d for d in docs if str(d.metadata.get("source", "")) == str(src_filter)]
-
+        docs = [d for d in docs if str(d.metadata.get("source","")) == str(src_filter)]
     docs = docs[:k]
 
-    # 5) Open WebUI가 좋아하는 스키마로 변환 + 별칭들 추가
-    items = []
+    # 3-B) 점수만 따로 계산(유사도 검색으로 거리 확보)
+    #  - HuggingFaceEmbeddings(normalize_embeddings=True) + FAISS L2 가정
+    #  - L2^2 = 2 - 2*cos  ⇒ cos = 1 - (dist/2)
+    def key_of(d):
+        md = d.metadata or {}
+        return (str(md.get("source","")), md.get("page"), md.get("kind","chunk"), md.get("chunk"))
+
+    score_map = {}
+    text_map  = {}
+
+    try:
+        pairs = vectorstore.similarity_search_with_score(q, k=max(k*8, 80))
+        for d, dist in pairs:
+            # 유사도 변환 + 클램프
+            try:
+                sim = 1.0 - float(dist)/2.0
+                sim = max(0.0, min(1.0, sim))
+            except Exception:
+                sim = 0.0
+
+            K = key_of(d)
+            if score_map.get(K, -1.0) < sim:
+                score_map[K] = sim
+
+            # chunk 메타가 없는 로더 대비 텍스트 프리픽스 키
+            md = d.metadata or {}
+            textK = (str(md.get("source","")), md.get("page"), md.get("kind","chunk"), (d.page_content or "")[:80])
+            if text_map.get(textK, -1.0) < sim:
+                text_map[textK] = sim
+    except Exception:
+        pass
+
+    # 4) 응답 구성(+score)
+    items, contexts = [], []
     for d in docs:
-        md = dict(d.metadata or {})
-        md["source"] = str(md.get("source", ""))
-        items.append({
+        md = dict(d.metadata or {}); md["source"] = str(md.get("source",""))
+        sim = score_map.get(key_of(d))
+        if sim is None:
+            textK = (md["source"], md.get("page"), md.get("kind","chunk"), (d.page_content or "")[:80])
+            sim = text_map.get(textK, 0.0)
+
+        entry = {
             "text": d.page_content or "",
             "metadata": md,
-            "score": None,  # 점수가 없더라도 필드만 맞춰줌
+            "score": round(sim, 4) if isinstance(sim, (int, float)) else 0.0,
+        }
+        items.append(entry)
+        contexts.append({
+            "text": entry["text"],
+            "source": md["source"],
+            "page": md.get("page"),
+            "kind": md.get("kind", "chunk"),
+            "score": entry["score"],
         })
-
-    contexts = [
-        {
-            "text": it["text"],
-            "source": it["metadata"]["source"],
-            "page": it["metadata"].get("page"),
-            "kind": it["metadata"].get("kind", "chunk"),
-        } for it in items
-    ]
 
     return {
         "hits": len(items),
         "items": items,
-        # 호환용 별칭들(어떤 브랜치에서도 인식되도록 넉넉히)
         "contexts": contexts,
         "context_texts": [it["text"] for it in items],
         "documents": items,
