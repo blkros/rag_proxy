@@ -547,7 +547,9 @@ async def query(payload: dict = Body(...)):
         k = int(k)
     except Exception:
         k = 5
-    src_filter = (payload or {}).get("source")
+    src_filter = (payload or {}).get("source")    # 기존 단일
+    src_list = (payload or {}).get("sources")     # ← 새로: 복수
+    src_set = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
 
     # 3) 리트리버(MMR)로 통일
     try:
@@ -555,15 +557,18 @@ async def query(payload: dict = Body(...)):
                 if hasattr(retriever, "get_relevant_documents")
                 else retriever.invoke(q))
     except Exception:
-        # 폴백
         try:
-            docs = vectorstore.similarity_search(q, k=k)
+            # 필터 적용 전에 후보를 넉넉히 확보
+            docs = vectorstore.similarity_search(q, k=max(k*8, 40))
         except Exception:
             docs = []
 
     # 4) 소스 필터(옵션) + 상위 k
-    if src_filter:
+    if src_set:
+        docs = [d for d in docs if str(d.metadata.get("source", "")) in src_set]
+    elif src_filter:
         docs = [d for d in docs if str(d.metadata.get("source", "")) == str(src_filter)]
+
     docs = docs[:k]
 
     # 5) Open WebUI가 좋아하는 스키마로 변환 + 별칭들 추가
