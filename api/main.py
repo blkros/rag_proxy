@@ -1,7 +1,7 @@
 # api/main.py
 from __future__ import annotations
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 import shutil, os, logging, re
 from fastapi.responses import RedirectResponse
@@ -129,7 +129,7 @@ def _upsert_docs_no_dup(docs: List[Document]) -> int:
     _reload_retriever()
     return len(new_docs)
 
-def build_openai_messages(question: str, k: int = 5) -> List[Dict[str, Any]]:
+def build_openai_messages(question: str, k: int = 5) -> Tuple[List[Dict[str, Any]], List[Document]]:
     global retriever, vectorstore
 
     # 1) 메타 질문이면 k 확장
@@ -189,11 +189,12 @@ def build_openai_messages(question: str, k: int = 5) -> List[Dict[str, Any]]:
         system += "\n\n요청이 '주제/개요/요약' 성격이면 핵심 내용을 2-3문장으로 요약하라."
     if context:
         system += f"\n\n컨텍스트:\n{context}"
-
-    return [
+    
+    msgs = [
         {"role": "system", "content": system},
         {"role": "user", "content": question},
     ]
+    return msgs, docs[:k_eff]
 
 @app.on_event("startup")
 def _startup():
@@ -232,7 +233,7 @@ async def ask(payload: dict):
     q = (payload or {}).get("question") or ""
     if not q.strip():
         raise HTTPException(400, "question is required")
-    msgs = build_openai_messages(q, k=5)
+    msgs, _ = build_openai_messages(q, k=5)
     res = await call_chat_completions(messages=msgs, temperature=0)
     try:
         content = res["choices"][0]["message"]["content"]
@@ -514,12 +515,14 @@ async def uploads_reset():
         raise HTTPException(500, f"uploads reset failed: {e}")
     
 @app.post("/query", include_in_schema=False)
-@app.post("/query", include_in_schema=False)
 async def query(payload: dict = Body(...)):
     """
     Open WebUI 호환 /query:
-    입력: {"query"|"question"|"q"|messages, "k"| "top_k"}
-    출력: {"hits": int, "items": [{"text": str, "metadata": {...}, "score": float}]}
+    입력: {"query"|"question"|"q"|messages, "k"| "top_k", "source"(옵션)}
+    출력: 
+      - hits: int
+      - items: [{text, metadata, score}]
+      - contexts/context_texts/documents/chunks: 호환용 별칭
     """
     global vectorstore, retriever
     if vectorstore is None:
@@ -530,7 +533,6 @@ async def query(payload: dict = Body(...)):
         or (payload or {}).get("query") \
         or (payload or {}).get("q") \
         or ""
-
     if (not q.strip()) and isinstance((payload or {}).get("messages"), list):
         for m in reversed(payload["messages"]):
             if m.get("role") == "user" and m.get("content"):
@@ -539,35 +541,57 @@ async def query(payload: dict = Body(...)):
     if not q.strip():
         raise HTTPException(400, "question/query/q/messages is required")
 
-    # 2) k 결정
+    # 2) k / source 필터
     k = (payload or {}).get("k") or (payload or {}).get("top_k") or 5
     try:
         k = int(k)
     except Exception:
         k = 5
+    src_filter = (payload or {}).get("source")
 
-    # 3) 유사도 검색 (점수 포함)
+    # 3) 리트리버(MMR)로 통일
     try:
-        results = vectorstore.similarity_search_with_relevance_scores(q, k=k)
+        docs = (retriever.get_relevant_documents(q)
+                if hasattr(retriever, "get_relevant_documents")
+                else retriever.invoke(q))
     except Exception:
-        # 점수 API가 안되면 리트리버로 폴백
+        # 폴백
         try:
-            docs = (retriever.get_relevant_documents(q)
-                    if hasattr(retriever, "get_relevant_documents")
-                    else retriever.invoke(q))
+            docs = vectorstore.similarity_search(q, k=k)
         except Exception:
             docs = []
-        results = [(d, 0.0) for d in docs]
 
-    # 4) Open WebUI가 기대하는 스키마로 변환
+    # 4) 소스 필터(옵션) + 상위 k
+    if src_filter:
+        docs = [d for d in docs if str(d.metadata.get("source", "")) == str(src_filter)]
+    docs = docs[:k]
+
+    # 5) Open WebUI가 좋아하는 스키마로 변환 + 별칭들 추가
     items = []
-    for doc, score in results:
-        md = dict(doc.metadata or {})
+    for d in docs:
+        md = dict(d.metadata or {})
         md["source"] = str(md.get("source", ""))
         items.append({
-            "text": doc.page_content or "",
+            "text": d.page_content or "",
             "metadata": md,
-            "score": float(score),
+            "score": None,  # 점수가 없더라도 필드만 맞춰줌
         })
 
-    return {"hits": len(items), "items": items}
+    contexts = [
+        {
+            "text": it["text"],
+            "source": it["metadata"]["source"],
+            "page": it["metadata"].get("page"),
+            "kind": it["metadata"].get("kind", "chunk"),
+        } for it in items
+    ]
+
+    return {
+        "hits": len(items),
+        "items": items,
+        # 호환용 별칭들(어떤 브랜치에서도 인식되도록 넉넉히)
+        "contexts": contexts,
+        "context_texts": [it["text"] for it in items],
+        "documents": items,
+        "chunks": items,
+    }
