@@ -600,3 +600,7 @@ async def query(payload: dict = Body(...)):
         "documents": items,
         "chunks": items,
     }
+
+@app.post("/qa")
+async def qa_compat(payload: dict = Body(...)):
+    return await query(payload)
