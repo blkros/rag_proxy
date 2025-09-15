@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 from pathlib import Path
 import shutil, os, logging, re
 from fastapi.responses import RedirectResponse
+from fastapi import Body
 
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
@@ -513,38 +514,60 @@ async def uploads_reset():
         raise HTTPException(500, f"uploads reset failed: {e}")
     
 @app.post("/query", include_in_schema=False)
-async def query_compat(payload: dict):
+@app.post("/query", include_in_schema=False)
+async def query(payload: dict = Body(...)):
     """
-    Open WebUI가 호출하는 /query 바디를 /ask 형태로 정규화해 처리.
-    지원 키: question | query | q | messages (OpenAI 포맷)
-    선택 파라미터: k | top_k
+    Open WebUI 호환 /query:
+    입력: {"query"|"question"|"q"|messages, "k"| "top_k"}
+    출력: {"hits": int, "items": [{"text": str, "metadata": {...}, "score": float}]}
     """
+    global vectorstore, retriever
+    if vectorstore is None:
+        raise HTTPException(500, "vectorstore is not ready.")
+
+    # 1) 쿼리 추출
     q = (payload or {}).get("question") \
         or (payload or {}).get("query") \
         or (payload or {}).get("q") \
         or ""
 
-    # messages 포맷(최근 user 메시지) 지원
     if (not q.strip()) and isinstance((payload or {}).get("messages"), list):
-        msgs = payload["messages"]
-        for m in reversed(msgs):
+        for m in reversed(payload["messages"]):
             if m.get("role") == "user" and m.get("content"):
                 q = m["content"]
                 break
-
     if not q.strip():
         raise HTTPException(400, "question/query/q/messages is required")
 
+    # 2) k 결정
     k = (payload or {}).get("k") or (payload or {}).get("top_k") or 5
     try:
         k = int(k)
     except Exception:
         k = 5
 
-    msgs = build_openai_messages(q, k=k)
-    res = await call_chat_completions(messages=msgs, temperature=0)
+    # 3) 유사도 검색 (점수 포함)
     try:
-        content = res["choices"][0]["message"]["content"]
+        results = vectorstore.similarity_search_with_relevance_scores(q, k=k)
     except Exception:
-        content = str(res)
-    return {"answer": drop_think(content)}
+        # 점수 API가 안되면 리트리버로 폴백
+        try:
+            docs = (retriever.get_relevant_documents(q)
+                    if hasattr(retriever, "get_relevant_documents")
+                    else retriever.invoke(q))
+        except Exception:
+            docs = []
+        results = [(d, 0.0) for d in docs]
+
+    # 4) Open WebUI가 기대하는 스키마로 변환
+    items = []
+    for doc, score in results:
+        md = dict(doc.metadata or {})
+        md["source"] = str(md.get("source", ""))
+        items.append({
+            "text": doc.page_content or "",
+            "metadata": md,
+            "score": float(score),
+        })
+
+    return {"hits": len(items), "items": items}
