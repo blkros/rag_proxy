@@ -25,6 +25,13 @@ from langchain_community.docstore.in_memory import InMemoryDocstore
 META_PAT  = re.compile(r"(주제|개요|요약|무엇|무슨\s*내용)", re.I)
 TITLE_PAT = re.compile(r"(제목|title|문서명|파일명)", re.I)
 
+THIS_FILE_PAT = re.compile(r"(이\s*(파일|문서)|첨부(한)?\s*(파일|문서)|방금\s*(올린|업로드한)\s*(파일|문서))", re.I)
+last_source: Optional[str] = None
+
+def _norm_source(s: str) -> str:
+    s = (s or "").replace("\\", "/")
+    return re.sub(r"^/app/", "", s)  # 컨테이너 절대경로를 제거해 'uploads/…'로 맞춤
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -297,6 +304,8 @@ async def ingest(
             before = len(vectorstore.docstore._dict)
             added = _upsert_docs_no_dup(docs)
             after = len(vectorstore.docstore._dict)
+            global last_source
+            last_source = _norm_source(str(dest))
         return {
             "saved": {"path": str(dest), "bytes": dest.stat().st_size},
             "indexed": len(docs),
@@ -328,6 +337,9 @@ async def update_index(payload: dict):
         path = Path(UPLOAD_DIR) / rel if not rel.startswith(UPLOAD_DIR) else Path(rel)
     if not path.exists():
         raise HTTPException(404, f"file not found: {path}")
+    
+    global last_source
+    last_source = _norm_source(str(path))
 
     # 1) 문서 로딩
     try:
@@ -540,6 +552,11 @@ async def query(payload: dict = Body(...)):
     src_list   = (payload or {}).get("sources")
     src_set    = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
 
+    # "이 파일/첨부한 파일" 지시어면 최근 업로드 파일로 고정
+    global last_source
+    if not src_filter and not src_set and last_source and THIS_FILE_PAT.search(q):
+        src_filter = last_source
+
     # 3-A) 후보 선택은 MMR로(기존 그대로)
     try:
         docs = (retriever.get_relevant_documents(q)
@@ -567,11 +584,9 @@ async def query(payload: dict = Body(...)):
 
     # 2) 확장자 없이도 매칭(질문에 포함된 토큰이 소스 파일명에 들어가면)
     if not fname:
-        # 후보들의 소스명(파일명) 목록
         sources = [str(d.metadata.get("source","")) for d in docs]
         basenames = {Path(s).name.lower(): s for s in sources}
-        # 질문 토큰 중 파일명에 등장하는 것을 찾기
-        tokens = re.findall(r'[\w\.\-\(\)가-힣]+', q_lc)
+        tokens = re.findall(r'[\w\.\-\(\)가-힣]+', q.lower())
         hit = None
         for t in tokens:
             for bn in basenames.keys():
@@ -581,11 +596,23 @@ async def query(payload: dict = Body(...)):
         if hit:
             docs = [d for d in docs if hit in Path(str(d.metadata.get("source",""))).name.lower()]
 
-    # 소스 필터 후 상위 k
+    # 2.5) [NEW] 지배적 소스 자동 수렴 (4-B)
+    # - 명시적 source 지정이 없고, 검색 상위 결과가 특정 파일로 쏠리면 그 파일만 남김
+    if not src_set and not src_filter and docs:
+        cand = docs[:max(12, k*2)]
+        cnt = Counter(_norm_source(str((d.metadata or {}).get("source",""))) for d in cand)
+        if cnt:
+            best, freq = cnt.most_common(1)[0]
+            if freq / len(cand) >= 0.6:  # 상위 결과의 60% 이상이 동일 소스면 잠금
+                docs = [d for d in docs if _norm_source(str((d.metadata or {}).get("source",""))) == best]
+
+    # 3) 소스 필터 후 상위 k (4-C: 정규화 비교로 교체)
     if src_set:
-        docs = [d for d in docs if str(d.metadata.get("source","")) in src_set]
+        wanted = {_norm_source(str(s)) for s in src_set}
+        docs = [d for d in docs if _norm_source(str((d.metadata or {}).get("source",""))) in wanted]
     elif src_filter:
-        docs = [d for d in docs if str(d.metadata.get("source","")) == str(src_filter)]
+        wanted = _norm_source(str(src_filter))
+        docs = [d for d in docs if _norm_source(str((d.metadata or {}).get("source",""))) == wanted]
     docs = docs[:k]
 
     # 3-B) 점수만 따로 계산(유사도 검색으로 거리 확보)
@@ -604,12 +631,12 @@ async def query(payload: dict = Body(...)):
         try:
             wanted = None
             if src_set:
-                wanted = set(src_set)
+                wanted = {_norm_source(str(s)) for s in src_set}
             elif src_filter:
-                wanted = {str(src_filter)}
+                wanted = {_norm_source(str(src_filter))}
 
             if wanted:
-                ranked = [d for d, _ in pairs if str((d.metadata or {}).get("source","")) in wanted]
+                ranked = [d for d, _ in pairs if _norm_source(str((d.metadata or {}).get("source",""))) in wanted]
                 if ranked:
                     docs = ranked[:k]
         except Exception:
