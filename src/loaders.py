@@ -387,24 +387,28 @@ def _load_pdf_auto(path: Path) -> List[Document]:
 
     # 3) 표가 거의 없으면 기본 파서와 병합
     threshold = settings.PDF_TABLE_THRESHOLD
-    legacy = []
     if table_sentence_cnt < threshold:
         legacy = load_pdf(path)
         docs = _dedup(legacy + docs)
 
-    # [MOD OCR] auto 경로에서도 총텍스트가 너무 적으면 OCR 폴백
-    total_chars = sum(len(d.page_content) for d in docs)
-    if total_chars < AUTO_OCR_MIN_CHARS:
-        ocr_docs = load_pdf_ocr(path, dpi=450, lang=DEFAULT_OCR_LANG)   # ← hi 파이프라인 사용
+    # 3.5) OCR 자동 폴백 판단 (요약/제목 추가 전!)
+    #   - 후보 텍스트: 본문 성격만(기본 chunk/페이지 텍스트/표 문장)
+    SRC_RE = re.compile(r'^\[SOURCE:.*?\]\s*')
+
+    text_candidates = [
+        SRC_RE.sub("", d.page_content)
+        for d in docs
+        if (d.metadata or {}).get("kind") in (None, "page_text", "table_row")
+    ]
+    full_text   = " ".join(text_candidates)
+    total_chars = sum(len(t) for t in text_candidates)
+
+    # 조건: 본문이 거의 없거나(길이), 있긴 한데 '깨짐'(가독성 낮음)
+    if not text_candidates or total_chars < AUTO_OCR_MIN_CHARS or _looks_gibberish(full_text):
+        ocr_docs = load_pdf_ocr(path, dpi=450, lang=DEFAULT_OCR_LANG)  # 고품질 파이프라인
         return _dedup(ocr_docs)
 
-    # [ADD OCR] 텍스트가 “있긴 한데 깨짐”이면 OCR로 교체
-    full_text = " ".join(d.page_content for d in docs)
-    if _looks_gibberish(full_text):
-        ocr_docs = load_pdf_ocr(path, dpi=450, lang=DEFAULT_OCR_LANG)
-        return _dedup(ocr_docs)
-
-    # 4) 요약/제목 메타 청크
+    # 4) 요약/제목 메타 청크 (OCR 폴백 안 탔을 때만 진행)
     head = " ".join(first_text_lines)[:400]
     if head:
         docs.append(Document(
@@ -418,6 +422,7 @@ def _load_pdf_auto(path: Path) -> List[Document]:
             metadata={"source": str(path), "kind": "title"},
         ))
     return docs
+
 
 # -----------------------------
 # 디스패처
