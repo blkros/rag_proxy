@@ -15,8 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config import settings
 import asyncio, hashlib
 from collections import Counter
-from retrieval.rerank import pick_for_injection, rerank
-from retrieval.rerank import parse_query_intent
+from src.retrieval.rerank import parse_query_intent, pick_for_injection
 
 # empty FAISS 빌드를 위한 보조들
 import faiss
@@ -759,6 +758,7 @@ async def query(payload: dict = Body(...)):
         "context_texts": [it["text"] for it in items],
         "documents": items,
         "chunks": items,
+        "notes": {"missing_article": missing_article, "article_no": intent.get("article_no")}
     }
 
 @app.post("/qa")
