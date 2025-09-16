@@ -213,31 +213,41 @@ def _dedup(docs: List[Document]) -> List[Document]:
             out.append(d)
     return out
 
+# [ADD] 사람이 읽을만한지 검사
+def _is_readable(s: str) -> bool:
+    s = (s or "").strip()
+    if not s: return False
+    good = len(re.findall(r"[ㄱ-ㅎ가-힣A-Za-z0-9\s\-\_\.\(\)\[\]]", s))
+    return good / max(1, len(s)) >= 0.6
+
 def _extract_pdf_title(path: Path) -> str | None:
-    # 1) PDF 메타데이터 title
     try:
         meta = PdfReader(str(path)).metadata or {}
-        t = None
-        if hasattr(meta, "title"):
-            t = meta.title
-        elif isinstance(meta, dict):
-            t = meta.get("/Title") or meta.get("Title")
-        if t and str(t).strip():
-            return str(t).strip()
+        t = getattr(meta, "title", None)
+        if isinstance(meta, dict):
+            t = t or meta.get("/Title") or meta.get("Title")
+        if t:
+            t = str(t)
+            # 흔한 모지바케 복구 시도
+            try:
+                t = t.encode("latin1").decode("utf-8")
+            except Exception:
+                pass
+            if _is_readable(t):
+                return t.strip()
     except Exception:
         pass
-    # 2) 첫 페이지 첫 줄 휴리스틱 (pdfplumber 있으면)
+    # 첫 페이지 휴리스틱은 그대로 두고, 그래도 읽기 불가면 파일명 사용
     try:
         import pdfplumber
         with pdfplumber.open(str(path)) as pdf:
             if pdf.pages:
                 text = pdf.pages[0].extract_text() or ""
                 for ln in (l.strip() for l in text.splitlines()):
-                    if len(ln) >= 3:
+                    if len(ln) >= 3 and _is_readable(ln):
                         return ln[:120]
     except Exception:
         pass
-    # 3) 폴백: 파일명
     return path.stem
 
 # [ADD OCR] OCR 전처리/실행
@@ -264,7 +274,8 @@ def _ocr_page(pil_img: Image.Image, lang: str = "kor+eng") -> str:
     kernel = np.ones((2,2), np.uint8)
     proc = cv2.morphologyEx(binarized, cv2.MORPH_OPEN, kernel, iterations=1)
     # OCR
-    config = "--psm 6"  # 한 문서 내 여러 블록/문장을 안정적으로
+    config = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
+    proc = cv2.resize(proc, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
     text = pytesseract.image_to_string(proc, lang=lang, config=config)
     return text.strip()
 
@@ -384,7 +395,13 @@ def _load_pdf_auto(path: Path) -> List[Document]:
     # [MOD OCR] auto 경로에서도 총텍스트가 너무 적으면 OCR 폴백
     total_chars = sum(len(d.page_content) for d in docs)
     if total_chars < AUTO_OCR_MIN_CHARS:
-        ocr_docs = _build_docs_from_page_texts(_ocr_pdf_to_texts(path), path)
+        ocr_docs = load_pdf_ocr(path, dpi=450, lang=DEFAULT_OCR_LANG)   # ← hi 파이프라인 사용
+        return _dedup(ocr_docs)
+
+    # [ADD OCR] 텍스트가 “있긴 한데 깨짐”이면 OCR로 교체
+    full_text = " ".join(d.page_content for d in docs)
+    if _looks_gibberish(full_text):
+        ocr_docs = load_pdf_ocr(path, dpi=450, lang=DEFAULT_OCR_LANG)
         return _dedup(ocr_docs)
 
     # 4) 요약/제목 메타 청크
@@ -414,13 +431,13 @@ def load_docs_any(
     p = Path(path)
     ext = p.suffix.lower()
 
-    # [ADD OCR] 강제 OCR 파서
+    # [CHANGE OCR] 강제 OCR 파서: 고품질 파이프라인 사용
     if parser == "ocr_hi":
         if ext != ".pdf":
             raise ValueError("ocr_hi 파서는 PDF에만 사용할 수 있습니다.")
-        ocr_docs = _build_docs_from_page_texts(_ocr_pdf_to_texts(p), p)
-        return _chunk(_dedup(ocr_docs), chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-
+        docs = load_pdf_ocr(p, dpi=450, lang=DEFAULT_OCR_LANG)  # 고해상도 + 강한 전처리
+        return _chunk(_dedup(docs), chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    
     if ext == ".pdf":
         docs = _load_pdf_auto(p)  # auto: 표-친화 시도 후 부족하면 기본 병합, 너무 적으면 OCR 폴백
         return _chunk(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)

@@ -24,3 +24,7 @@ huggingface-hub
 hf-transfer
 FlagEmbedding
 pdfplumber>=0.11
+pdf2image
+pytesseract
+opencv-python-headless
+Pillow
