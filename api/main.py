@@ -630,17 +630,35 @@ async def query(payload: dict = Body(...)):
 
     # 2) 확장자 없이도 매칭(질문에 포함된 토큰이 소스 파일명에 들어가면)
     if not fname:
-        sources = [str(d.metadata.get("source","")) for d in docs]
-        basenames = {Path(s).name.lower(): s for s in sources}
-        tokens = re.findall(r'[\w\.\-\(\)가-힣]+', q.lower())
-        hit = None
-        for t in tokens:
-            for bn in basenames.keys():
+        def _canon_file(s: str) -> str:
+            bn = Path(s).name.lower()
+            for ext in ('.pdf', '.pptx', '.xlsx', '.txt', '.csv', '.md'):
+                if bn.endswith(ext): bn = bn[:-len(ext)]
+            return bn
+
+        # 토큰 정규화: 조사/불용 접미 제거
+        raw_tokens = re.findall(r'[\w\.\-\(\)가-힣]+', q.lower())
+        norm_tokens = []
+        for t in raw_tokens:
+            if t.endswith("의"): t = t[:-1]
+            # 필요한 경우 더 추가: t = t.replace("관련","").replace("에","")
+            t = t.strip()
+            if t: norm_tokens.append(t)
+
+        # 후보 소스 basename 사전
+        cand_sources = [str(d.metadata.get("source","")) for d in docs]
+        bn_map = {_canon_file(s): s for s in cand_sources if s}
+
+        hit_bn = None
+        for t in norm_tokens:
+            for bn in bn_map.keys():
                 if t and t in bn:
-                    hit = t; break
-            if hit: break
-        if hit:
-            docs = [d for d in docs if hit in Path(str(d.metadata.get("source",""))).name.lower()]
+                    hit_bn = bn; break
+            if hit_bn: break
+
+        if hit_bn:
+            wanted = _norm_source(bn_map[hit_bn])
+            docs = [d for d in docs if _norm_source(str(d.metadata.get("source",""))) == wanted]
 
     # 3) 소스 필터 후 상위 k (4-C: 정규화 비교로 교체)
     if src_set:
@@ -700,11 +718,6 @@ async def query(payload: dict = Body(...)):
             "score": 0.5,
         })
 
-    # 3-C) 소스 필터링 (sources / source / sticky / "이 파일")
-    def _norm_source(s: str) -> str:
-        s = (s or "").replace("\\", "/")
-        return re.sub(r"^/app/", "", s)
-
     if src_set:
         wanted = {_norm_source(str(s)) for s in src_set}
         pool_hits = [h for h in pool_hits if _norm_source(h["metadata"].get("source","")) in wanted]
@@ -722,6 +735,24 @@ async def query(payload: dict = Body(...)):
 
     # 3-E) rerank + 의도기반 주입선택
     chosen = pick_for_injection(q, pool_hits, k_default=int(k) if isinstance(k, int) else 5)
+    if intent.get("article_no") and src_filter and not any(
+        (h.get("metadata") or {}).get("article_no") == intent["article_no"] for h in chosen
+    ):
+        try:
+            pairs2 = vectorstore.similarity_search_with_score(q, k=160)
+            pool_hits2 = []
+            for d, dist in pairs2:
+                if _norm_source(str((d.metadata or {}).get("source",""))) != _norm_source(str(src_filter)):
+                    continue
+                pool_hits2.append({
+                    "text": d.page_content or "",
+                    "metadata": dict(d.metadata, source=str(d.metadata.get("source",""))),
+                    "score": _sim_from_dist(dist),
+                })
+            if pool_hits2:
+                chosen = pick_for_injection(q, pool_hits2, k_default=int(k) if isinstance(k, int) else 5)
+        except Exception:
+            pass
 
     # 4) 응답 생성 (기존 포맷 유지)
     items, contexts = [], []

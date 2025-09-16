@@ -71,6 +71,9 @@ def _split_sections(text: str) -> list[dict]:
 
 def _build_section_docs_from_text(text: str, path: Path) -> List[Document]:
     """split_sections 결과를 LangChain Document로 변환 + article_no 메타 자동 부여"""
+    # 조문 표기 정규화 먼저
+    text = _normalize_articles(text)
+
     secs = _split_sections(text)[:400]
     docs: List[Document] = []
     for i, sec in enumerate(secs):
@@ -87,11 +90,13 @@ def _build_section_docs_from_text(text: str, path: Path) -> List[Document]:
                 md["article_no"] = int(m.group(1))
             except Exception:
                 pass
-        docs.append(Document(
-            page_content=f'{sec["title"]}\n{sec["body"]}',
-            metadata=md
-        ))
+        # 제목은 prefix에서 넣어주므로 본문만 저장
+        docs.append(Document(page_content=sec["body"], metadata=md))
     return docs
+
+def _normalize_articles(s: str) -> str:
+    return re.sub(r'제\s*([0-9]{1,3})\s*조', lambda m: f"제{int(m.group(1))}조", s)
+
 
 # -----------------------------
 # 공통: 청킹
@@ -102,16 +107,21 @@ def _chunk(docs: List[Document], chunk_size=800, chunk_overlap=120) -> List[Docu
     for d in docs:
         text = d.page_content or ""
         prefix = ""
-        if (d.metadata or {}).get("kind") == "section":
-            # 섹션 제목을 각 청크에 보존
-            st = (d.metadata or {}).get("section_title") or ""
+        md = d.metadata or {}
+
+        if md.get("kind") == "section":
+            st = md.get("section_title") or ""
+            src_bn = Path(str(md.get("source",""))).name
             if st:
-                prefix = st.strip() + "\n"
+                prefix = f"[SOURCE:{src_bn}] {st}\n"
+            else:
+                prefix = f"[SOURCE:{src_bn}]\n"
+
         parts = splitter.split_text(text)
         for i, p in enumerate(parts):
-            md = dict(d.metadata)
-            md["chunk"] = i
-            out.append(Document(page_content=(prefix + p) if prefix else p, metadata=md))
+            new_md = dict(md)
+            new_md["chunk"] = i
+            out.append(Document(page_content=(prefix + p) if prefix else p, metadata=new_md))
     return out
 
 # -----------------------------
@@ -378,7 +388,7 @@ def load_pdf_ocr(path: Path, dpi: int = 400, lang: str = "kor+eng") -> List[Docu
             docs.insert(1, Document(page_content=f"[SUMMARY] {path.name} 개요: {head}", metadata={"source": str(path), "kind": "summary"}))
 
     # OCR 전체 본문으로 섹션 생성
-    joined = "\n".join(t for t in page_texts if t)
+    joined = _normalize_articles("\n".join(t for t in page_texts if t))
     section_docs = _build_section_docs_from_text(joined, path)
     docs = section_docs + docs
 
@@ -497,7 +507,7 @@ def _load_pdf_auto(path: Path) -> List[Document]:
         ocr_docs = load_pdf_ocr(path, dpi=450, lang=DEFAULT_OCR_LANG)  # 고품질 파이프라인
         return _dedup(ocr_docs)
     
-    joined_for_sections = "\n".join(text_candidates)
+    joined_for_sections = _normalize_articles("\n".join(text_candidates))
     docs += _build_section_docs_from_text(joined_for_sections, path)
     docs = _dedup(docs)
     
