@@ -15,6 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config import settings
 import asyncio, hashlib
 from collections import Counter
+from retrieval.rerank import pick_for_injection, rerank
+from retrieval.rerank import parse_query_intent
 
 # empty FAISS 빌드를 위한 보조들
 import faiss
@@ -650,93 +652,102 @@ async def query(payload: dict = Body(...)):
         docs = [d for d in docs if _norm_source(str((d.metadata or {}).get("source",""))) == wanted]
     docs = docs[:k]
 
-    # 3-B) 점수만 따로 계산(유사도 검색으로 거리 확보)
-    #  - HuggingFaceEmbeddings(normalize_embeddings=True) + FAISS L2 가정
-    #  - L2^2 = 2 - 2*cos  ⇒ cos = 1 - (dist/2)
+    # 3-B) 넉넉한 후보 풀을 구성하고 점수/메타를 붙인다
     def key_of(d):
         md = d.metadata or {}
         return (str(md.get("source","")), md.get("page"), md.get("kind","chunk"), md.get("chunk"))
 
-    score_map = {}
-    text_map  = {}
-
+    pool_hits = []   # ← rerank/pick_for_injection가 먹는 풀
     try:
         pairs = vectorstore.similarity_search_with_score(q, k=max(k*8, 80))
-        # source/sources가 지정된 경우: 해당 소스만 대상으로 재선정
-        # >>> [ADD] 지배적 소스 자동잠금: 유사도 상위 큰 풀(pairs)로 판단
-        try:
-            wanted = None
-            if src_set:
-                wanted = {_norm_source(str(s)) for s in src_set}
-            elif src_filter:
-                wanted = {_norm_source(str(src_filter))}
-
-            if wanted:
-                ranked = [d for d, _ in pairs if _norm_source(str((d.metadata or {}).get("source",""))) in wanted]
-                if ranked:
-                    docs = ranked[:k]
-        except Exception:
-            pass
-        
-        if not src_set and not src_filter and pairs:
-            topN = pairs[:30]  # 표본 확장
-            cnt = Counter(_norm_source(str((d.metadata or {}).get("source",""))) for d, _ in topN)
-            if cnt:
-                best, freq = cnt.most_common(1)[0]
-                denom = max(1, len(topN))
-                if freq / denom >= 0.5:  # 50% 이상 쏠리면 그 소스로 잠금
-                    docs = [d for d, _ in pairs if _norm_source(str((d.metadata or {}).get("source",""))) == best][:k]
-                    _set_sticky(best)
-
-
-        for d, dist in pairs:
-            # 유사도 변환 + 클램프
-            try:
-                sim = 1.0 - float(dist)/2.0
-                sim = max(0.0, min(1.0, sim))
-            except Exception:
-                sim = 0.0
-
-            K = key_of(d)
-            if score_map.get(K, -1.0) < sim:
-                score_map[K] = sim
-
-            # chunk 메타가 없는 로더 대비 텍스트 프리픽스 키
-            md = d.metadata or {}
-            textK = (str(md.get("source","")), md.get("page"), md.get("kind","chunk"), (d.page_content or "")[:80])
-            if text_map.get(textK, -1.0) < sim:
-                text_map[textK] = sim
     except Exception:
-        pass
+        pairs = []
 
-    # 4) 응답 구성(+score)
-    items, contexts = [], []
-    for d in docs:
-        md = dict(d.metadata or {}); md["source"] = str(md.get("source",""))
-        sim = score_map.get(key_of(d))
-        if sim is None:
-            textK = (md["source"], md.get("page"), md.get("kind","chunk"), (d.page_content or "")[:80])
-            sim = text_map.get(textK, 0.0)
+    # (선택) retriever 결과도 풀에 합치기
+    base_docs = []
+    try:
+        base_docs = (retriever.get_relevant_documents(q)
+                    if hasattr(retriever, "get_relevant_documents")
+                    else retriever.invoke(q)) or []
+    except Exception:
+        base_docs = []
 
-        entry = {
+    # 유사도 점수 변환 (FAISS L2 → cos 유사도 근사)
+    def _sim_from_dist(dist):
+        try:
+            s = 1.0 - float(dist)/2.0
+            return max(0.0, min(1.0, s))
+        except Exception:
+            return 0.0
+
+    # 3-B-1) similarity_search_with_score 풀
+    for d, dist in pairs:
+        sim = _sim_from_dist(dist)
+        md = dict(d.metadata or {})
+        md["source"] = str(md.get("source",""))
+        pool_hits.append({
             "text": d.page_content or "",
             "metadata": md,
-            "score": round(sim, 4) if isinstance(sim, (int, float)) else 0.0,
+            "score": sim,
+        })
+
+    # 3-B-2) retriever 풀(점수 없으면 0.5 기본 가중)
+    for d in base_docs:
+        md = dict(d.metadata or {})
+        md["source"] = str(md.get("source",""))
+        pool_hits.append({
+            "text": d.page_content or "",
+            "metadata": md,
+            "score": 0.5,
+        })
+
+    # 3-C) 소스 필터링 (sources / source / sticky / "이 파일")
+    def _norm_source(s: str) -> str:
+        s = (s or "").replace("\\", "/")
+        return re.sub(r"^/app/", "", s)
+
+    if src_set:
+        wanted = {_norm_source(str(s)) for s in src_set}
+        pool_hits = [h for h in pool_hits if _norm_source(h["metadata"].get("source","")) in wanted]
+    elif src_filter:
+        wanted = _norm_source(str(src_filter))
+        pool_hits = [h for h in pool_hits if _norm_source(h["metadata"].get("source","")) == wanted]
+
+    # === 3-D) 의도 파악 후 '조문 없음' 플래그 계산
+    intent = parse_query_intent(q)
+    missing_article = False
+    if intent["article_no"]:
+        # 풀에 해당 조문(article_no)을 가진 섹션이 하나도 없으면 True
+        if not any((h.get("metadata") or {}).get("article_no") == intent["article_no"] for h in pool_hits):
+            missing_article = True
+
+    # 3-E) rerank + 의도기반 주입선택
+    chosen = pick_for_injection(q, pool_hits, k_default=int(k) if isinstance(k, int) else 5)
+
+    # 4) 응답 생성 (기존 포맷 유지)
+    items, contexts = [], []
+    for h in chosen:
+        md = dict(h["metadata"])
+        sc = float(h.get("score") or 0.0)
+        entry = {
+            "text": h["text"],
+            "metadata": md,
+            "score": round(sc, 4),
         }
         items.append(entry)
         contexts.append({
-            "text": entry["text"],
-            "source": md["source"],
+            "text": h["text"],
+            "source": md.get("source"),
             "page": md.get("page"),
             "kind": md.get("kind", "chunk"),
-            "score": entry["score"],
+            "score": round(sc, 4),
         })
-    # >>> [ADD] 디버깅 로그(원하면 사용)
+
     try:
         log.info(
-            "Q=%r src_filter=%r sticky=%r hits=%d chosen=%s",
-            q, src_filter, current_source, len(docs),
-            dict(Counter(_norm_source(str((d.metadata or {}).get('source',''))) for d in docs))
+            "Q=%r src_filter=%r sticky=%r pool=%d chosen=%d by_section=%s",
+            q, src_filter, current_source, len(pool_hits), len(items),
+            dict(Counter((h.get('metadata') or {}).get('section_index', -1) for h in chosen))
         )
     except Exception:
         pass

@@ -24,6 +24,75 @@ DEFAULT_OCR_LANG = "kor+eng"
 DEFAULT_OCR_DPI = 300
 AUTO_OCR_MIN_CHARS = 80   # auto 경로에서 텍스트가 이 값보다 작으면 OCR 폴백
 
+# === Universal heading detection (범용 헤더 스플리터) ===
+HEADING_RES = [
+    # 법/규정: 제7조, 제 7 조, 제7 조 ...
+    (re.compile(r'^\s*(?P<title>제\s*(?P<num>\d{1,3})\s*조[^\n]*?)\s*$', re.MULTILINE), 1, "article"),
+    # 1. 제목
+    (re.compile(r'^\s*(?P<title>\d{1,3}\.\s+[^\n]{2,})\s*$', re.MULTILINE), 1, "h1"),
+    # 1.1. 부제목 / 1.1 / 1.1.1 ...
+    (re.compile(r'^\s*(?P<title>\d{1,3}(?:\.\d{1,3}){1,}\.?\s+[^\n]{2,})\s*$', re.MULTILINE), 2, "h2"),
+    # 로마숫자 I. II. III.
+    (re.compile(r'^\s*(?P<title>[IVXLCDM]+\.\s+[^\n]{2,})\s*$', re.IGNORECASE | re.MULTILINE), 1, "roman"),
+    # 한글 목차: 가. 나. 다.
+    (re.compile(r'^\s*(?P<title>[가-힣]\.\s+[^\n]{2,})\s*$', re.MULTILINE), 2, "alpha_ko"),
+    # 괄호 번호: (1) (2) (3)
+    (re.compile(r'^\s*(?P<title>\(\d+\)\s+[^\n]{2,})\s*$', re.MULTILINE), 3, "paren"),
+]
+
+def _split_sections(text: str) -> list[dict]:
+    if not text or len(text) < 30:
+        return []
+    idxs = []
+    for pat, level, kind in HEADING_RES:
+        for m in pat.finditer(text):
+            title = (m.group("title") or m.group(0)).strip()
+            idxs.append((m.start(), m.end(), title, level, kind))
+
+    if not idxs:
+        return []
+
+    # 시작 위치 기준으로 제일 '강한' 헤더 하나만 남기기 (level 낮을수록 상위)
+    by_start = {}
+    for s, e, title, level, kind in idxs:
+        if s not in by_start or level < by_start[s][3]:
+            by_start[s] = (s, e, title, level, kind)
+    idxs = sorted(by_start.values(), key=lambda x: x[0])
+
+    sections = []
+    for i, (s, e, title, level, kind) in enumerate(idxs):
+        body_start = e
+        body_end = idxs[i+1][0] if i + 1 < len(idxs) else len(text)
+        body = text[body_start:body_end].strip()
+        if len(body) < 40:
+            continue
+        sections.append({"title": title, "level": level, "kind": kind, "body": body})
+    return sections
+
+def _build_section_docs_from_text(text: str, path: Path) -> List[Document]:
+    """split_sections 결과를 LangChain Document로 변환 + article_no 메타 자동 부여"""
+    secs = _split_sections(text)[:400]
+    docs: List[Document] = []
+    for i, sec in enumerate(secs):
+        md = {
+            "source": str(path),
+            "kind": "section",
+            "section_title": sec["title"],
+            "section_level": sec["level"],
+            "section_index": i
+        }
+        m = re.search(r'제\s*(\d{1,3})\s*조', sec["title"])
+        if m:
+            try:
+                md["article_no"] = int(m.group(1))
+            except Exception:
+                pass
+        docs.append(Document(
+            page_content=f'{sec["title"]}\n{sec["body"]}',
+            metadata=md
+        ))
+    return docs
+
 # -----------------------------
 # 공통: 청킹
 # -----------------------------
@@ -31,11 +100,18 @@ def _chunk(docs: List[Document], chunk_size=800, chunk_overlap=120) -> List[Docu
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     out: List[Document] = []
     for d in docs:
-        parts = splitter.split_text(d.page_content or "")
+        text = d.page_content or ""
+        prefix = ""
+        if (d.metadata or {}).get("kind") == "section":
+            # 섹션 제목을 각 청크에 보존
+            st = (d.metadata or {}).get("section_title") or ""
+            if st:
+                prefix = st.strip() + "\n"
+        parts = splitter.split_text(text)
         for i, p in enumerate(parts):
             md = dict(d.metadata)
             md["chunk"] = i
-            out.append(Document(page_content=p, metadata=md))
+            out.append(Document(page_content=(prefix + p) if prefix else p, metadata=md))
     return out
 
 # -----------------------------
@@ -282,21 +358,31 @@ def _ocr_page(pil_img: Image.Image, lang: str = "kor+eng") -> str:
 def load_pdf_ocr(path: Path, dpi: int = 400, lang: str = "kor+eng") -> List[Document]:
     """[OCR] 스캔/깨짐 PDF 전용 로더"""
     pages = convert_from_path(str(path), dpi=dpi)   # poppler-utils 필요
+    page_texts: List[str] = []
     docs: List[Document] = []
+
     for i, im in enumerate(pages, start=1):
         txt = _ocr_page(im, lang=lang)
+        page_texts.append(txt or "")
         if txt:
             docs.append(Document(
                 page_content=txt,
                 metadata={"source": str(path), "type": "pdf", "page": i, "kind": "ocr_text"}
             ))
+
     # 제목/요약 메타 보강
     if docs:
         head = " ".join((docs[0].page_content or "").split()[:60])
         docs.insert(0, Document(page_content=f"[TITLE] {path.stem}", metadata={"source": str(path), "kind": "title"}))
         if head:
             docs.insert(1, Document(page_content=f"[SUMMARY] {path.name} 개요: {head}", metadata={"source": str(path), "kind": "summary"}))
-    return docs
+
+    # OCR 전체 본문으로 섹션 생성
+    joined = "\n".join(t for t in page_texts if t)
+    section_docs = _build_section_docs_from_text(joined, path)
+    docs = section_docs + docs
+
+    return _dedup(docs)
     
 def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
     im = np.array(img.convert("RGB"))
@@ -319,7 +405,7 @@ def _build_docs_from_page_texts(page_texts: List[str], path: Path) -> List[Docum
         if page_text.strip():
             docs.append(Document(
                 page_content=page_text,
-                metadata={"source": str(path), "type": "pdf_ocr", "page": idx}
+                metadata={"source": str(path), "type": "pdf", "page": idx, "kind": "ocr_text"}
             ))
     # 간단 SUMMARY/TITLE 메타
     head_lines = []
@@ -337,7 +423,10 @@ def _build_docs_from_page_texts(page_texts: List[str], path: Path) -> List[Docum
             page_content=f"[TITLE] {title}",
             metadata={"source": str(path), "kind": "title"},
         ))
-    return docs
+    # >>> '전체 본문'을 대상으로 범용 섹션 분해
+    joined = "\n".join(t for t in page_texts if t)
+    section_docs = _build_section_docs_from_text(joined, path)
+    return _dedup(section_docs + docs)   # 섹션 문서를 우선 넣고 dedup
 
 def _load_pdf_auto(path: Path) -> List[Document]:
     """표→문장 + 텍스트 스니펫을 함께 만들고,
@@ -407,7 +496,11 @@ def _load_pdf_auto(path: Path) -> List[Document]:
     if not text_candidates or total_chars < AUTO_OCR_MIN_CHARS or _looks_gibberish(full_text):
         ocr_docs = load_pdf_ocr(path, dpi=450, lang=DEFAULT_OCR_LANG)  # 고품질 파이프라인
         return _dedup(ocr_docs)
-
+    
+    joined_for_sections = "\n".join(text_candidates)
+    docs += _build_section_docs_from_text(joined_for_sections, path)
+    docs = _dedup(docs)
+    
     # 4) 요약/제목 메타 청크 (OCR 폴백 안 탔을 때만 진행)
     head = " ".join(first_text_lines)[:400]
     if head:
