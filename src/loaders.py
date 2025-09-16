@@ -12,6 +12,17 @@ from pptx import Presentation
 import openpyxl
 from src.config import settings
 
+# [ADD OCR] 의존성
+from pdf2image import convert_from_path            # poppler-utils 필요
+import pytesseract                                 # tesseract-ocr / kor / eng 필요
+import cv2, numpy as np
+from PIL import Image
+
+# [ADD OCR] 기본 OCR 옵션
+DEFAULT_OCR_LANG = "kor+eng"
+DEFAULT_OCR_DPI = 300
+AUTO_OCR_MIN_CHARS = 80   # auto 경로에서 텍스트가 이 값보다 작으면 OCR 폴백
+
 # -----------------------------
 # 공통: 청킹
 # -----------------------------
@@ -209,7 +220,7 @@ def _extract_pdf_title(path: Path) -> str | None:
         if hasattr(meta, "title"):
             t = meta.title
         elif isinstance(meta, dict):
-            t = meta.get("/Title") or meta.get("Title")
+            t = meta.get("/Title") or t.get("Title")  # type: ignore
         if t and str(t).strip():
             return str(t).strip()
     except Exception:
@@ -228,13 +239,61 @@ def _extract_pdf_title(path: Path) -> str | None:
     # 3) 폴백: 파일명
     return path.stem
 
+# [ADD OCR] OCR 전처리/실행
+def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    im = np.array(img.convert("RGB"))
+    im = cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)
+    im = cv2.threshold(im, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    return Image.fromarray(im)
+
+def _ocr_pdf_to_texts(pdf_path: Path, dpi: int = DEFAULT_OCR_DPI, lang: str = DEFAULT_OCR_LANG) -> List[str]:
+    images = convert_from_path(str(pdf_path), dpi=dpi)  # poppler-utils 필요
+    texts: List[str] = []
+    for pil_img in images:
+        proc = _preprocess_for_ocr(pil_img)
+        txt = pytesseract.image_to_string(proc, lang=lang)
+        texts.append((txt or "").strip())
+    return texts
+
+def _build_docs_from_page_texts(page_texts: List[str], path: Path) -> List[Document]:
+    docs: List[Document] = []
+    for idx, page_text in enumerate(page_texts, start=1):
+        if page_text.strip():
+            docs.append(Document(
+                page_content=page_text,
+                metadata={"source": str(path), "type": "pdf_ocr", "page": idx}
+            ))
+    # 간단 SUMMARY/TITLE 메타
+    head_lines = []
+    if page_texts:
+        head_lines = [ln.strip() for ln in (page_texts[0].splitlines() if page_texts[0] else []) if ln.strip()][:10]
+    head = " ".join(head_lines)[:400]
+    if head:
+        docs.append(Document(
+            page_content=f"[SUMMARY] {path.name} 개요: {head}",
+            metadata={"source": str(path), "kind": "summary"},
+        ))
+    title = _extract_pdf_title(path) or path.stem
+    if title:
+        docs.insert(0, Document(
+            page_content=f"[TITLE] {title}",
+            metadata={"source": str(path), "kind": "title"},
+        ))
+    return docs
+
 def _load_pdf_auto(path: Path) -> List[Document]:
     """표→문장 + 텍스트 스니펫을 함께 만들고,
-       표 문장이 적으면 기본 파서 결과와 병합."""
+       표 문장이 적으면 기본 파서와 병합. (텍스트가 너무 적으면 OCR 폴백)"""
     try:
         import pdfplumber
     except Exception:
-        return load_pdf(path)
+        # pdfplumber 없으면 기본 텍스트만
+        base = load_pdf(path)
+        # [MOD OCR] 텍스트가 거의 없으면 OCR 폴백
+        if sum(len(d.page_content) for d in base) < AUTO_OCR_MIN_CHARS:
+            ocr_docs = _build_docs_from_page_texts(_ocr_pdf_to_texts(path), path)
+            return _dedup(ocr_docs)
+        return base
 
     docs: List[Document] = []
     first_text_lines: list[str] = []
@@ -270,9 +329,16 @@ def _load_pdf_auto(path: Path) -> List[Document]:
 
     # 3) 표가 거의 없으면 기본 파서와 병합
     threshold = settings.PDF_TABLE_THRESHOLD
+    legacy = []
     if table_sentence_cnt < threshold:
         legacy = load_pdf(path)
         docs = _dedup(legacy + docs)
+
+    # [MOD OCR] auto 경로에서도 총텍스트가 너무 적으면 OCR 폴백
+    total_chars = sum(len(d.page_content) for d in docs)
+    if total_chars < AUTO_OCR_MIN_CHARS:
+        ocr_docs = _build_docs_from_page_texts(_ocr_pdf_to_texts(path), path)
+        return _dedup(ocr_docs)
 
     # 4) 요약/제목 메타 청크
     head = " ".join(first_text_lines)[:400]
@@ -301,8 +367,15 @@ def load_docs_any(
     p = Path(path)
     ext = p.suffix.lower()
 
+    # [ADD OCR] 강제 OCR 파서
+    if parser == "ocr_hi":
+        if ext != ".pdf":
+            raise ValueError("ocr_hi 파서는 PDF에만 사용할 수 있습니다.")
+        ocr_docs = _build_docs_from_page_texts(_ocr_pdf_to_texts(p), p)
+        return _chunk(_dedup(ocr_docs), chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
     if ext == ".pdf":
-        docs = _load_pdf_auto(p)  # auto: 표-친화 시도 후 부족하면 기본과 병합
+        docs = _load_pdf_auto(p)  # auto: 표-친화 시도 후 부족하면 기본 병합, 너무 적으면 OCR 폴백
         return _chunk(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
     if ext == ".csv":

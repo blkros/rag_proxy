@@ -3,6 +3,14 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
  && rm -rf /var/lib/apt/lists/*
 
+ # (rag-proxy 이미지 빌드 단계에 추가)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng poppler-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    pdf2image pytesseract opencv-python-headless Pillow
+
 WORKDIR /app
 
 COPY requirements.txt /app/
