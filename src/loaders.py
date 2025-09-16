@@ -17,6 +17,7 @@ from pdf2image import convert_from_path            # poppler-utils 필요
 import pytesseract                                 # tesseract-ocr / kor / eng 필요
 import cv2, numpy as np
 from PIL import Image
+import re
 
 # [ADD OCR] 기본 OCR 옵션
 DEFAULT_OCR_LANG = "kor+eng"
@@ -220,7 +221,7 @@ def _extract_pdf_title(path: Path) -> str | None:
         if hasattr(meta, "title"):
             t = meta.title
         elif isinstance(meta, dict):
-            t = meta.get("/Title") or t.get("Title")  # type: ignore
+            t = meta.get("/Title") or meta.get("Title")
         if t and str(t).strip():
             return str(t).strip()
     except Exception:
@@ -240,6 +241,52 @@ def _extract_pdf_title(path: Path) -> str | None:
     return path.stem
 
 # [ADD OCR] OCR 전처리/실행
+_HANGUL_ENG_NUM = re.compile(r"[ㄱ-ㅎ가-힣A-Za-z0-9]")
+
+def _looks_gibberish(text: str) -> bool:
+    """[OCR] 한/영/숫자 비율이 너무 낮거나 제어/기호가 과도하면 '깨짐'으로 간주"""
+    if not text or len(text) < 30:
+        return True
+    good = len(_HANGUL_ENG_NUM.findall(text))
+    ratio = good / max(1, len(text))
+    return ratio < 0.25  # 경험치: 25% 미만이면 OCR 필요 가능성 높음
+
+def _ocr_page(pil_img: Image.Image, lang: str = "kor+eng") -> str:
+    """[OCR] 고해상도 + 이진화/잡음제거 후 Tesseract"""
+    # 고해상도 확보
+    img = np.array(pil_img.convert("RGB"))
+    # 그레이스케일
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    # 가우시안 블러로 노이즈 축소 후 OTSU 이진화
+    gray = cv2.GaussianBlur(gray, (3,3), 0)
+    _, binarized = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 약한 팽창/침식으로 글자 연결성 보정
+    kernel = np.ones((2,2), np.uint8)
+    proc = cv2.morphologyEx(binarized, cv2.MORPH_OPEN, kernel, iterations=1)
+    # OCR
+    config = "--psm 6"  # 한 문서 내 여러 블록/문장을 안정적으로
+    text = pytesseract.image_to_string(proc, lang=lang, config=config)
+    return text.strip()
+
+def load_pdf_ocr(path: Path, dpi: int = 400, lang: str = "kor+eng") -> List[Document]:
+    """[OCR] 스캔/깨짐 PDF 전용 로더"""
+    pages = convert_from_path(str(path), dpi=dpi)   # poppler-utils 필요
+    docs: List[Document] = []
+    for i, im in enumerate(pages, start=1):
+        txt = _ocr_page(im, lang=lang)
+        if txt:
+            docs.append(Document(
+                page_content=txt,
+                metadata={"source": str(path), "type": "pdf", "page": i, "kind": "ocr_text"}
+            ))
+    # 제목/요약 메타 보강
+    if docs:
+        head = " ".join((docs[0].page_content or "").split()[:60])
+        docs.insert(0, Document(page_content=f"[TITLE] {path.stem}", metadata={"source": str(path), "kind": "title"}))
+        if head:
+            docs.insert(1, Document(page_content=f"[SUMMARY] {path.name} 개요: {head}", metadata={"source": str(path), "kind": "summary"}))
+    return docs
+    
 def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
     im = np.array(img.convert("RGB"))
     im = cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)

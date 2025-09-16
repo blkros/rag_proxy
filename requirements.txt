@@ -19,8 +19,8 @@ openpyxl
 chardet
 pandas==2.3.2
 python-multipart
-pdfplumber
 transformers
 huggingface-hub
 hf-transfer
 FlagEmbedding
+pdfplumber>=0.11
