@@ -7,6 +7,7 @@ import shutil, os, logging, re
 from fastapi.responses import RedirectResponse
 from fastapi import Body
 import time
+import src.vectorstore as VS
 
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
@@ -124,6 +125,7 @@ def _empty_faiss() -> FAISSStore:
 def _reload_retriever():
     global retriever
     retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 5, "fetch_k": 40})
+    VS.retriever = retriever
 
 # 인덱싱 동시성 방지 락
 index_lock = asyncio.Lock()
@@ -244,6 +246,9 @@ def _startup():
         logger.info("Startup complete. Index at %s", INDEX_DIR)
     except Exception as e:
         logger.exception("Startup failed: %s", e)
+    VS.vectorstore = vectorstore
+    VS.retriever = retriever
+
 
 @app.get("/health")
 def health():
@@ -434,6 +439,8 @@ async def delete_index(payload: Optional[dict] = None):
             vectorstore = _empty_faiss()
             vectorstore.save_local(INDEX_DIR)
             _reload_retriever()
+            VS.vectorstore = vectorstore
+            VS.retriever  = retriever
             return {"deleted": "all", "doc_count": len(vectorstore.docstore._dict)}
         except Exception as e:
             raise HTTPException(500, f"delete all failed: {e}")
