@@ -26,17 +26,20 @@ AUTO_OCR_MIN_CHARS = 80   # auto 경로에서 텍스트가 이 값보다 작으�
 
 # === Universal heading detection (범용 헤더 스플리터) ===
 HEADING_RES = [
-    # 법/규정: 제7조, 제 7 조, 제7 조 ...
-    (re.compile(r'^\s*(?P<title>제\s*(?P<num>\d{1,3})\s*조[^\n]*?)\s*$', re.MULTILINE), 1, "article"),
+    # 법/규정: 제7조, 제│7 조 … (세로바/기호 허용)
+    (re.compile(
+        r'^\s*(?:[•\-\u25BA\u25CF\u2022▶]?\s*)?(?P<title>제\s*[\|\│\.\-\u2502\u2503]?\s*(?P<num>\d{1,3})\s*조[^\n]*?)\s*$',
+        re.MULTILINE
+     ), 1, "article"),
     # 1. 제목
     (re.compile(r'^\s*(?P<title>\d{1,3}\.\s+[^\n]{2,})\s*$', re.MULTILINE), 1, "h1"),
-    # 1.1. 부제목 / 1.1 / 1.1.1 ...
+    # 1.1. …
     (re.compile(r'^\s*(?P<title>\d{1,3}(?:\.\d{1,3}){1,}\.?\s+[^\n]{2,})\s*$', re.MULTILINE), 2, "h2"),
-    # 로마숫자 I. II. III.
+    # 로마숫자
     (re.compile(r'^\s*(?P<title>[IVXLCDM]+\.\s+[^\n]{2,})\s*$', re.IGNORECASE | re.MULTILINE), 1, "roman"),
-    # 한글 목차: 가. 나. 다.
+    # 가. 나. 다.
     (re.compile(r'^\s*(?P<title>[가-힣]\.\s+[^\n]{2,})\s*$', re.MULTILINE), 2, "alpha_ko"),
-    # 괄호 번호: (1) (2) (3)
+    # (1) (2) …
     (re.compile(r'^\s*(?P<title>\(\d+\)\s+[^\n]{2,})\s*$', re.MULTILINE), 3, "paren"),
 ]
 
@@ -50,7 +53,12 @@ def _split_sections(text: str) -> list[dict]:
             idxs.append((m.start(), m.end(), title, level, kind))
 
     if not idxs:
-        return []
+        # Fallback: 줄 시작이 아니어도 '제6조'가 보이면 그 지점부터 섹션으로 간주
+        ANY_ART_RE = re.compile(r'제\s*(\d{1,3})\s*조[^\n]*')
+        idxs2 = [(m.start(), m.end(), m.group(0).strip(), 1, "article") for m in ANY_ART_RE.finditer(text)]
+        if not idxs2:
+            return []
+        idxs = sorted(idxs2, key=lambda x: x[0])
 
     # 시작 위치 기준으로 제일 '강한' 헤더 하나만 남기기 (level 낮을수록 상위)
     by_start = {}
@@ -94,8 +102,20 @@ def _build_section_docs_from_text(text: str, path: Path) -> List[Document]:
         docs.append(Document(page_content=sec["body"], metadata=md))
     return docs
 
+_OCR_SEP_RE = re.compile(r"[│|¦┃┆┇┊┋丨ㅣ]")  # 세로바/유사문자
+
+def _norm_brackets(s: str) -> str:
+    repl = {"［":"[", "］":"]", "【":"[", "】":"]", "〔":"(", "〕":")", "「":"[", "」":"]", "『":"[", "』":"]"}
+    for a, b in repl.items():
+        s = s.replace(a, b)
+    return s  # ← 반드시 반환
+
 def _normalize_articles(s: str) -> str:
-    return re.sub(r'제\s*([0-9]{1,3})\s*조', lambda m: f"제{int(m.group(1))}조", s)
+    s = _norm_brackets(s)
+    s = _OCR_SEP_RE.sub(" ", s)  # │, | 등 -> 공백
+    # 제 (세로바/점/하이픈 허용) 숫자 조  ->  제{숫자}조
+    pat = re.compile(r"제\s*[\|\│\.\-\u2502\u2503]?\s*([0-9]{1,3})\s*조")
+    return pat.sub(lambda m: f"제{int(m.group(1))}조", s)
 
 
 # -----------------------------

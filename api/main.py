@@ -718,6 +718,14 @@ async def query(payload: dict = Body(...)):
             "score": 0.5,
         })
 
+    # === 3-D) 의도 파악
+    intent = parse_query_intent(q)
+
+    # 조문 질의면 스티키 무효(사용자가 payload로 명시한 source만 존중)
+    if intent.get("article_no"):
+        src_filter = (payload or {}).get("source")
+
+    # 여기에서 pool_hits에 최종 소스 필터 적용
     if src_set:
         wanted = {_norm_source(str(s)) for s in src_set}
         pool_hits = [h for h in pool_hits if _norm_source(h["metadata"].get("source","")) in wanted]
@@ -725,13 +733,24 @@ async def query(payload: dict = Body(...)):
         wanted = _norm_source(str(src_filter))
         pool_hits = [h for h in pool_hits if _norm_source(h["metadata"].get("source","")) == wanted]
 
-    # === 3-D) 의도 파악 후 '조문 없음' 플래그 계산
-    intent = parse_query_intent(q)
+    # --- 조문 텍스트 가산점/누락 플래그 ---
+    def _bonus_for_article_text(h, artno: int) -> float:
+        # 텍스트 내 '제{n}조'가 OCR 노이즈(공백/세로바 등) 제거 후 보이면 가산점
+        t = (h.get("text") or "")
+        t2 = re.sub(r"[ \t\r\n│|¦┃┆┇┊┋丨ㅣ]", "", t)  # 공백/세로바 제거
+        return 0.15 if re.search(fr"제{artno}조", t2) else 0.0
+
     missing_article = False
-    if intent["article_no"]:
-        # 풀에 해당 조문(article_no)을 가진 섹션이 하나도 없으면 True
-        if not any((h.get("metadata") or {}).get("article_no") == intent["article_no"] for h in pool_hits):
-            missing_article = True
+    if intent.get("article_no"):
+        art = intent["article_no"]
+        # 메타(article_no)로 잡혔거나, 텍스트 패턴으로라도 보이면 '존재'로 판단
+        have_meta = any((h.get("metadata") or {}).get("article_no") == art for h in pool_hits)
+        have_text = any(_bonus_for_article_text(h, art) > 0 for h in pool_hits)
+        missing_article = not (have_meta or have_text)
+
+        # 조문 질의면 관련 히트에 가산점 부여
+        for h in pool_hits:
+            h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, art)
 
     # 3-E) rerank + 의도기반 주입선택
     chosen = pick_for_injection(q, pool_hits, k_default=int(k) if isinstance(k, int) else 5)
