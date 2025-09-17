@@ -721,8 +721,9 @@ async def query(payload: dict = Body(...)):
     # === 3-D) 의도 파악
     intent = parse_query_intent(q)
 
-    # 조문 질의면 스티키 무효(사용자가 payload로 명시한 source만 존중)
-    if intent.get("article_no"):
+    # 조문 질의여도, 사용자가 source를 명시한 경우에만 그 값으로 고정
+    # (명시 안 했으면 sticky/last_source 그대로 유지)
+    if intent.get("article_no") and ("source" in (payload or {})):
         src_filter = (payload or {}).get("source")
 
     # 여기에서 pool_hits에 최종 소스 필터 적용
