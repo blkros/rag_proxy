@@ -28,3 +28,4 @@ pdf2image
 pytesseract
 opencv-python-headless
 Pillow
+langchain-text-splitters

@@ -16,6 +16,15 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ocrmypdf qpdf ghostscript \
+    tesseract-ocr tesseract-ocr-kor tesseract-ocr-script-hang \
+    poppler-utils \
+    fonts-nanum fonts-noto-cjk \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+
 # 소스는 명시적으로 복사 (api/, src/가 반드시 컨텍스트 최상위에 있어야 함)
 COPY api/ /app/api
 COPY src/ /app/src
