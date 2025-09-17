@@ -16,6 +16,7 @@ from src.config import settings
 import asyncio, hashlib
 from collections import Counter
 from src.retrieval.rerank import parse_query_intent, pick_for_injection
+from api.smart_router import router as smart_router
 
 # empty FAISS 빌드를 위한 보조들
 import faiss
@@ -59,6 +60,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(smart_router)
+
+
 logger = logging.getLogger("rag-proxy")
 log = logging.getLogger(__name__)
 
