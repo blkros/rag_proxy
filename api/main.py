@@ -14,6 +14,7 @@ from src.rag_pipeline import build_rag_chain, Document
 from src.loaders import load_docs_any
 from fastapi.middleware.cors import CORSMiddleware
 from src.config import settings
+from src.ext.confluence_mcp import mcp_search
 import asyncio, hashlib
 from collections import Counter
 from src.retrieval.rerank import parse_query_intent, pick_for_injection
@@ -812,6 +813,64 @@ async def query(payload: dict = Body(...)):
         )
     except Exception:
         pass
+
+    # === [ADD] 히트가 없거나 너무 약하면 MCP(Confluence) 폴백 시도 → 벡터DB 업서트 후 재질의
+    NEED_FALLBACK = (len(items) == 0) or (len(pool_hits) < max(10, k*2)) or missing_article
+    if NEED_FALLBACK:
+        try:
+            log.info("MCP fallback: calling Confluence MCP for query=%r", q)
+            mcp_results = await mcp_search(q, limit=5, timeout=20)
+            # MCP 결과를 문서로 변환
+            new_docs = []
+            for r in mcp_results:
+                txt = (r.get("title","").strip() + "\n\n" if r.get("title") else "") + (r.get("body") or "")
+                if not txt.strip():
+                    continue
+                md = {
+                    "source": r.get("url") or f"confluence://{hashlib.sha1(txt.encode('utf-8','ignore')).hexdigest()[:10]}",
+                    "kind": "confluence",
+                    "page": None,
+                }
+                new_docs.append(Document(page_content=txt, metadata=md))
+
+            if new_docs:
+                async with index_lock:
+                    added = _upsert_docs_no_dup(new_docs)
+                    log.info("MCP fallback: upserted %d docs (query=%r)", added, q)
+
+                # 재질의(간단히 재검색만)
+                try:
+                    docs2 = (retriever.get_relevant_documents(q)
+                             if hasattr(retriever, "get_relevant_documents")
+                             else retriever.invoke(q)) or []
+                except Exception:
+                    docs2 = []
+                # 상위 k로 재구성
+                docs2 = docs2[:k]
+                items, contexts = [], []
+                for d in docs2:
+                    md = dict(d.metadata or {})
+                    entry = {"text": d.page_content or "", "metadata": md, "score": 0.5}
+                    items.append(entry)
+                    contexts.append({
+                        "text": entry["text"],
+                        "source": md.get("source"),
+                        "page": md.get("page"),
+                        "kind": md.get("kind","chunk"),
+                        "score": 0.5,
+                    })
+                # 재구성한 결과를 그대로 반환
+                return {
+                    "hits": len(items),
+                    "items": items,
+                    "contexts": contexts,
+                    "context_texts": [it["text"] for it in items],
+                    "documents": items,
+                    "chunks": items,
+                    "notes": {"fallback_used": True}
+                }
+        except Exception as e:
+            log.warning("MCP fallback failed: %s", e)
 
     return {
         "hits": len(items),
