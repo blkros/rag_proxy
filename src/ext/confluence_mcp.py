@@ -4,7 +4,7 @@ import os, asyncio, json, logging, hashlib
 from typing import Any, Dict, List, Optional
 
 from mcp import ClientSession
-from mcp.client.sse import http_client # << 변경 포인트
+from mcp.client.http import http_client
 
 log = logging.getLogger(__name__)
 

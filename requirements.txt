@@ -29,4 +29,4 @@ pytesseract
 opencv-python-headless
 Pillow
 langchain-text-splitters
-mcp>=1.14.0
+mcp[client]>=1.2.0
