@@ -4,7 +4,7 @@ import os, asyncio, json, logging, hashlib
 from typing import Any, Dict, List, Optional
 
 from mcp import ClientSession
-from mcp.client.sse import sse_client  # << 변경 포인트
+from mcp.client.sse import http_client # << 변경 포인트
 
 log = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict
     results: List[Dict[str, Any]] = []
 
     # SSE로 MCP 세션 연결 (신 SDK는 sse_client가 정답)
-    async with sse_client(url) as (read, write):
+    async with http_client(url) as (read, write):
         async with ClientSession(read, write) as session:
             tools = await session.list_tools()
             # 서버 구현 이름 폭넓게 매칭
