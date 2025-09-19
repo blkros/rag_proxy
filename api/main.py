@@ -7,6 +7,7 @@ import shutil, os, logging, re
 from fastapi.responses import RedirectResponse
 from fastapi import Body
 import time
+import traceback
 import src.vectorstore as VS
 
 from src.utils import proxy_get, call_chat_completions, drop_think
@@ -130,6 +131,8 @@ def _reload_retriever():
 
 # 인덱싱 동시성 방지 락
 index_lock = asyncio.Lock()
+# [ADD] MCP 폴백 동시 호출을 막는 락
+mcp_lock = asyncio.Lock()
 
 # 문서 고유 ID (중복 방지용)
 def _doc_id(d: Document) -> str:
@@ -172,9 +175,7 @@ def build_openai_messages(question: str, k: int = 5) -> Tuple[List[Dict[str, Any
     docs: List[Document] = []
     if retriever is not None:
         try:
-            docs = (retriever.get_relevant_documents(question)
-                    if hasattr(retriever, "get_relevant_documents")
-                    else retriever.invoke(question))
+            docs = retriever.invoke(question)
         except Exception:
             docs = []
 
@@ -637,9 +638,7 @@ async def query(payload: dict = Body(...)):
 
     # 3-A) 후보 선택은 MMR로(기존 그대로)
     try:
-        docs = (retriever.get_relevant_documents(q)
-                if hasattr(retriever, "get_relevant_documents")
-                else retriever.invoke(q))
+        docs = retriever.invoke(q)
     except Exception:
         docs = []
 
@@ -671,10 +670,6 @@ async def query(payload: dict = Body(...)):
                 _set_sticky(src_filter)
         except Exception:
             pass
-    # if fname:
-    #     same = [d for d in docs if fname in str(d.metadata.get("source","")).lower()]
-    #     if same:
-    #         docs = same
 
     # 2) 확장자 없이도 매칭(질문에 포함된 토큰이 소스 파일명에 들어가면)
     if not fname:
@@ -731,9 +726,7 @@ async def query(payload: dict = Body(...)):
     # (선택) retriever 결과도 풀에 합치기
     base_docs = []
     try:
-        base_docs = (retriever.get_relevant_documents(q)
-                    if hasattr(retriever, "get_relevant_documents")
-                    else retriever.invoke(q)) or []
+        base_docs = retriever.invoke(q) or []
     except Exception:
         base_docs = []
 
@@ -850,13 +843,14 @@ async def query(payload: dict = Body(...)):
     except Exception:
         pass
 
-    # === [ADD] 히트가 없거나 너무 약하면 MCP(Confluence) 폴백 시도 → 벡터DB 업서트 후 재질의
     NEED_FALLBACK = (len(items) == 0) or (len(pool_hits) < max(10, k*2)) or missing_article
     if NEED_FALLBACK:
         try:
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
-            mcp_results = await mcp_search(q, limit=5, timeout=20)
-            # MCP 결과를 문서로 변환
+            async with mcp_lock:
+                mcp_results = await mcp_search(q, limit=5, timeout=20)
+
+            # MCP 결과 → 문서화
             new_docs = []
             for r in mcp_results:
                 txt = (r.get("title","").strip() + "\n\n" if r.get("title") else "") + (r.get("body") or "")
@@ -874,14 +868,12 @@ async def query(payload: dict = Body(...)):
                     added = _upsert_docs_no_dup(new_docs)
                     log.info("MCP fallback: upserted %d docs (query=%r)", added, q)
 
-                # 재질의(간단히 재검색만)
+                # 재검색으로 간단 재질의
                 try:
-                    docs2 = (retriever.get_relevant_documents(q)
-                             if hasattr(retriever, "get_relevant_documents")
-                             else retriever.invoke(q)) or []
+                    docs2 = retriever.invoke(q) or []
                 except Exception:
                     docs2 = []
-                # 상위 k로 재구성
+
                 docs2 = docs2[:k]
                 items, contexts = [], []
                 for d in docs2:
@@ -895,7 +887,7 @@ async def query(payload: dict = Body(...)):
                         "kind": md.get("kind","chunk"),
                         "score": 0.5,
                     })
-                # 재구성한 결과를 그대로 반환
+
                 return {
                     "hits": len(items),
                     "items": items,
@@ -905,8 +897,17 @@ async def query(payload: dict = Body(...)):
                     "chunks": items,
                     "notes": {"fallback_used": True}
                 }
+
         except Exception as e:
-            log.warning("MCP fallback failed: %s", e)
+            # 3.11+면 ExceptionGroup에 'exceptions' 속성이 있음
+            exs = getattr(e, "exceptions", None)
+            if exs and isinstance(exs, (list, tuple)):
+                for i, ex in enumerate(exs, 1):
+                    log.error("MCP fallback failed [%d/%d]: %s",
+                            i, len(exs), "".join(traceback.format_exception(ex)))
+            else:
+                log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
+
 
     return {
         "hits": len(items),
