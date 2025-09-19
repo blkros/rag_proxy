@@ -69,12 +69,12 @@ class MCP:
         args: Dict[str, Any] = {"query": query, "limit": limit}
         if space:
             args["space"] = space
-
+        tool = os.getenv("CONFLUENCE_TOOL_SEARCH", "search_pages")
         res = self._post({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": {"name": "confluence_search", "arguments": args},
+            "params": {"name": tool, "arguments": args},
         })
 
         # 결과 포맷은 서버 구현에 따라 다소 다를 수 있어 안전하게 파싱
@@ -90,7 +90,7 @@ class MCP:
         # 컨플 URI만
         return [u for u in uris if isinstance(u, str) and u.startswith("confluence://")]
 
-    def read(self, uri: str) -> Dict[str, Any]:
+    def read(self, uri: str) -> dict:
         res = self._post({
             "jsonrpc": "2.0",
             "id": 4,
@@ -98,11 +98,6 @@ class MCP:
             "params": {"uri": uri},
         })
         result = res.get("result", {}) or {}
-        text = result.get("text")
-        if not text:
-            # FastMCP 스타일: contents=[{type:'text', text:'...'}]
-            contents = result.get("contents") or []
-            if contents and isinstance(contents[0], dict):
-                text = contents[0].get("text")
+        text = result.get("text") or result.get("contents", [{}])[0].get("text", "")
         meta = result.get("meta") or {}
         return {"uri": uri, "text": text or "", "meta": meta}
