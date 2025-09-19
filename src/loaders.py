@@ -13,8 +13,21 @@ import openpyxl
 from src.config import settings
 
 # [ADD OCR] 의존성
-from pdf2image import convert_from_path            # poppler-utils 필요
-import pytesseract                                 # tesseract-ocr / kor / eng 필요
+# >>> FIX: pdf2image / pytesseract가 없을 경우를 대비해 안전 가드 추가
+try:
+    from pdf2image import convert_from_path            # poppler-utils 필요
+    _PDF2IMAGE_OK = True   # ← 의존성 확인 플래그
+except Exception:
+    convert_from_path = None
+    _PDF2IMAGE_OK = False  # ← 없으면 False
+
+try:
+    import pytesseract                                 # tesseract-ocr / kor / eng 필요
+    _TESSERACT_OK = True
+except Exception:
+    pytesseract = None
+    _TESSERACT_OK = False
+
 import cv2, numpy as np
 from PIL import Image
 import re
@@ -385,8 +398,13 @@ def _ocr_page(pil_img: Image.Image, lang: str = "kor+eng") -> str:
     text = pytesseract.image_to_string(proc, lang=lang, config=config)
     return text.strip()
 
+# >>> FIX: OCR 전용 로더도 의존성 없으면 기본 파서로 강등
 def load_pdf_ocr(path: Path, dpi: int = 400, lang: str = "kor+eng") -> List[Document]:
     """[OCR] 스캔/깨짐 PDF 전용 로더"""
+    if not (_PDF2IMAGE_OK and _TESSERACT_OK):
+        # ← OCR 불가: 기본 텍스트 파서 결과라도 리턴해 앱이 죽지 않게
+        return _dedup(_build_docs_from_page_texts([], path) + load_pdf(path))
+
     pages = convert_from_path(str(path), dpi=dpi)   # poppler-utils 필요
     page_texts: List[str] = []
     docs: List[Document] = []
@@ -400,19 +418,19 @@ def load_pdf_ocr(path: Path, dpi: int = 400, lang: str = "kor+eng") -> List[Docu
                 metadata={"source": str(path), "type": "pdf", "page": i, "kind": "ocr_text"}
             ))
 
-    # 제목/요약 메타 보강
+    # 제목/요약 메타 보강 (이하 기존 그대로)
     if docs:
         head = " ".join((docs[0].page_content or "").split()[:60])
         docs.insert(0, Document(page_content=f"[TITLE] {path.stem}", metadata={"source": str(path), "kind": "title"}))
         if head:
             docs.insert(1, Document(page_content=f"[SUMMARY] {path.name} 개요: {head}", metadata={"source": str(path), "kind": "summary"}))
 
-    # OCR 전체 본문으로 섹션 생성
     joined = _normalize_articles("\n".join(t for t in page_texts if t))
     section_docs = _build_section_docs_from_text(joined, path)
     docs = section_docs + docs
 
     return _dedup(docs)
+
     
 def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
     im = np.array(img.convert("RGB"))
@@ -420,14 +438,19 @@ def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
     im = cv2.threshold(im, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
     return Image.fromarray(im)
 
+# >>> OCR 스택이 없으면 빈 리스트를 반환하여 상위 로직이 텍스트 파서로 자연 강등
 def _ocr_pdf_to_texts(pdf_path: Path, dpi: int = DEFAULT_OCR_DPI, lang: str = DEFAULT_OCR_LANG) -> List[str]:
-    images = convert_from_path(str(pdf_path), dpi=dpi)  # poppler-utils 필요
+    if not (_PDF2IMAGE_OK and _TESSERACT_OK):
+        return []  # ← 의존성 없으면 OCR 시도 자체를 건너뜀
+
+    images = convert_from_path(str(pdf_path), dpi=dpi)
     texts: List[str] = []
     for pil_img in images:
         proc = _preprocess_for_ocr(pil_img)
-        txt = pytesseract.image_to_string(proc, lang=lang)
+        txt = pytesseract.image_to_string(proc, lang=lang) if _TESSERACT_OK else ""
         texts.append((txt or "").strip())
     return texts
+
 
 def _build_docs_from_page_texts(page_texts: List[str], path: Path) -> List[Document]:
     docs: List[Document] = []
@@ -524,8 +547,11 @@ def _load_pdf_auto(path: Path) -> List[Document]:
 
     # 조건: 본문이 거의 없거나(길이), 있긴 한데 '깨짐'(가독성 낮음)
     if not text_candidates or total_chars < AUTO_OCR_MIN_CHARS or _looks_gibberish(full_text):
-        ocr_docs = load_pdf_ocr(path, dpi=450, lang=DEFAULT_OCR_LANG)  # 고품질 파이프라인
-        return _dedup(ocr_docs)
+        # >>> FIX: OCR 스택이 있을 때만 OCR, 없으면 기본 파서로 강등
+        if _PDF2IMAGE_OK and _TESSERACT_OK:
+            ocr_docs = load_pdf_ocr(path, dpi=450, lang=DEFAULT_OCR_LANG)  # 고품질 파이프라인
+            return _dedup(ocr_docs)
+        return _dedup(load_pdf(path))  # ← 의존성 없으면 여기로
     
     joined_for_sections = _normalize_articles("\n".join(text_candidates))
     docs += _build_section_docs_from_text(joined_for_sections, path)

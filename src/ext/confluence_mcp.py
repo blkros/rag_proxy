@@ -9,7 +9,13 @@ from mcp.client.sse import sse_client
 log = logging.getLogger(__name__)
 
 MCP_URL = os.getenv("MCP_CONFLUENCE_URL", "http://mcp-atlassian:9000/sse")
-PREFERRED_TOOLS = ("confluence_search",)  # 명시
+# >>> FIX: 실제 환경에서 흔히 쓰이는 이름들을 전부 후보에 넣기
+PREFERRED_TOOLS = (  # ← 여기 확장
+    "confluence_search",
+    "confluence.search",
+    "search",
+    "atlassian.confluence.search",
+)
 
 async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
@@ -21,9 +27,13 @@ async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict
 
             # 2) 툴 선택
             tools = await session.list_tools()
+            # >>> FIX: 선호 툴 없으면 첫 번째 툴로 폴백 (죽지 않게)
             tool_name: Optional[str] = next((t.name for t in tools if t.name in PREFERRED_TOOLS), None)
             if not tool_name:
-                raise RuntimeError(f"No suitable tool found on MCP at {MCP_URL}. tools={[t.name for t in tools]}")
+                tool_name = tools[0].name if tools else None  # ← 안전 폴백
+                log.warning("MCP: preferred tool not found, fallback to %r", tool_name)
+            if not tool_name:
+                raise RuntimeError(f"No suitable tool found on MCP at {MCP_URL}. tools={[t.name for t in tools]}")  # ← 진짜 없음
 
             # 3) 반드시 'query' 파라미터만 사용
             resp = await asyncio.wait_for(
