@@ -898,15 +898,15 @@ async def query(payload: dict = Body(...)):
                     "notes": {"fallback_used": True}
                 }
 
+        except ExceptionGroup as eg:
+            exs = list(getattr(eg, "exceptions", []))
+            for i, ex in enumerate(exs, 1):
+                log.error(
+                    "MCP fallback failed [%d/%d]: %s",
+                    i, len(exs), "".join(traceback.format_exception(ex)),
+                )
         except Exception as e:
-            # 3.11+면 ExceptionGroup에 'exceptions' 속성이 있음
-            exs = getattr(e, "exceptions", None)
-            if exs and isinstance(exs, (list, tuple)):
-                for i, ex in enumerate(exs, 1):
-                    log.error("MCP fallback failed [%d/%d]: %s",
-                            i, len(exs), "".join(traceback.format_exception(ex)))
-            else:
-                log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
+            log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
 
     return {
