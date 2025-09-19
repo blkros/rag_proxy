@@ -415,6 +415,7 @@ async def update_index(payload: dict):
         detail = str(e) or e.__class__.__name__
         raise HTTPException(500, f"update failed: {detail}")
 
+
 @app.delete("/delete")
 async def delete_index(payload: Optional[dict] = None):
     """
@@ -423,6 +424,7 @@ async def delete_index(payload: Optional[dict] = None):
       - {"source":"uploads/파일.pdf"} → 해당 source만 제거
     """
     global vectorstore
+
     if vectorstore is None:
         raise HTTPException(500, "vectorstore is not ready.")
 
@@ -442,21 +444,23 @@ async def delete_index(payload: Optional[dict] = None):
                             child.unlink()
                         except Exception:
                             pass
-            # >>> FIX: 전체 삭제는 '빈 인덱스'로 재초기화 해야 함
-            global vectorstore
-            vectorstore = _empty_faiss()
-            vectorstore.save_local(INDEX_DIR)
-            _reload_retriever()
-            VS.vectorstore = vectorstore
+           
+            vectorstore = _empty_faiss()             # ← 인메모리 FAISS 새로 생성
+            vectorstore.save_local(INDEX_DIR)        # ← 빈 인덱스 저장
+            _reload_retriever()                      # ← retriever 갱신
+            VS.vectorstore = vectorstore             # ← 외부 모듈 참조 갱신
             VS.retriever  = retriever
 
-            # >>> FIX: sticky/최근 소스 리셋 (전체삭제 후 엉킴 방지)
             global current_source, current_source_until, last_source
             current_source = None
             current_source_until = 0.0
             last_source = None
 
-            return {"deleted": "all", "doc_count": len(vectorstore.docstore._dict)}  # ← 응답 정리
+            return {
+                "deleted": "all",
+                "doc_count": len(vectorstore.docstore._dict)
+            }
+
         except Exception as e:
             raise HTTPException(500, f"delete all failed: {e}")
 
@@ -467,11 +471,10 @@ async def delete_index(payload: Optional[dict] = None):
                       if str(doc.metadata.get("source", "")) == str(source)]
             if not target:
                 return {"deleted": 0, "reason": f"no documents with source={source}"}
-            vectorstore.delete(target)
+            vectorstore.delete(target)                # ← 이건 '특정 소스 삭제'에서만 사용
             vectorstore.save_local(INDEX_DIR)
             _reload_retriever()
 
-            # >>> FIX: 삭제한 소스가 sticky/last였다면 해제
             global current_source, current_source_until, last_source
             if current_source == _norm_source(source):
                 current_source = None
@@ -479,11 +482,16 @@ async def delete_index(payload: Optional[dict] = None):
             if last_source == _norm_source(source):
                 last_source = None
 
-            return {"deleted": len(target), "source": source, "doc_count": len(vectorstore.docstore._dict)}
+            return {
+                "deleted": len(target),
+                "source": source,
+                "doc_count": len(vectorstore.docstore._dict)
+            }
         except Exception as e:
             raise HTTPException(500, f"delete by source failed: {e}")
 
     raise HTTPException(400, "Invalid payload. Use {'mode':'all'} or {'source':'uploads/파일.ext'}.")
+
 
 @app.get("/index/stats")
 def index_stats():
