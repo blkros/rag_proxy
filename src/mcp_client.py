@@ -80,14 +80,40 @@ class MCP:
         # 결과 포맷은 서버 구현에 따라 다소 다를 수 있어 안전하게 파싱
         # 우선순위: result.content(list of dict/text) -> result.result -> result
         result = res.get("result", {}) or {}
-        items = result.get("content") or result.get("result") or result.get("items") or []
+
+        # 1) content/contents/result/items 어떤 키로 와도 받기
+        items = (
+            result.get("content")
+            or result.get("contents")
+            or result.get("result")
+            or result.get("items")
+            or []
+        )
+
+        # 2) MCP가 content를 [{type:"json", json:[...]}] 형식으로 줄 때 풀어주기
+        if isinstance(items, list) and items and isinstance(items[0], dict) and ("type" in items[0]):
+            flat = []
+            for c in items:
+                if c.get("type") == "json" and isinstance(c.get("json"), list):
+                    flat.extend(c["json"])
+                elif c.get("type") == "text" and isinstance(c.get("text"), str):
+                    txt = c["text"].strip()
+                    if txt.startswith("{") or txt.startswith("["):
+                        try:
+                            maybe = json.loads(txt)
+                            if isinstance(maybe, list):
+                                flat.extend(maybe)
+                        except Exception:
+                            pass
+            items = flat or items
+
         uris: List[str] = []
         for it in items if isinstance(items, list) else []:
             if isinstance(it, dict) and "uri" in it:
                 uris.append(it["uri"])
             elif isinstance(it, str):
                 uris.append(it)
-        # 컨플 URI만
+
         return [u for u in uris if isinstance(u, str) and u.startswith("confluence://")]
 
     def read(self, uri: str) -> dict:
