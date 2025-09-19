@@ -9,52 +9,62 @@ from mcp.client.sse import sse_client
 log = logging.getLogger(__name__)
 
 MCP_URL = os.getenv("MCP_CONFLUENCE_URL", "http://mcp-atlassian:9000/sse")
-# >>> FIX: 실제 환경에서 흔히 쓰이는 이름들을 전부 후보에 넣기
-PREFERRED_TOOLS = (  # ← 여기 확장
-    "confluence_search",
-    "confluence.search",
-    "search",
-    "atlassian.confluence.search",
-)
+PREFERRED_TOOLS = {"confluence_search", "confluence_search_user"}
 
-async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict[str, Any]]:
+
+def _tool_name(item):
+    # dict
+    if isinstance(item, dict):
+        return item.get("name")
+    # (name, something) tuple/list
+    if isinstance(item, (list, tuple)) and item:
+        return item[0]
+    # 객체 (dataclass 등)
+    return getattr(item, "name", None)
+
+async def mcp_search(
+    query: str,
+    limit: int = 5,
+    timeout: int = 20,
+    spaces_filter: Optional[str] = None,  # ← 필요 시 외부에서 주입
+) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
     async with sse_client(MCP_URL) as (read, write):
         async with ClientSession(read, write) as session:
-            # 1) 초기화 반드시 수행
+            # 1) 초기화
             await session.initialize()
 
-            # 2) 툴 선택
+            # 2) 툴 선택 (선호 툴 우선, 없으면 첫 번째 유효 이름으로 폴백)
             tools = await session.list_tools()
-            # >>> FIX: 선호 툴 없으면 첫 번째 툴로 폴백 (죽지 않게)
-            tool_name: Optional[str] = next((t.name for t in tools if t.name in PREFERRED_TOOLS), None)
+            names = [_tool_name(t) for t in tools]
+            tool_name = next((n for n in names if n in PREFERRED_TOOLS), None) \
+                        or next((n for n in names if n), None)
             if not tool_name:
-                tool_name = tools[0].name if tools else None  # ← 안전 폴백
-                log.warning("MCP: preferred tool not found, fallback to %r", tool_name)
-            if not tool_name:
-                raise RuntimeError(f"No suitable tool found on MCP at {MCP_URL}. tools={[t.name for t in tools]}")  # ← 진짜 없음
+                raise RuntimeError(f"No usable Confluence tool; got={names}")
 
-            # 3) 반드시 'query' 파라미터만 사용
-            resp = await asyncio.wait_for(
-                session.call_tool(tool_name, {"query": query, "limit": limit}),
-                timeout=timeout
-            )
+            # 3) 호출 (한 번만)
+            args = {
+                "query": query,
+                "limit": limit,
+                "spaces_filter": spaces_filter if spaces_filter is not None
+                                  else os.getenv("CONFLUENCE_SPACES_FILTER"),
+            }
+            resp = await session.call_tool(tool_name, args, timeout=timeout)
 
-            # 4) 에러 응답이면 바로 예외 (텍스트 메시지 추출)
+            # 4) 에러면 예외
             if getattr(resp, "is_error", False):
                 msg = "; ".join(
-                    getattr(c, "text", "") for c in resp.content
+                    getattr(c, "text", "") for c in getattr(resp, "content", []) 
                     if getattr(c, "type", None) == "text"
                 ) or "MCP tool error"
                 raise RuntimeError(msg)
 
-            # 5) content 파싱: json 우선, text가 JSON처럼 생기면 로드
-            for c in resp.content:
+            # 5) content 파싱
+            for c in getattr(resp, "content", []):
                 ctype = getattr(c, "type", None)
                 if ctype == "json":
-                    payload = getattr(c, "json", None)
-                    _collect_payload(results, payload)
+                    _collect_payload(results, getattr(c, "json", None))
                 elif ctype == "text":
                     txt = (getattr(c, "text", "") or "").strip()
                     payload = None
@@ -68,7 +78,6 @@ async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict
                     elif txt:
                         results.append({"title": "", "url": "", "body": txt})
                 else:
-                    # 기타 타입은 문자열화
                     results.append({"title": "", "url": "", "body": str(c)})
 
     return _dedup(results)
@@ -96,7 +105,7 @@ def _dedup(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         key = ((r.get("title","") or "").strip(),
                (r.get("url","") or "").strip(),
                (r.get("body","") or "")[:120])
-        if key in seen: 
+        if key in seen:
             continue
         seen.add(key)
         if (r.get("body") or "").strip():
