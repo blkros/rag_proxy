@@ -9,7 +9,7 @@ from mcp.client.sse import sse_client
 log = logging.getLogger(__name__)
 
 MCP_URL = os.getenv("MCP_CONFLUENCE_URL", "http://mcp-atlassian:9000/sse")
-PREFERRED_TOOLS = {"confluence_search", "confluence_search_user"}
+PREFERRED_TOOLS = {"confluence_search", "confluence_search_user", "search_pages"}
 
 
 def _tool_name(item):
@@ -22,65 +22,54 @@ def _tool_name(item):
     # 객체 (dataclass 등)
     return getattr(item, "name", None)
 
-async def mcp_search(
-    query: str,
-    limit: int = 5,
-    timeout: int = 20,
-    spaces_filter: Optional[str] = None,  # ← 필요 시 외부에서 주입
-) -> List[Dict[str, Any]]:
+async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
     async with sse_client(MCP_URL) as (read, write):
         async with ClientSession(read, write) as session:
-            # 1) 초기화
             await session.initialize()
 
-            # 2) 툴 선택 (선호 툴 우선, 없으면 첫 번째 유효 이름으로 폴백)
             tools = await session.list_tools()
             names = [_tool_name(t) for t in tools]
-            tool_name = next((n for n in names if n in PREFERRED_TOOLS), None) \
-                        or next((n for n in names if n), None)
+            tool_name = next((n for n in names if n in PREFERRED_TOOLS), None)
             if not tool_name:
-                raise RuntimeError(f"No usable Confluence tool; got={names}")
+                # 선호 툴 없으면 첫 번째라도 쓰기(죽지 않게)
+                tool_name = names[0] if names else None
+            if not tool_name:
+                raise RuntimeError(f"No Confluence tool available; got={names}")
 
-            # 3) 호출 (한 번만)
-            args = {
-                "query": query,
-                "limit": limit,
-                "spaces_filter": spaces_filter if spaces_filter is not None
-                                  else os.getenv("CONFLUENCE_SPACES_FILTER"),
-            }
-            resp = await session.call_tool(tool_name, args, timeout=timeout)
+            # 한 번만 호출
+            resp = await asyncio.wait_for(
+                session.call_tool(tool_name, {"query": query, "limit": limit}),
+                timeout=timeout
+            )
 
-            # 4) 에러면 예외
             if getattr(resp, "is_error", False):
                 msg = "; ".join(
-                    getattr(c, "text", "") for c in getattr(resp, "content", []) 
+                    getattr(c, "text", "") for c in resp.content
                     if getattr(c, "type", None) == "text"
                 ) or "MCP tool error"
                 raise RuntimeError(msg)
 
-            # 5) content 파싱
-            for c in getattr(resp, "content", []):
+            for c in resp.content:
                 ctype = getattr(c, "type", None)
                 if ctype == "json":
                     _collect_payload(results, getattr(c, "json", None))
                 elif ctype == "text":
                     txt = (getattr(c, "text", "") or "").strip()
-                    payload = None
                     if txt.startswith("{") or txt.startswith("["):
                         try:
-                            payload = json.loads(txt)
+                            _collect_payload(results, json.loads(txt))
+                            continue
                         except Exception:
-                            payload = None
-                    if payload is not None:
-                        _collect_payload(results, payload)
-                    elif txt:
+                            pass
+                    if txt:
                         results.append({"title": "", "url": "", "body": txt})
                 else:
                     results.append({"title": "", "url": "", "body": str(c)})
 
     return _dedup(results)
+
 
 def _collect_payload(out: List[Dict[str, Any]], payload: Any) -> None:
     if isinstance(payload, list):
