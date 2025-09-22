@@ -872,13 +872,20 @@ async def query(payload: dict = Body(...)):
             # MCP 결과 → 문서화
             new_docs = []
             for r in mcp_results or []:
-                txt = (r.get("title","").strip() + "\n\n" if r.get("title") else "") + (r.get("body") or "")
+                title = (r.get("title") or "").strip()
+                body  = r.get("body") or r.get("excerpt") or ""
+                # Confluence 하이라이트 태그 제거
+                body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
+                txt   = ((title + "\n\n") if title else "") + body
                 if not txt.strip():
                     continue
                 md = {
-                    "source": r.get("url") or f"confluence://{hashlib.sha1(txt.encode('utf-8','ignore')).hexdigest()[:10]}",
+                    "source": r.get("url") or f"confluence://{hashlib.sha1((title+body).encode('utf-8','ignore')).hexdigest()[:10]}",
                     "kind": "confluence",
-                    "page": None,
+                    "page": r.get("id"),
+                    "space": r.get("space"),
+                    "title": title,
+                    "url": r.get("url"),
                 }
                 new_docs.append(Document(page_content=txt, metadata=md))
 
@@ -894,6 +901,8 @@ async def query(payload: dict = Body(...)):
 
                 docs2 = docs2[:k]
                 items, contexts = [], []
+
+                # retriever 재검색 결과를 먼저 넣기
                 for d in docs2:
                     md = dict(d.metadata or {})
                     entry = {"text": d.page_content or "", "metadata": md, "score": 0.5}
@@ -905,6 +914,19 @@ async def query(payload: dict = Body(...)):
                         "kind": md.get("kind","chunk"),
                         "score": 0.5,
                     })
+
+                # 그래도 비면 new_docs로 즉시 응답
+                if not items and new_docs:
+                    for d in new_docs[:k]:
+                        md = dict(d.metadata or {})
+                        items.append({"text": d.page_content, "metadata": md, "score": 0.5})
+                        contexts.append({
+                            "text": d.page_content,
+                            "source": md.get("source"),
+                            "page": md.get("page"),
+                            "kind": md.get("kind","chunk"),
+                            "score": 0.5,
+                        })
 
                 return {
                     "hits": len(items),
