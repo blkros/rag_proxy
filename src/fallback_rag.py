@@ -4,7 +4,8 @@ from __future__ import annotations
 import hashlib
 from typing import List, Tuple
 
-from src.mcp_client import MCP
+import asyncio
+from src.ext.confluence_mcp import mcp_search
 from src.rag_pipeline import Document
 from src.vectorstore import vectorstore  # similarity_search_with_score, add_documents / upsert 등
 from src.llm_pipeline import chat_with_context
@@ -85,22 +86,24 @@ def answer_with_fallback(question: str, space: str | None = None) -> dict:
 
     # 2) 부족하면 MCP로 보충 → 영속 업서트 → 재검색
     if not _good(hits):
-        mcp = MCP()
-        mcp.initialize()
-        uris = mcp.search(question, limit=MCP_LIMIT, space=space)
-        for u in uris:
-            rep = mcp.read(u)
-            txt, md = rep["text"], rep["meta"]
-            if not txt:
+        mcp_results = asyncio.run(mcp_search(question, limit=MCP_LIMIT))
+        for h in mcp_results:
+            url   = (h.get("url")   or h.get("link") or h.get("webui") or "").strip()
+            title = (h.get("title") or h.get("name") or "").strip()
+            txt   = (h.get("body")  or h.get("content") or h.get("excerpt") or "").strip()
+            if not (url and txt):
                 continue
+
             chunks = _chunk(txt)
+
             _upsert_chunks(
-                u,
-                title=(md.get("title") or ""),
-                space=(md.get("space") or ""),
-                version=md.get("version"),
+                uri=url,
+                title=title,
+                space=space or "",
+                version=None,
                 chunks=chunks,
             )
+
         hits = _retrieve_local(question)
 
     # 3) 컨텍스트 구성 + LLM 호출
