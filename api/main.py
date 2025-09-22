@@ -861,90 +861,58 @@ async def query(payload: dict = Body(...)):
             async with mcp_lock:
                 mcp_results = await mcp_search(q, limit=5, timeout=20)
 
-            # 결과가 없으면 키워드 정제 후 한 번 더 시도
+            # 결과 없으면 간단 키워드로 한 번 더
             if not mcp_results:
                 q2 = _to_mcp_keywords(q)
                 if q2 != q:
-                    log.info("MCP fallback: retry with keywords=%r", q2)
                     async with mcp_lock:
                         mcp_results = await mcp_search(q2, limit=5, timeout=20)
 
-            # MCP 결과 → 문서화
-            new_docs = []
-            for r in mcp_results or []:
-                title = (r.get("title") or "").strip()
-                body  = r.get("body") or r.get("excerpt") or ""
-                # Confluence 하이라이트 태그 제거
-                body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
-                txt   = ((title + "\n\n") if title else "") + body
-                if not txt.strip():
-                    continue
-                md = {
-                    "source": r.get("url") or f"confluence://{hashlib.sha1((title+body).encode('utf-8','ignore')).hexdigest()[:10]}",
-                    "kind": "confluence",
-                    "page": r.get("id"),
-                    "space": r.get("space"),
-                    "title": title,
-                    "url": r.get("url"),
-                }
-                new_docs.append(Document(page_content=txt, metadata=md))
-
-            if new_docs:
-                async with index_lock:
-                    added = _upsert_docs_no_dup(new_docs)
-                    log.info("MCP fallback: upserted %d docs (query=%r)", added, q)
-
-                try:
-                    docs2 = retriever.invoke(q) or []
-                except Exception:
-                    docs2 = []
-
-                docs2 = docs2[:k]
+            # ===== 여기부터: 인덱싱 생략하고 '즉시-리턴' =====
+            if mcp_results:
                 items, contexts = [], []
-
-                # retriever 재검색 결과를 먼저 넣기
-                for d in docs2:
-                    md = dict(d.metadata or {})
-                    entry = {"text": d.page_content or "", "metadata": md, "score": 0.5}
-                    items.append(entry)
+                for r in mcp_results[:k]:
+                    title = (r.get("title") or "").strip()
+                    body  = r.get("body") or r.get("excerpt") or ""
+                    body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)  # 하이라이트 태그 제거
+                    text  = ((title + "\n\n") if title else "") + body
+                    if not text.strip():
+                        continue
+                    md = {
+                        "source": r.get("url"),
+                        "kind": "confluence",
+                        "page": r.get("id"),
+                        "space": r.get("space"),
+                        "title": title,
+                        "url": r.get("url"),
+                    }
+                    items.append({"text": text, "metadata": md, "score": 0.5})
                     contexts.append({
-                        "text": entry["text"],
-                        "source": md.get("source"),
-                        "page": md.get("page"),
-                        "kind": md.get("kind","chunk"),
+                        "text": text,
+                        "source": md["source"],
+                        "page": md["page"],
+                        "kind": md["kind"],
                         "score": 0.5,
                     })
 
-                # 그래도 비면 new_docs로 즉시 응답
-                if not items and new_docs:
-                    for d in new_docs[:k]:
-                        md = dict(d.metadata or {})
-                        items.append({"text": d.page_content, "metadata": md, "score": 0.5})
-                        contexts.append({
-                            "text": d.page_content,
-                            "source": md.get("source"),
-                            "page": md.get("page"),
-                            "kind": md.get("kind","chunk"),
-                            "score": 0.5,
-                        })
+                if items:  # 결과가 있으면 바로 리턴
+                    return {
+                        "hits": len(items),
+                        "items": items,
+                        "contexts": contexts,
+                        "context_texts": [it["text"] for it in items],
+                        "documents": items,
+                        "chunks": items,
+                        "notes": {"fallback_used": True, "indexed": False}
+                    }
 
-                return {
-                    "hits": len(items),
-                    "items": items,
-                    "contexts": contexts,
-                    "context_texts": [it["text"] for it in items],
-                    "documents": items,
-                    "chunks": items,
-                    "notes": {"fallback_used": True}
-                }
-
-        except ExceptionGroup as eg:
-            exs = list(getattr(eg, "exceptions", []))
-            for i, ex in enumerate(exs, 1):
-                log.error(
-                    "MCP fallback failed [%d/%d]: %s",
-                    i, len(exs), "".join(traceback.format_exception(ex)),
-                )
+        # except ExceptionGroup as eg:
+        #     exs = list(getattr(eg, "exceptions", []))
+        #     for i, ex in enumerate(exs, 1):
+        #         log.error(
+        #             "MCP fallback failed [%d/%d]: %s",
+        #             i, len(exs), "".join(traceback.format_exception(ex)),
+        #         )
         except Exception as e:
             log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
