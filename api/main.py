@@ -27,6 +27,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS as FAISSStore
 from langchain_community.docstore.in_memory import InMemoryDocstore
 
+logging.basicConfig(level=logging.INFO)
 
 META_PAT  = re.compile(r"(주제|개요|요약|무엇|무슨\s*내용)", re.I)
 TITLE_PAT = re.compile(r"(제목|title|문서명|파일명)", re.I)
@@ -68,14 +69,23 @@ app.add_middleware(
 _K_STOP = {"관련","내용","찾아줘","찾아","알려줘","정리","컨플루언스","에서","해줘",
            "무엇","어떤","대한","관련한","좀","좀만","계속","그리고","거나"}
 
+_JOSA_RE = re.compile(
+    r"(으로써|으로서|으로부터|라고는|라고도|라고|처럼|까지|부터|에게서|한테서|에게|한테|께|이며|이자|"
+    r"으로|로서|로써|로부터|께서|와는|과는|에서는|에는|에서|에게|한테|와|과|을|를|은|는|이|가|의|에|도|만|랑|하고)$"
+)
+
+def _strip_josa(t: str) -> str:
+    return _JOSA_RE.sub("", t)
+
 def _to_mcp_keywords(q: str) -> str:
     toks = re.findall(r"[A-Za-z0-9가-힣]+", q)
-    toks = [t for t in toks if t not in _K_STOP and len(t) >= 2]
-    # 한글 토큰을 우선으로, 없으면 전체에서 상위 몇 개만
+    toks = [_strip_josa(t) for t in toks]                # ← 조사 제거
+    toks = [t for t in toks if t and t not in _K_STOP and len(t) >= 2]
     hangs = [t for t in toks if re.search(r"[가-힣]", t)]
     keep = hangs if hangs else toks
-    # 길이 폭주 방지
-    return " ".join(keep[:6])[:200] or q
+    # 중복 제거 + 과도한 길이 방지
+    dedup = list(dict.fromkeys(keep))
+    return " ".join(dedup[:6])[:200] or q
 
 logger = logging.getLogger("rag-proxy")
 log = logging.getLogger(__name__)
@@ -867,6 +877,15 @@ async def query(payload: dict = Body(...)):
                 if q2 != q:
                     async with mcp_lock:
                         mcp_results = await mcp_search(q2, limit=5, timeout=20)
+
+            # 그래도 없으면: 한글 토큰 중 가장 긴 것 하나로 최후 시도
+            if not mcp_results:
+                ko = re.findall(r"[가-힣]{2,}", q)
+                if ko:
+                    best = sorted(ko, key=len, reverse=True)[0]
+                    best = _strip_josa(best)
+                    async with mcp_lock:
+                        mcp_results = await mcp_search(best, limit=5, timeout=20)
 
             # ===== 여기부터: 인덱싱 생략하고 '즉시-리턴' =====
             if mcp_results:
