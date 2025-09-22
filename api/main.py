@@ -20,7 +20,6 @@ import asyncio, hashlib
 from collections import Counter
 from src.retrieval.rerank import parse_query_intent, pick_for_injection
 from api.smart_router import router as smart_router
-from src.fallback_rag import answer_with_fallback
 
 # empty FAISS 빌드를 위한 보조들
 import faiss
@@ -77,7 +76,6 @@ def _to_mcp_keywords(q: str) -> str:
     keep = hangs if hangs else toks
     # 길이 폭주 방지
     return " ".join(keep[:6])[:200] or q
-
 
 logger = logging.getLogger("rag-proxy")
 log = logging.getLogger(__name__)
