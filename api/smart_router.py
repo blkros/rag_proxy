@@ -13,4 +13,4 @@ async def ask_smart(payload: dict = Body(...)):
     space = payload.get("space")
     if not q:
         return {"error": "question required"}
-    return await answer_with_fallback(q, space=space)
+    return answer_with_fallback(q, space=space)
