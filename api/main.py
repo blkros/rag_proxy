@@ -20,6 +20,7 @@ import asyncio, hashlib
 from collections import Counter
 from src.retrieval.rerank import parse_query_intent, pick_for_injection
 from api.smart_router import router as smart_router
+from src.fallback_rag import answer_with_fallback
 
 # empty FAISS 빌드를 위한 보조들
 import faiss
@@ -63,7 +64,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.include_router(smart_router)
+
+# 키워드 정제(Confluence CQL용)
+_K_STOP = {"관련","내용","찾아줘","찾아","알려줘","정리","컨플루언스","에서","해줘",
+           "무엇","어떤","대한","관련한","좀","좀만","계속","그리고","거나"}
+
+def _to_mcp_keywords(q: str) -> str:
+    toks = re.findall(r"[A-Za-z0-9가-힣]+", q)
+    toks = [t for t in toks if t not in _K_STOP and len(t) >= 2]
+    # 한글 토큰을 우선으로, 없으면 전체에서 상위 몇 개만
+    hangs = [t for t in toks if re.search(r"[가-힣]", t)]
+    keep = hangs if hangs else toks
+    # 길이 폭주 방지
+    return " ".join(keep[:6])[:200] or q
 
 
 logger = logging.getLogger("rag-proxy")
@@ -850,9 +863,17 @@ async def query(payload: dict = Body(...)):
             async with mcp_lock:
                 mcp_results = await mcp_search(q, limit=5, timeout=20)
 
+            # 결과가 없으면 키워드 정제 후 한 번 더 시도
+            if not mcp_results:
+                q2 = _to_mcp_keywords(q)
+                if q2 != q:
+                    log.info("MCP fallback: retry with keywords=%r", q2)
+                    async with mcp_lock:
+                        mcp_results = await mcp_search(q2, limit=5, timeout=20)
+
             # MCP 결과 → 문서화
             new_docs = []
-            for r in mcp_results:
+            for r in mcp_results or []:
                 txt = (r.get("title","").strip() + "\n\n" if r.get("title") else "") + (r.get("body") or "")
                 if not txt.strip():
                     continue
@@ -868,7 +889,6 @@ async def query(payload: dict = Body(...)):
                     added = _upsert_docs_no_dup(new_docs)
                     log.info("MCP fallback: upserted %d docs (query=%r)", added, q)
 
-                # 재검색으로 간단 재질의
                 try:
                     docs2 = retriever.invoke(q) or []
                 except Exception:
@@ -922,3 +942,5 @@ async def query(payload: dict = Body(...)):
 @app.post("/qa")
 async def qa_compat(payload: dict = Body(...)):
     return await query(payload)
+
+app.include_router(smart_router)
