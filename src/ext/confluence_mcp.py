@@ -9,7 +9,7 @@ from mcp.client.sse import sse_client
 log = logging.getLogger(__name__)
 
 MCP_URL = os.getenv("MCP_CONFLUENCE_URL", "http://mcp-atlassian:9000/sse")
-PREFERRED_TOOLS = {"confluence_search", "confluence_search_user", "search_pages"}
+TOOL_OVERRIDE = (os.getenv("CONFLUENCE_MCP_TOOL", "search_pages") or "search_pages").strip()
 
 
 def _tool_name(item):
@@ -29,16 +29,8 @@ async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            tools = await session.list_tools()
-            names = [_tool_name(t) for t in tools]
-            tool_name = next((n for n in names if n in PREFERRED_TOOLS), None)
-            if not tool_name:
-                # 선호 툴 없으면 첫 번째라도 쓰기(죽지 않게)
-                tool_name = names[0] if names else None
-            if not tool_name:
-                raise RuntimeError(f"No Confluence tool available; got={names}")
+            tool_name = TOOL_OVERRIDE
 
-            # 한 번만 호출
             resp = await asyncio.wait_for(
                 session.call_tool(tool_name, {"query": query, "limit": limit}),
                 timeout=timeout
@@ -79,9 +71,9 @@ def _collect_payload(out: List[Dict[str, Any]], payload: Any) -> None:
         out.append(_normalize_item(payload))
 
 def _normalize_item(d: Dict[str, Any]) -> Dict[str, Any]:
-    title = (d.get("title") or d.get("name") or "").strip()
-    url   = (d.get("url")   or d.get("link") or d.get("webui") or "").strip()
-    body  =  d.get("body")  or d.get("content") or d.get("excerpt") or d.get("text") or ""
+    title = (d.get("title") or d.get("name") or "").strip() if isinstance(d, dict) else ""
+    url   = (d.get("url")   or d.get("link") or d.get("webui") or "").strip() if isinstance(d, dict) else ""
+    body  =  (d.get("body") or d.get("content") or d.get("excerpt") or d.get("text") or "") if isinstance(d, dict) else ""
     if isinstance(body, dict):
         body = body.get("storage") or body.get("view") or body.get("plain") or body.get("value") or ""
         if isinstance(body, dict):
