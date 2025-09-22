@@ -286,6 +286,21 @@ def health():
 async def models():
     return await proxy_get("/models")
 
+@app.get("/v1/models")
+def v1_models():
+    import time
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "rag-proxy",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "rag-proxy"
+            }
+        ]
+    }
+
 @app.post("/ask")
 async def ask(payload: dict):
     q = (payload or {}).get("question") or ""
