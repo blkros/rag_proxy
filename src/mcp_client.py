@@ -1,4 +1,4 @@
-# src/mcp_client.py
+# rag-proxy/src/mcp_client.py
 from __future__ import annotations
 
 import os

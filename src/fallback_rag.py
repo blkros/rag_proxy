@@ -1,4 +1,4 @@
-# src/fallback_rag.py
+# rag-proxy/src/fallback_rag.py
 from __future__ import annotations
 
 import hashlib

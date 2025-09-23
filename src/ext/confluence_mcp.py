@@ -1,4 +1,4 @@
-# src/ext/confluence_mcp.py
+# rag-proxy/src/ext/confluence_mcp.py
 from __future__ import annotations
 import os, asyncio, json, logging
 from typing import Any, Dict, List, Optional

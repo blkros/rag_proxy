@@ -1,4 +1,4 @@
-# api/smart_router.py
+# rag-proxy/api/smart_router.py
 from __future__ import annotations
 
 from fastapi import APIRouter, Body

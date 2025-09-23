@@ -1,4 +1,4 @@
-# api/main.py
+# rag-proxy/api/main.py
 from __future__ import annotations
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from typing import List, Dict, Any, Optional, Tuple
@@ -28,6 +28,7 @@ from langchain_community.vectorstores import FAISS as FAISSStore
 from langchain_community.docstore.in_memory import InMemoryDocstore
 
 logging.basicConfig(level=logging.INFO)
+DISABLE_INTERNAL_MCP = (os.getenv("DISABLE_INTERNAL_MCP", "0").lower() in ("1","true","yes"))
 
 META_PAT  = re.compile(r"(주제|개요|요약|무엇|무슨\s*내용)", re.I)
 TITLE_PAT = re.compile(r"(제목|title|문서명|파일명)", re.I)
@@ -880,7 +881,7 @@ async def query(payload: dict = Body(...)):
         pass
 
     NEED_FALLBACK = (len(items) == 0) or (len(pool_hits) < max(10, k*2)) or missing_article
-    if NEED_FALLBACK:
+    if NEED_FALLBACK and not DISABLE_INTERNAL_MCP:
         try:
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
             async with mcp_lock:
@@ -964,5 +965,71 @@ async def query(payload: dict = Body(...)):
 @app.post("/qa")
 async def qa_compat(payload: dict = Body(...)):
     return await query(payload)
+
+# ------- helper: chunk text -------
+def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
+    if not text:
+        return []
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        j = min(n, i + int(size))
+        out.append(text[i:j])
+        if j == n:
+            break
+        i = j - int(overlap)
+        if i < 0:
+            i = 0
+    return out
+
+
+@app.post("/documents/upsert")
+async def documents_upsert(payload: dict = Body(...)):
+    """
+    payload = {"docs":[{"id":"confluence:<page_id>",
+                        "text":"<long text>",
+                        "metadata":{"source":"confluence","title":"...","url":"...","space":"ENG"}}]}
+    """
+    global vectorstore
+    if vectorstore is None:
+        raise HTTPException(500, "vectorstore is not ready.")
+
+    docs = (payload or {}).get("docs")
+    if not isinstance(docs, list):
+        raise HTTPException(400, "docs(list) is required")
+
+    to_add = []
+    for d in docs:
+        text = (d.get("text") or "").strip()
+        meta = d.get("metadata") or {}
+        if not text:
+            continue
+        title = (meta.get("title") or "").strip()
+        url   = (meta.get("url") or meta.get("source") or "").strip()
+        space = (meta.get("space") or meta.get("spaceKey") or "").strip()
+        source = url if url else str(d.get("id") or "confluence")
+
+        for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
+            to_add.append(Document(
+                page_content=c,
+                metadata={"source": source, "title": title, "space": space, "kind": "chunk"}
+            ))
+
+    if not to_add:
+        try:
+            n = len(vectorstore.docstore._dict)
+        except Exception:
+            n = None
+        return {"added": 0, "doc_total": n}
+
+    try:
+        async with index_lock:
+            before = len(vectorstore.docstore._dict)
+            added = _upsert_docs_no_dup(to_add)
+            after  = len(vectorstore.docstore._dict)
+        return {"added": added, "doc_total": after}
+    except Exception as e:
+        raise HTTPException(500, f"documents upsert failed: {e}")
+
 
 app.include_router(smart_router)
