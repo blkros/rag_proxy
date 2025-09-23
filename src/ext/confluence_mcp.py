@@ -1,14 +1,23 @@
 # rag-proxy/src/ext/confluence_mcp.py
 from __future__ import annotations
 import os, asyncio, json, logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
 log = logging.getLogger(__name__)
 
-MCP_URL = os.getenv("MCP_CONFLUENCE_URL", "http://mcp-atlassian:9000/sse")
+# ### CHANGED: 우선 MCP_URL → 그다음 MCP_CONFLUENCE_URL → 기본값(/sse?version=...)
+MCP_URL = (
+    os.getenv("MCP_URL")
+    or os.getenv("MCP_CONFLUENCE_URL")
+    or "http://mcp-confluence:9000/sse?version=2025-06-18"
+)
+
+# ### NEW: 프로토콜 버전 환경변수 지원 (없으면 2025-06-18)
+MCP_PROTOCOL_VERSION = os.getenv("MCP_PROTOCOL_VERSION", "2025-06-18")
+
 TOOL_OVERRIDE = (os.getenv("CONFLUENCE_MCP_TOOL", "search_pages") or "search_pages").strip()
 
 
@@ -22,12 +31,37 @@ def _tool_name(item):
     # 객체 (dataclass 등)
     return getattr(item, "name", None)
 
+# ### NEW: 신/구 MCP SDK 호환 레이어
+def _wrap_streams(read, write):
+    """
+    mcp.client.sse.sse_client 가 신버전에서는 anyio Stream(read.receive / write.send)을,
+    구버전에서는 callables(read(), write(msg))를 반환한다.
+    여기서 둘 다 callables 로 맞춰준다.
+    """
+    # 신버전: MemoryObjectReceiveStream / MemoryObjectSendStream 스타일
+    if hasattr(read, "receive") and hasattr(write, "send"):
+        async def _read():
+            return await read.receive()
+        async def _write(msg):
+            return await write.send(msg)
+        return _read, _write
+    # 구버전: 이미 callables
+    return read, write
+
+
 async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
     async with sse_client(MCP_URL) as (read, write):
+        # ### NEW: 신/구 SDK 모두 동작하게 스트림을 callables 로 래핑
+        read, write = _wrap_streams(read, write)
+
         async with ClientSession(read, write) as session:
-            await session.initialize()
+            # ### CHANGED: 가능하면 프로토콜 버전 명시, 구버전이면 무시
+            try:
+                await session.initialize(protocol_version=MCP_PROTOCOL_VERSION)  # 신버전
+            except TypeError:
+                await session.initialize()  # 구버전 호환
 
             tool_name = TOOL_OVERRIDE
 
