@@ -880,7 +880,17 @@ async def query(payload: dict = Body(...)):
     except Exception:
         pass
 
-    NEED_FALLBACK = (len(items) == 0) or (len(pool_hits) < max(10, k*2)) or missing_article
+    # === 컨텍스트에 질의 토큰이 하나도 없으면 폴백 플래그 ===
+    def _query_tokens(q: str):
+        toks = re.findall(r"[가-힣A-Za-z0-9]{2,}", q)
+        toks = [t for t in toks if t not in _K_STOP]
+        return toks[:8]
+
+    ctx_all = "\n".join(c["text"] for c in contexts)
+    has_any_query_token = any(t in ctx_all for t in _query_tokens(q))
+
+    # 기존 NEED_FALLBACK 조건에 '키워드 미등장'을 추가
+    NEED_FALLBACK = (len(items) == 0) or (len(pool_hits) < max(10, k*2)) or missing_article or (not has_any_query_token)
     if NEED_FALLBACK and not DISABLE_INTERNAL_MCP:
         try:
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
