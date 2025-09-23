@@ -31,37 +31,14 @@ def _tool_name(item):
     # 객체 (dataclass 등)
     return getattr(item, "name", None)
 
-# ### NEW: 신/구 MCP SDK 호환 레이어
-def _wrap_streams(read, write):
-    """
-    mcp.client.sse.sse_client 가 신버전에서는 anyio Stream(read.receive / write.send)을,
-    구버전에서는 callables(read(), write(msg))를 반환한다.
-    여기서 둘 다 callables 로 맞춰준다.
-    """
-    # 신버전: MemoryObjectReceiveStream / MemoryObjectSendStream 스타일
-    if hasattr(read, "receive") and hasattr(write, "send"):
-        async def _read():
-            return await read.receive()
-        async def _write(msg):
-            return await write.send(msg)
-        return _read, _write
-    # 구버전: 이미 callables
-    return read, write
-
-
 async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
-    async with sse_client(MCP_URL) as (read, write):
-        # ### NEW: 신/구 SDK 모두 동작하게 스트림을 callables 로 래핑
-        read, write = _wrap_streams(read, write)
-
-        async with ClientSession(read, write) as session:
-            # ### CHANGED: 가능하면 프로토콜 버전 명시, 구버전이면 무시
-            try:
-                await session.initialize(protocol_version=MCP_PROTOCOL_VERSION)  # 신버전
-            except TypeError:
-                await session.initialize()  # 구버전 호환
+    # sse_client 가 주는 read/write "스트림 객체"를 그대로 사용
+    async with sse_client(MCP_URL) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            # 기본 initialize() 호출
+            await session.initialize()
 
             tool_name = TOOL_OVERRIDE
 
