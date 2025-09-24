@@ -636,6 +636,7 @@ async def uploads_reset():
 @app.post("/query", include_in_schema=False)
 async def query(payload: dict = Body(...)):
     global vectorstore, retriever
+    fallback_attempted = False 
     if vectorstore is None:
         raise HTTPException(500, "vectorstore is not ready.")
 
@@ -889,6 +890,7 @@ async def query(payload: dict = Body(...)):
     NEED_FALLBACK = (len(items) == 0) or (len(pool_hits) < max(10, k*2)) or missing_article or (not has_any_query_token)
     if NEED_FALLBACK and not DISABLE_INTERNAL_MCP:
         try:
+            fallback_attempted = True
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
             async with mcp_lock:
                 mcp_results = await mcp_search(q, limit=5, timeout=20)
@@ -961,6 +963,11 @@ async def query(payload: dict = Body(...)):
         except Exception as e:
             log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
+    base_notes = {"missing_article": missing_article, "article_no": intent.get("article_no")}
+    if fallback_attempted:
+        base_notes["fallback_used"] = True
+        base_notes["indexed"] = False
+
     return {
         "hits": len(items),
         "items": items,
@@ -968,7 +975,7 @@ async def query(payload: dict = Body(...)):
         "context_texts": [it["text"] for it in items],
         "documents": items,
         "chunks": items,
-        "notes": {"missing_article": missing_article, "article_no": intent.get("article_no")}
+        "notes": base_notes
     }
 
 @app.post("/qa")

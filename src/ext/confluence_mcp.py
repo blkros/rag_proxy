@@ -145,9 +145,9 @@ def _dedup(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen, out = set(), []
     for r in items:
         body = (r.get("body") or "").strip()
-        if not body or _looks_like_login(body):
+        # 본문이 없어도 허용. 로그인 화면만 제외
+        if _looks_like_login(body):
             continue
-        # id/url/제목/본문 일부로 중복 제거
         key = (
             (r.get("id") or "").strip(),
             (r.get("url") or "").strip(),
