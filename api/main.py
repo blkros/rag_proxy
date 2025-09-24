@@ -32,7 +32,7 @@ DISABLE_INTERNAL_MCP = (os.getenv("DISABLE_INTERNAL_MCP", "0").lower() in ("1","
 
 META_PAT  = re.compile(r"(주제|개요|요약|무엇|무슨\s*내용)", re.I)
 TITLE_PAT = re.compile(r"(제목|title|문서명|파일명)", re.I)
-
+LOGIN_PAT = re.compile(r"(Confluence에\s*로그인|로그인\s*-\s*Confluence|name=[\"']os_username[\"'])", re.I)
 THIS_FILE_PAT = re.compile(
     r"(이\s*(?:pdf|엑셀|hwp|한글|워드|ppt|파워포인트)?\s*(?:파일|문서|자료)|"
     r"해당\s*(?:파일|문서|자료|pdf)|"
@@ -886,7 +886,6 @@ async def query(payload: dict = Body(...)):
     ctx_all = "\n".join(c["text"] for c in contexts)
     has_any_query_token = any(t in ctx_all for t in _query_tokens(q))
 
-    # 기존 NEED_FALLBACK 조건에 '키워드 미등장'을 추가
     NEED_FALLBACK = (len(items) == 0) or (len(pool_hits) < max(10, k*2)) or missing_article or (not has_any_query_token)
     if NEED_FALLBACK and not DISABLE_INTERNAL_MCP:
         try:
@@ -894,14 +893,14 @@ async def query(payload: dict = Body(...)):
             async with mcp_lock:
                 mcp_results = await mcp_search(q, limit=5, timeout=20)
 
-            # 결과 없으면 간단 키워드로 한 번 더
+            # 2차: 키워드 정제
             if not mcp_results:
                 q2 = _to_mcp_keywords(q)
                 if q2 != q:
                     async with mcp_lock:
                         mcp_results = await mcp_search(q2, limit=5, timeout=20)
 
-            # 그래도 없으면: 한글 토큰 중 가장 긴 것 하나로 최후 시도
+            # 3차: 가장 긴 한글 토큰
             if not mcp_results:
                 ko = re.findall(r"[가-힣]{2,}", q)
                 if ko:
@@ -910,24 +909,35 @@ async def query(payload: dict = Body(...)):
                     async with mcp_lock:
                         mcp_results = await mcp_search(best, limit=5, timeout=20)
 
-            # ===== 여기부터: 인덱싱 생략하고 '즉시-리턴' =====
+            # === 결과 정규화/필터링 → items/contexts 로 변환 ===
             if mcp_results:
                 items, contexts = [], []
                 for r in mcp_results[:k]:
                     title = (r.get("title") or "").strip()
-                    body  = r.get("body") or r.get("excerpt") or ""
-                    body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)  # 하이라이트 태그 제거
-                    text  = ((title + "\n\n") if title else "") + body
-                    if not text.strip():
+                    body  = (r.get("body") or r.get("excerpt") or r.get("text") or "")
+                    body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
+                    text  = ((title + "\n\n") if title else "") + (body or "")
+
+                    # 로그인 화면/빈 본문 제외
+                    if not text.strip() or LOGIN_PAT.search(text):
                         continue
+
+                    # pageId 보강
+                    pid = (r.get("id") or "").strip()
+                    if not pid:
+                        m_pid = re.search(r"[?&]pageId=(\d+)", (r.get("url") or ""))
+                        if m_pid:
+                            pid = m_pid.group(1)
+
                     md = {
                         "source": r.get("url"),
                         "kind": "confluence",
-                        "page": r.get("id"),
+                        "page": pid or None,
                         "space": r.get("space"),
                         "title": title,
                         "url": r.get("url"),
                     }
+
                     items.append({"text": text, "metadata": md, "score": 0.5})
                     contexts.append({
                         "text": text,
@@ -948,16 +958,8 @@ async def query(payload: dict = Body(...)):
                         "notes": {"fallback_used": True, "indexed": False}
                     }
 
-        # except ExceptionGroup as eg:
-        #     exs = list(getattr(eg, "exceptions", []))
-        #     for i, ex in enumerate(exs, 1):
-        #         log.error(
-        #             "MCP fallback failed [%d/%d]: %s",
-        #             i, len(exs), "".join(traceback.format_exception(ex)),
-        #         )
         except Exception as e:
             log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
-
 
     return {
         "hits": len(items),
