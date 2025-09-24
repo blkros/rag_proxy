@@ -304,16 +304,13 @@ def v1_models():
 
 @app.post("/ask")
 async def ask(payload: dict):
-    q = (payload or {}).get("question") or ""
-    if not q.strip():
-        raise HTTPException(400, "question is required")
-    msgs, _ = build_openai_messages(q, k=5)
-    res = await call_chat_completions(messages=msgs, temperature=0)
-    try:
-        content = res["choices"][0]["message"]["content"]
-    except Exception:
-        content = str(res)
-    return {"answer": drop_think(content)}
+    """
+    /ask 도 /query 로 위임하여:
+      - 벡터 검색
+      - 필요 시 MCP(Confluence) 폴백
+    까지 한 번에 사용.
+    """
+    return await query(payload)
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), overwrite: bool = Form(False)):
