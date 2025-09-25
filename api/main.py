@@ -949,17 +949,46 @@ async def query(payload: dict = Body(...)):
                         "score": 0.5,
                     })
 
-                if items:  # 결과가 있으면 바로 리턴
-                    return {
-                        "hits": len(items),
-                        "items": items,
-                        "contexts": contexts,
-                        "context_texts": [it["text"] for it in items],
-                        "documents": items,
-                        "chunks": items,
-                        "notes": {"fallback_used": True, "indexed": False}
-                    }
+            if mcp_results:
+                # 폴백 결과를 인덱스로 영구 업서트
+                up_docs = []
+                for r in mcp_results[:k]:
+                    text = (r.get("body") or r.get("text") or r.get("excerpt") or "").strip()
+                    if not text:
+                        continue
+                    src   = (r.get("url") or f"confluence:{r.get('id') or ''}").strip()
+                    title = (r.get("title") or "").strip()
+                    space = (r.get("space") or "").strip()
 
+                    for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
+                        up_docs.append(Document(
+                            page_content=c,
+                            metadata={"source": src, "title": title, "space": space, "kind": "chunk"}
+                        ))
+
+                added = 0
+                if up_docs:
+                    async with index_lock:
+                        added = _upsert_docs_no_dup(up_docs)
+                        vectorstore.save_local(INDEX_DIR)
+                        _reload_retriever()
+
+                # 첫 결과를 최근 소스로 스티키 처리하면 연속 후속질문 안정적
+                try:
+                    if mcp_results and (mcp_results[0].get("url") or mcp_results[0].get("id")):
+                        _set_sticky(mcp_results[0].get("url") or f"confluence:{mcp_results[0].get('id')}")
+                except Exception:
+                    pass
+
+                return {
+                    "hits": len(items),
+                    "items": items,
+                    "contexts": contexts,
+                    "context_texts": [it["text"] for it in items],
+                    "documents": items,
+                    "chunks": items,
+                    "notes": {"fallback_used": True, "indexed": True, "added": added}
+                }
         except Exception as e:
             log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
