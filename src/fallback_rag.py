@@ -1,7 +1,7 @@
 # rag-proxy/src/fallback_rag.py
 from __future__ import annotations
 
-import hashlib
+import hashlib, re
 from typing import List, Tuple
 
 import asyncio
@@ -18,6 +18,8 @@ MCP_LIMIT = 6
 CHUNK_SZ = 1400
 CH_OVER = 180
 
+YEAR_RE   = re.compile(r'(?:19|20)\d{2}')
+TOPIC_RE  = re.compile(r'(이슈|목록|현황|페이지|탭|리스트|DR|작업)')
 
 def _chunk(text: str) -> List[str]:
     if not text:
@@ -79,8 +81,21 @@ def _upsert_chunks(uri: str, title: str, space: str, version, chunks: List[str])
 
     return len(new_docs)
 
+def _looks_like_topic_year(q: str) -> bool:
+    return bool(YEAR_RE.search(q or "")) and bool(TOPIC_RE.search(q or ""))
 
 def answer_with_fallback(question: str, space: str | None = None) -> dict:
+    # 연도+토픽이면 MCP를 먼저 돌려 최신 페이지를 인덱싱
+    if _looks_like_topic_year(question):
+        mcp_results = asyncio.run(mcp_search(question, limit=MCP_LIMIT))
+        for h in mcp_results:
+            url   = (h.get("url")   or h.get("link") or h.get("webui") or "").strip()
+            title = (h.get("title") or h.get("name") or "").strip()
+            txt   = (h.get("body")  or h.get("content") or h.get("excerpt") or "").strip()
+            if not (url and txt):
+                continue
+            _upsert_chunks(uri=url, title=title, space=space or "", version=None, chunks=_chunk(txt))
+
     # 1) 로컬 검색
     hits = _retrieve_local(question)
 
