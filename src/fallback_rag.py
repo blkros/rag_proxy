@@ -114,7 +114,13 @@ def answer_with_fallback(question: str, space: str | None = None) -> dict:
         head = f"[{md.get('space','')}/{md.get('title','')}] {md.get('source','')}"
         contexts.append(f"{head}\n{d.page_content}")
 
-    system = "Answer strictly from the provided context. If not contained, say you don't know."
+    system = (
+        "Answer strictly from the provided context. "
+        "If a direct definition/overview sentence is not present, compose a neutral 2–3 sentence overview "
+        "ONLY from the provided context and append concise sources (title or URL). "
+        "If the context is insufficient, say you don't know."
+    )
+
     answer = chat_with_context(question=question, contexts=contexts, system_prompt=system)
 
     sources = [
