@@ -388,7 +388,7 @@ async def ingest(
         raise HTTPException(500, f"index failed: {e}")
 
 @app.post("/update")
-async def update_index(payload: dict):
+async def update_index(payload: dict = Body(...)):
     """
     업로드된 파일을 인덱스에 추가(멀티포맷: pdf/xlsx/pptx/txt, hwp 제외)
     payload 예: {"path": "uploads/문서.pdf", "parser": "auto|pdf_table"}
@@ -505,9 +505,12 @@ async def delete_index(payload: Optional[dict] = None):
 
     if source:
         try:
+            ns = _norm_source(str(source))
             docstore = vectorstore.docstore._dict
-            target = [doc_id for doc_id, doc in docstore.items()
-                      if str(doc.metadata.get("source", "")) == str(source)]
+            target = [
+                doc_id for doc_id, doc in docstore.items()
+                if _norm_source(str(doc.metadata.get("source",""))) == ns
+            ]
             if not target:
                 return {"deleted": 0, "reason": f"no documents with source={source}"}
 
@@ -852,6 +855,7 @@ async def query(payload: dict = Body(...)):
 
     # 4) 응답 생성 (기존 포맷 유지)
     items, contexts = [], []
+
     for h in chosen:
         md = dict(h["metadata"])
         sc = float(h.get("score") or 0.0)
@@ -868,6 +872,11 @@ async def query(payload: dict = Body(...)):
             "kind": md.get("kind", "chunk"),
             "score": round(sc, 4),
         })
+        
+    try:
+        top_score = max((float(it.get("score") or 0.0) for it in items), default=0.0)
+    except Exception:
+        top_score = 0.0
 
     try:
         log.info(
@@ -979,9 +988,16 @@ async def query(payload: dict = Body(...)):
                         _set_sticky(mcp_results[0].get("url") or f"confluence:{mcp_results[0].get('id')}")
                 except Exception:
                     pass
+                
+                _fb_top = 0.0
+                try:
+                    _fb_top = max((float(it.get("score") or 0.0) for it in items), default=0.0)
+                except Exception:
+                    _fb_top = 0.0
 
                 return {
                     "hits": len(items),
+                    "top_score": round(_fb_top, 4),  # >>> [ADD]
                     "items": items,
                     "contexts": contexts,
                     "context_texts": [it["text"] for it in items],
@@ -996,9 +1012,14 @@ async def query(payload: dict = Body(...)):
     if fallback_attempted:
         base_notes["fallback_used"] = True
         base_notes["indexed"] = False
+    else:
+        # [ADD] 폴백을 안 썼을 때도 표시
+        base_notes["fallback_used"] = False
 
+    # [CHANGE] 응답에 top_score 포함
     return {
         "hits": len(items),
+        "top_score": round(top_score, 4),   # [ADD]
         "items": items,
         "contexts": contexts,
         "context_texts": [it["text"] for it in items],
