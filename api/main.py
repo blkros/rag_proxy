@@ -9,7 +9,7 @@ from fastapi import Body
 import time
 import traceback
 import src.vectorstore as VS
-
+import requests
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
 from src.loaders import load_docs_any
@@ -47,6 +47,8 @@ current_source: Optional[str] = None
 current_source_until: float = 0.0
 STICKY_SECS = 180  # 최근 파일 기준 3분 잠금
 
+BRIDGE_MCP = os.getenv("BRIDGE_MCP", "http://mcp-confluence:9012").rstrip("/")
+
 def _set_sticky(src: str, secs: int = STICKY_SECS):
     """해당 소스를 잠시 기본 대상으로 고정(연속 질문 시 섞임 방지)"""
     global current_source, current_source_until
@@ -74,6 +76,15 @@ _JOSA_RE = re.compile(
     r"(으로써|으로서|으로부터|라고는|라고도|라고|처럼|까지|부터|에게서|한테서|에게|한테|께|이며|이자|"
     r"으로|로서|로써|로부터|께서|와는|과는|에서는|에는|에서|에게|한테|와|과|을|를|은|는|이|가|의|에|도|만|랑|하고)$"
 )
+
+_ENT_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,7}\b")
+
+def _extract_entities(text: str) -> list[str]:
+    if not text:
+        return []
+    ents = _ENT_RE.findall(text.upper())
+    # 중복 제거, 과한 길이 방지
+    return list(dict.fromkeys(ents))[:12]
 
 def _strip_josa(t: str) -> str:
     return _JOSA_RE.sub("", t)
@@ -360,6 +371,15 @@ async def ingest(
             chunk_overlap=CHUNK_OVERLAP,
             parser=parser,
         )
+        for d in docs:
+            try:
+                ents = _extract_entities(d.page_content or "")
+                if ents:
+                    md = d.metadata or {}
+                    md["entities"] = ents
+                    d.metadata = md
+            except Exception:
+                pass
         if not docs:
             raise HTTPException(400, f"no docs parsed from {dest}")
     except ValueError as ve:
@@ -422,6 +442,15 @@ async def update_index(payload: dict = Body(...)):
             chunk_overlap=CHUNK_OVERLAP,
             parser=parser,           # ← 자동/표친화 감지 반영
         )
+        for d in docs:
+            try:
+                ents = _extract_entities(d.page_content or "")
+                if ents:
+                    md = d.metadata or {}
+                    md["entities"] = ents
+                    d.metadata = md
+            except Exception:
+                pass
         if not docs:
             raise HTTPException(400, f"no docs parsed from {path}")
     except ValueError as ve:
@@ -832,6 +861,20 @@ async def query(payload: dict = Body(...)):
         for h in pool_hits:
             h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, art)
 
+    # [ADD] 쿼리/문서 엔티티 교집합 가산점
+    q_ents = set(_extract_entities(q))
+    if q_ents:
+        for h in pool_hits:
+            try:
+                d_ents = set((h.get("metadata") or {}).get("entities", []))
+                inter = q_ents & d_ents
+                if inter:
+                    # 교집합 1개당 +0.06, 최대 +0.18
+                    bonus = min(0.18, 0.06 * len(inter))
+                    h["score"] = float(h.get("score") or 0.0) + bonus
+            except Exception:
+                pass
+
     # 3-E) rerank + 의도기반 주입선택
     chosen = pick_for_injection(q, pool_hits, k_default=int(k) if isinstance(k, int) else 5)
     if intent.get("article_no") and src_filter and not any(
@@ -900,6 +943,47 @@ async def query(payload: dict = Body(...)):
     if NEED_FALLBACK and not DISABLE_INTERNAL_MCP:
         try:
             fallback_attempted = True
+            payload_bridge = {
+                "query": q,
+                "top_k": int(k),
+                "threshold": 0.83,          # 임계 미달 시만 브릿지 동작
+                "include_attachments": True, # 첨부 OCR 포함
+                "att_types": "pdf,img",
+                "att_ocr_max_pages": 3
+                # "space": payload.get("space")  # 팀/스페이스 제한을 요청에서 넘기려면 주석 해제
+            }
+            try:
+                r = requests.post(f"{BRIDGE_MCP}/search_and_ingest_mcp", json=payload_bridge, timeout=180)
+                jr = r.json() if r.ok else {}
+            except Exception:
+                jr = {}
+
+            if isinstance(jr, dict) and jr.get("hits"):
+                items, contexts = [], []
+                for h in jr["hits"][:k]:
+                    md = h.get("meta") or {}
+                    txt = h.get("chunk") or ""
+                    sc  = float(h.get("score") or 0.0)
+                    items.append({"text": txt, "metadata": md, "score": round(sc, 4)})
+                    contexts.append({
+                        "text": txt,
+                        "source": md.get("source"),
+                        "page": md.get("page"),
+                        "kind": md.get("kind", "chunk"),
+                        "score": round(sc, 4),
+                    })
+                top_score = float(jr.get("top_score") or 0.0)
+                return {
+                    "hits": len(items),
+                    "top_score": round(top_score, 4),
+                    "items": items,
+                    "contexts": contexts,
+                    "context_texts": [it["text"] for it in items],
+                    "documents": items,
+                    "chunks": items,
+                    "notes": {"fallback_used": True, "indexed": True}
+                }
+            
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
             async with mcp_lock:
                 mcp_results = await mcp_search(q, limit=5, timeout=20)
@@ -1078,7 +1162,14 @@ async def documents_upsert(payload: dict = Body(...)):
         for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
             to_add.append(Document(
                 page_content=c,
-                metadata={"source": source, "title": title, "space": space, "kind": "chunk"}
+                metadata={
+                    "source": source,
+                    "title": title,
+                    "space": space,
+                    "kind": "chunk",
+                    # [ADD] 업서트 시 엔티티 저장(브릿지/OCR 포함 전체)
+                    "entities": _extract_entities(c)
+                }
             ))
 
     if not to_add:
