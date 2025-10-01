@@ -75,6 +75,89 @@ _JOSA_RE = re.compile(
     r"으로|로서|로써|로부터|께서|와는|과는|에서는|에는|에서|에게|한테|와|과|을|를|은|는|이|가|의|에|도|만|랑|하고)$"
 )
 
+# [ADD] ===== Sparse(키워드) 후보용 토크나이저/스코어러 =====
+
+_TOK_RE = re.compile(r"[A-Za-z0-9가-힣]{2,}")
+
+def _tokenize_query(q: str) -> List[str]:
+    raw = _TOK_RE.findall(q or "")
+    toks = []
+    for t in raw:
+        t = _strip_josa(t)
+        if t and t not in _K_STOP:
+            toks.append(t)
+    # 중복 제거, 너무 많은 토큰 방지
+    return list(dict.fromkeys(toks))[:12]
+
+def _keyword_overlap_score(q_tokens: List[str], text: str, title: str = "") -> float:
+    """간단한 스파스 점수: 토큰 교집합 비율 + 제목 매치 보너스"""
+    if not q_tokens:
+        return 0.0
+    # 텍스트는 길 수 있으니 앞부분만 얇게 보지만, 제목은 풀로 본다
+    body = (text or "")[:1200]
+    hits = sum(1 for t in q_tokens if t in body)
+    base = hits / max(4, len(q_tokens))          # 토큰 일부만 맞아도 0.x 점수
+    if title:
+        title_hits = sum(1 for t in q_tokens if t in title)
+        if title_hits:
+            base += settings.TITLE_BONUS         # 제목 매치 보너스 (가산점)
+    return float(base)
+
+def _sparse_keyword_hits(q: str, limit: int = 150, space: Optional[str] = None) -> List[dict]:
+    """
+    docstore 전체를 훑어 '간단 키워드 매치' 기반 후보를 만든다.
+    반환: pool_hits와 동일한 dict 목록({text, metadata, score})
+    """
+    if not q.strip():
+        return []
+    q_tokens = _tokenize_query(q)
+    if not q_tokens:
+        return []
+
+    try:
+        ds = getattr(vectorstore, "docstore", None)
+        dct = getattr(ds, "_dict", {}) if ds else {}
+    except Exception:
+        return []
+
+    out = []
+    for d in dct.values():
+        md = dict(d.metadata or {})
+        src = str(md.get("source", ""))
+
+        # (옵션) space 하드필터
+        if space and settings.SPACE_FILTER_MODE.lower() == "hard":
+            s = (md.get("space") or "").strip()
+            if not s or s.lower() != space.lower():
+                continue
+
+        title = (md.get("title") or "")
+        score = _keyword_overlap_score(q_tokens, d.page_content or "", title)
+        if score <= 0.0:
+            continue
+
+        # pool_hits 포맷으로 변환
+        md["source"] = src
+        out.append({
+            "text": d.page_content or "",
+            "metadata": md,
+            "score": min(0.99, score),  # 스파스 자체 점수는 0~1 사이
+        })
+
+    # 상위 limit만
+    out.sort(key=lambda h: h["score"], reverse=True)
+    return out[:int(limit)]
+
+def _apply_space_hint(hits: List[dict], space: Optional[str]):
+    """SPACE_FILTER_MODE == soft 일 때, space 일치 항목에 가산점"""
+    if not space or settings.SPACE_FILTER_MODE.lower() != "soft":
+        return
+    sp = space.lower()
+    for h in hits:
+        s = ((h.get("metadata") or {}).get("space") or "").lower()
+        if s and s == sp:
+            h["score"] = float(h.get("score") or 0.0) + settings.SPACE_HINT_BONUS
+
 def _strip_josa(t: str) -> str:
     return _JOSA_RE.sub("", t)
 
@@ -109,11 +192,25 @@ def ensure_dirs():
     Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
 def _make_embedder() -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(
+    emb = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
         model_kwargs={"device": EMBEDDING_DEVICE},
         encode_kwargs={"normalize_embeddings": True}
     )
+    # [ADD] e5 instruct 프리픽스 주입 (LangChain 메서드를 래핑)
+    if settings.E5_USE_PREFIX and "e5" in EMBEDDING_MODEL.lower():
+        _orig_eq = emb.embed_query
+        _orig_ed = emb.embed_documents
+
+        def _eq(text: str):
+            return _orig_eq(f"query: {text}")
+
+        def _ed(texts: List[str]):
+            return _orig_ed([f"passage: {t}" for t in texts])
+
+        emb.embed_query = _eq        # type: ignore
+        emb.embed_documents = _ed    # type: ignore
+    return emb
 
 def _load_or_init_vectorstore() -> FAISSStore:
     try:
@@ -148,8 +245,13 @@ def _empty_faiss() -> FAISSStore:
 
 def _reload_retriever():
     global retriever
-    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 5, "fetch_k": 40})
+    retriever = vectorstore.as_retriever(
+        search_type=settings.SEARCH_TYPE,                       # [MOD]
+        search_kwargs={"k": settings.RETRIEVER_K,               # [MOD]
+                       "fetch_k": settings.RETRIEVER_FETCH_K}   # [MOD]
+    )
     VS.retriever = retriever
+
 
 # 인덱싱 동시성 방지 락
 index_lock = asyncio.Lock()
@@ -684,7 +786,7 @@ async def query(payload: dict = Body(...)):
         except Exception:
             docs = []
     # ... docs를 뽑은 직후, src 필터 적용 전에 추가
-    q_lc = q.lower()
+    # q_lc = q.lower()
 
     # 1) "xxx.pdf"가 질문에 포함되면 동일 소스만 우선
     m = re.search(r'([^\s"\'()]+\.pdf)', q, re.I)
@@ -738,6 +840,11 @@ async def query(payload: dict = Body(...)):
             wanted = _norm_source(bn_map[hit_bn])
             docs = [d for d in docs if _norm_source(str(d.metadata.get("source",""))) == wanted]
 
+    # [ADD] space 힌트 (Confluence space 키)
+    space = (payload or {}).get("space") or (payload or {}).get("spaceKey")
+    if isinstance(space, str):
+        space = space.strip() or None
+
     # 3) 소스 필터 후 상위 k (4-C: 정규화 비교로 교체)
     if src_set:
         wanted = {_norm_source(str(s)) for s in src_set}
@@ -764,6 +871,13 @@ async def query(payload: dict = Body(...)):
         base_docs = retriever.invoke(q) or []
     except Exception:
         base_docs = []
+
+    # [ADD] --- 경량 스파스(키워드) 후보 융합 ---
+    if settings.ENABLE_SPARSE:
+        sparse_hits = _sparse_keyword_hits(q, limit=settings.SPARSE_LIMIT, space=space)
+        # space soft 모드면 가산점 부여
+        _apply_space_hint(sparse_hits, space)
+        pool_hits.extend(sparse_hits)
 
     # 유사도 점수 변환 (FAISS L2 → cos 유사도 근사)
     def _sim_from_dist(dist):
@@ -793,6 +907,17 @@ async def query(payload: dict = Body(...)):
             "metadata": md,
             "score": 0.5,
         })
+
+    # [ADD] dense 풀에도 space soft 보너스 적용
+    _apply_space_hint(pool_hits, space)
+    # [OPTION] dense 후보에도 제목 매치 보너스(약하게)
+    q_tokens = _tokenize_query(q)
+    if q_tokens:
+        for h in pool_hits:
+            md = h.get("metadata") or {}
+            title = (md.get("title") or "")
+            if title and any(t in title for t in q_tokens):
+                h["score"] = float(h.get("score") or 0.0) + (settings.TITLE_BONUS * 0.5)
 
     # === 3-D) 의도 파악
     intent = parse_query_intent(q)

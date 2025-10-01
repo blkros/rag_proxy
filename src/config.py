@@ -22,6 +22,8 @@ def _as_bool(val: str, default=False) -> bool:
         return default
     return s in {"1","true","yes","y","on"}
 
+# ...위 생략...
+
 @dataclass(frozen=True)
 class Settings:
     # RAG / 인덱스
@@ -51,9 +53,17 @@ class Settings:
     # Web
     CORS_ORIGINS: List[str] = field(default_factory=lambda: _as_list(os.getenv("CORS_ORIGINS", "*")))
 
-    # 표 위주 pdf, 만약 pdf에 표 내용이 거의 없으면 기본 파서랑 병합
-    PDF_TABLE_THRESHOLD: int = field(
-        default_factory=lambda: int(os.getenv("PDF_TABLE_THRESHOLD", "5"))
-    )
+    # 표 위주 pdf, ...
+    PDF_TABLE_THRESHOLD: int = field(default_factory=lambda: int(os.getenv("PDF_TABLE_THRESHOLD", "5")))
+
+    # --- Hybrid(경량 스파스) / 타이틀/스페이스 힌트 ---
+    ENABLE_SPARSE: bool = field(default_factory=lambda: _as_bool(os.getenv("ENABLE_SPARSE"), True))
+    SPARSE_LIMIT: int = field(default_factory=lambda: int(os.getenv("SPARSE_LIMIT", "150")))
+    TITLE_BONUS: float = field(default_factory=lambda: float(os.getenv("TITLE_BONUS", "0.25")))
+    SPACE_FILTER_MODE: str = field(default_factory=lambda: os.getenv("SPACE_FILTER_MODE", "soft"))  # "soft"|"hard"
+    SPACE_HINT_BONUS: float = field(default_factory=lambda: float(os.getenv("SPACE_HINT_BONUS", "0.2")))
+
+    # --- e5(instruct) 프리픽스 사용 ---
+    E5_USE_PREFIX: bool = field(default_factory=lambda: _as_bool(os.getenv("E5_USE_PREFIX"), True))
 
 settings = Settings()
