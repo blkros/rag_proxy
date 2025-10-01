@@ -9,6 +9,9 @@ from typing import Any, Dict, List
 MCP_URL = os.getenv("MCP_URL", "http://mcp-atlassian:9000/mcp").rstrip("/")
 PROTO = os.getenv("MCP_PROTOCOL_VERSION", "2025-06-18")
 
+# [# ADDED] Confluence Space 강제 제한(없으면 None)
+CONF_SPACE = os.getenv("CONFLUENCE_SPACE") or os.getenv("CONF_DEFAULT_SPACE") or None
+
 # FastMCP(Streamable HTTP) 서버가 요구하는 헤더
 BASE_HEADERS = {
     "Content-Type": "application/json",
@@ -16,6 +19,21 @@ BASE_HEADERS = {
     "MCP-Protocol-Version": PROTO,
 }
 
+_META_PATTERNS = (
+    r"^\s*###\s*task",            # ### Task:
+    r"json\s*format",             # JSON format:
+    r"<\s*chat_history\s*>",      # <chat_history>
+    r"follow[-\s]*ups?",          # follow-up(s)
+    r"title\s+with\s+an\s+emoji", # title with an emoji
+    r"tags\s+categorizing",       # tags categorizing
+    r"^query:\s*history",         # Query: History:
+    r"^\s*history:",              # History:
+    # (원하면 한국어 키워드도 추가 가능: r"가이드라인|출력|대화\s*기록|태그")
+)
+
+def _is_meta_query(q: str) -> bool:  # [ADDED]
+    s = (q or "").lower()
+    return any(re.search(p, s) for p in _META_PATTERNS)
 
 def _new_session_url(base: str) -> str:
     """
@@ -67,9 +85,12 @@ class MCP:
 
     # ---- Confluence 검색/읽기 ----
     def search(self, query: str, limit: int = 5, space: str | None = None) -> List[str]:
+        if _is_meta_query(query):
+            return []
         args: Dict[str, Any] = {"query": query, "limit": limit}
-        if space:
-            args["space"] = space
+        # [# CHANGED] space가 지정되지 않았을 때도 환경변수 강제 적용
+        if space or CONF_SPACE:  # [# ADDED]
+            args["space"] = space or CONF_SPACE  # [# ADDED]
         tool = os.getenv("CONFLUENCE_TOOL_SEARCH", "search_pages")
         res = self._post({
             "jsonrpc": "2.0",
@@ -79,10 +100,7 @@ class MCP:
         })
 
         # 결과 포맷은 서버 구현에 따라 다소 다를 수 있어 안전하게 파싱
-        # 우선순위: result.content(list of dict/text) -> result.result -> result
         result = res.get("result", {}) or {}
-
-        # 1) content/contents/result/items 어떤 키로 와도 받기
         items = (
             result.get("content")
             or result.get("contents")
@@ -91,7 +109,6 @@ class MCP:
             or []
         )
 
-        # 2) MCP가 content를 [{type:"json", json:[...]}] 형식으로 줄 때 풀어주기
         if isinstance(items, list) and items and isinstance(items[0], dict) and ("type" in items[0]):
             flat = []
             for c in items:
