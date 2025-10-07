@@ -30,3 +30,4 @@ opencv-python-headless
 Pillow
 langchain-text-splitters
 mcp[client]>=1.2.0
+sseclient-py

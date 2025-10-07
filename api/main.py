@@ -66,6 +66,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+SEARCH_LANGS = [s.strip() for s in os.getenv("SEARCH_LANGS", "ko,en").split(",") if s.strip()]
+
 # 키워드 정제(Confluence CQL용)
 _K_STOP = {"관련","내용","찾아줘","찾아","알려줘","정리","컨플루언스","에서","해줘",
            "무엇","어떤","대한","관련한","좀","좀만","계속","그리고","거나"}
@@ -608,8 +610,9 @@ async def delete_index(payload: Optional[dict] = None):
     if source:
         try:
             docstore = vectorstore.docstore._dict
+            norm = _norm_source
             target = [doc_id for doc_id, doc in docstore.items()
-                      if str(doc.metadata.get("source", "")) == str(source)]
+                    if norm(str(doc.metadata.get("source",""))) == norm(source)]
             if not target:
                 return {"deleted": 0, "reason": f"no documents with source={source}"}
 
@@ -1018,14 +1021,22 @@ async def query(payload: dict = Body(...)):
             fallback_attempted = True
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
             async with mcp_lock:
-                mcp_results = await mcp_search(q, limit=5, timeout=20)
+                # [MOD] space/langs를 MCP로 전달
+                mcp_results = await mcp_search(
+                    q,
+                    limit=5,
+                    timeout=20,
+                    space=space,              # [ADD]
+                    langs=SEARCH_LANGS        # [ADD] ex) ["ko","en"]
+                )
+
 
             # 2차: 키워드 정제
             if not mcp_results:
                 q2 = _to_mcp_keywords(q)
                 if q2 != q:
                     async with mcp_lock:
-                        mcp_results = await mcp_search(q2, limit=5, timeout=20)
+                        mcp_results = await mcp_search(q2, limit=5, timeout=20, space=space, langs=SEARCH_LANGS)
 
             # 3차: 가장 긴 한글 토큰
             if not mcp_results:
@@ -1034,7 +1045,8 @@ async def query(payload: dict = Body(...)):
                     best = sorted(ko, key=len, reverse=True)[0]
                     best = _strip_josa(best)
                     async with mcp_lock:
-                        mcp_results = await mcp_search(best, limit=5, timeout=20)
+                        mcp_results = await mcp_search(best, limit=5, timeout=20, space=space, langs=SEARCH_LANGS)
+
 
             # === 결과 정규화/필터링 → items/contexts 로 변환 ===
             if mcp_results:

@@ -36,7 +36,9 @@ def _tool_name(item):
     # 객체 (dataclass 등)
     return getattr(item, "name", None)
 
-async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict[str, Any]]:
+# [MOD] space/langs를 선택 인자로 받기
+async def mcp_search(query: str, limit: int = 5, timeout: int = 20,
+                     space: str | None = None, langs: list[str] | None = None) -> List[Dict[str, Any]]:
     results_all: List[Dict[str, Any]] = []
 
     # 툴 실행 순서를 결정: override가 있으면 그거만, 없으면 search → search_pages
@@ -51,8 +53,12 @@ async def mcp_search(query: str, limit: int = 5, timeout: int = 20) -> List[Dict
 
             for tool_name in tool_order:
                 try:
+                    payload = {"query": query, "limit": limit}
+                    if space: payload["space"] = space          # [ADD]
+                    if langs: payload["langs"] = langs          # [ADD]
+
                     resp = await asyncio.wait_for(
-                        session.call_tool(tool_name, {"query": query, "limit": limit}),
+                        session.call_tool(tool_name, payload),  # [MOD]
                         timeout=timeout
                     )
                 except Exception as e:

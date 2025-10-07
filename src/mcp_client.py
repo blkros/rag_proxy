@@ -1,7 +1,7 @@
 # rag-proxy/src/mcp_client.py
 from __future__ import annotations
 
-import os
+import os, re
 import json
 import requests
 from typing import Any, Dict, List

@@ -28,7 +28,14 @@ except Exception:
     pytesseract = None
     _TESSERACT_OK = False
 
-import cv2, numpy as np
+try:
+    import cv2
+    import numpy as np
+    _CV_OK = True
+except Exception:
+    cv2 = None
+    np = None
+    _CV_OK = False
 from PIL import Image
 import re
 
@@ -381,6 +388,9 @@ def _looks_gibberish(text: str) -> bool:
     return ratio < 0.25  # 경험치: 25% 미만이면 OCR 필요 가능성 높음
 
 def _ocr_page(pil_img: Image.Image, lang: str = "kor+eng") -> str:
+    # [ADD] OpenCV가 없으면 PIL+Tesseract만 빠르게 시도
+    if not _CV_OK or not _TESSERACT_OK:
+        return (pytesseract.image_to_string(pil_img, lang=lang) if _TESSERACT_OK else "").strip()
     """[OCR] 고해상도 + 이진화/잡음제거 후 Tesseract"""
     # 고해상도 확보
     img = np.array(pil_img.convert("RGB"))
