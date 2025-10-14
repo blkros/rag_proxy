@@ -16,4 +16,13 @@ faiss_index/
 node_modules/
 
 C;*/
-C:*/
+C:*/__pycache__/
+*.pyc
+.env
+uploads/
+faiss_index/
+storage/
+cache/
+.cache/
+hf/
+.vscode/
