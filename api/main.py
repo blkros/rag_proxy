@@ -3,12 +3,13 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
-import shutil, os, logging, re
+import shutil, os, logging, re, uuid
 from fastapi.responses import RedirectResponse
 from fastapi import Body
 import time
 import traceback
 import src.vectorstore as VS
+from pydantic import BaseModel
 
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
@@ -1183,18 +1184,29 @@ async def documents_upsert(payload: dict = Body(...)):
     to_add = []
     for d in docs:
         text = (d.get("text") or "").strip()
-        meta = d.get("metadata") or {}
+        # meta = d.get("metadata") or {}
+        meta_in = (d.get("metadata") or d.get("meta") or {})
         if not text:
             continue
-        title = (meta.get("title") or "").strip()
-        url   = (meta.get("url") or meta.get("source") or "").strip()
-        space = (meta.get("space") or meta.get("spaceKey") or "").strip()
+
+        title = (meta_in.get("title") or "").strip()
+        url   = (meta_in.get("url") or meta_in.get("source") or "").strip()
+        space = (meta_in.get("space") or meta_in.get("spaceKey") or "").strip()
         source = url if url else str(d.get("id") or "confluence")
+
+        doc_meta = dict(meta_in)               # ← 원본 메타 유지
+        doc_meta.setdefault("source", source)
+        doc_meta.setdefault("title", title)
+        doc_meta.setdefault("space", space)
+        doc_meta.setdefault("kind", "chunk")
+        # [ADD] pageId가 오면 'page'에도 복사(중복 방지 ID 계산에 유리)
+        if "page" not in doc_meta and doc_meta.get("pageId"):
+            doc_meta["page"] = doc_meta.get("pageId")
 
         for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
             to_add.append(Document(
                 page_content=c,
-                metadata={"source": source, "title": title, "space": space, "kind": "chunk"}
+                metadata=doc_meta    # ← [CHANGE] 재구성하지 말고 보강된 메타 그대로 저장
             ))
 
     if not to_add:
@@ -1213,5 +1225,17 @@ async def documents_upsert(payload: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, f"documents upsert failed: {e}")
 
+# ← [ADD] 호환용 별칭: 브리지에서 /upsert, /v1/ingest, /v1/upsert 도 시도하므로 모두 수용
+@app.post("/upsert")
+async def upsert_alias(payload: dict = Body(...)):
+    return await documents_upsert(payload)
+
+@app.post("/v1/ingest")
+async def v1_ingest_alias(payload: dict = Body(...)):
+    return await documents_upsert(payload)
+
+@app.post("/v1/upsert")
+async def v1_upsert_alias(payload: dict = Body(...)):
+    return await documents_upsert(payload)
 
 app.include_router(smart_router)
