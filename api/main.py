@@ -407,15 +407,78 @@ def v1_models():
         ]
     }
 
-@app.post("/ask")
-async def ask(payload: dict):
+# @app.post("/ask")
+# async def ask(payload: dict):
+#     """
+#     /ask 도 /query 로 위임하여:
+#       - 벡터 검색
+#       - 필요 시 MCP(Confluence) 폴백
+#     까지 한 번에 사용.
+#     """
+#     return await query(payload)
+
+# @app.post("/qa")
+# async def qa_compat(payload: dict = Body(...)):
+#     return await query(payload)
+
+
+from pydantic import BaseModel, Field
+
+class AskPayload(BaseModel):
     """
-    /ask 도 /query 로 위임하여:
-      - 벡터 검색
-      - 필요 시 MCP(Confluence) 폴백
-    까지 한 번에 사용.
+    OpenAPI에 'q'가 반드시 필요한 필드로 표기되도록 하는 요청 스키마.
+    - Open WebUI가 이 스키마를 읽고 q를 포함해 호출하게 됨
+    - top_k / k, space / spaceKey 등도 받아서 query()에 그대로 전달
     """
-    return await query(payload)
+    q: str = Field(..., description="사용자 질문 (필수)")
+    k: int | None = Field(5, description="리트리브 상위 K", ge=1, le=50)
+    top_k: int | None = Field(None, description="일부 클라이언트 호환용(내부에서 k로 매핑)")
+    source: str | None = Field(None, description="소스 단일 필터")
+    sources: list[str] | None = Field(None, description="소스 다중 필터")
+    space: str | None = Field(None, description="Confluence space 힌트")
+    spaceKey: str | None = Field(None, description="space와 동일(클라이언트 호환)")
+    messages: list[dict] | None = Field(None, description="대화형 호환 필드")
+
+    def to_query_dict(self) -> dict:
+        d = self.model_dump(exclude_none=True)
+        # 호환: top_k만 왔으면 k로 치환
+        if "top_k" in d and "k" not in d:
+            d["k"] = d.pop("top_k")
+        # 호환: spaceKey만 왔으면 space로 치환
+        if "spaceKey" in d and "space" not in d:
+            d["space"] = d.pop("spaceKey")
+        return d
+
+@app.post(
+    "/ask",
+    summary="Ask",
+    description="/ask → 내부적으로 /query 호출합니다. (벡터 검색 + 필요 시 폴백)",
+)
+async def ask(payload: AskPayload = Body(
+    ...,
+    example={"q": "NIA 사용자 시나리오", "k": 5}
+)):
+    """
+    [중요] 여기를 Pydantic 모델로 바꿔야 OpenAPI에 '필수 q'가 반영되어
+    Open WebUI가 빈 바디가 아닌 {'q': ...} 형태로 요청합니다.
+    """
+    # query()는 dict를 받으므로 모델을 dict로 변환
+    return await query(payload.to_query_dict())
+
+@app.post(
+    "/qa",
+    summary="Qa Compat",
+    description="과거 호환용 엔드포인트. /ask와 동일하게 동작.",
+)
+async def qa_compat(payload: AskPayload = Body(
+    ...,
+    example={"q": "NIA 사용자 시나리오"}
+)):
+    """
+    [중요] /qa도 동일 스키마를 쓰면 OpenAPI 상으로 동일한 요구사항이 노출됩니다.
+    """
+    return await query(payload.to_query_dict())
+
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), overwrite: bool = Form(False)):
@@ -1145,9 +1208,7 @@ async def query(payload: dict = Body(...)):
         "notes": base_notes
     }
 
-@app.post("/qa")
-async def qa_compat(payload: dict = Body(...)):
-    return await query(payload)
+
 
 # ------- helper: chunk text -------
 def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
