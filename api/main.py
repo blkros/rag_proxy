@@ -1,5 +1,4 @@
-# rag-proxy/api/main.py
-from __future__ import annotations
+# C:\Users\nuri\Desktop\RAG\ai-stack\api\main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
@@ -47,6 +46,22 @@ last_source: Optional[str] = None
 current_source: Optional[str] = None
 current_source_until: float = 0.0
 STICKY_SECS = 180  # 최근 파일 기준 3분 잠금
+
+# >>> [ADD] pageId 추출/URL 정규화 유틸
+_PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
+
+def _extract_page_id(src: Optional[str]) -> Optional[str]:
+    """Confluence URL 에서 pageId= 숫자만 뽑는다."""
+    if not src:
+        return None
+    m = _PAGEID_RE.search(str(src))
+    return m.group(1) if m else None
+
+def _url_has_page_id(url: Optional[str], page_id: Optional[str]) -> bool:
+    """url 이 해당 pageId 를 가리키는지 여부"""
+    if not url or not page_id:
+        return False
+    return bool(_PAGEID_RE.search(str(url)) and page_id in str(url))
 
 def _set_sticky(src: str, secs: int = STICKY_SECS):
     """해당 소스를 잠시 기본 대상으로 고정(연속 질문 시 섞임 방지)"""
@@ -819,13 +834,25 @@ async def query(payload: dict = Body(...)):
                 q = m["content"]; break
     if not q.strip():
         raise HTTPException(400, "question/query/q/messages is required")
-
+    
+    if q.strip().startswith("### Task:"):
+        return {
+            "hits": 0,
+            "items": [],
+            "contexts": [],
+            "context_texts": [],
+            "documents": [],
+            "chunks": [],
+            "notes": {"meta_task": True}
+        }
+    
     # 2) k / source
     k = (payload or {}).get("k") or (payload or {}).get("top_k") or 5
     try: k = int(k)
     except: k = 5
     src_filter = (payload or {}).get("source")
     src_list   = (payload or {}).get("sources")
+    forced_page_id = _extract_page_id(src_filter)
     src_set    = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
 
     # >>> [ADD] 스티키가 살아있으면 우선 적용
@@ -1063,12 +1090,13 @@ async def query(payload: dict = Body(...)):
 
     try:
         log.info(
-            "Q=%r src_filter=%r sticky=%r pool=%d chosen=%d by_section=%s",
-            q, src_filter, current_source, len(pool_hits), len(items),
+            "Q=%r src_filter=%r sticky=%r page_id=%r pool=%d chosen=%d by_section=%s",
+            q, src_filter, current_source, forced_page_id, len(pool_hits), len(items),
             dict(Counter((h.get('metadata') or {}).get('section_index', -1) for h in chosen))
         )
     except Exception:
         pass
+
 
     # === 컨텍스트에 질의 토큰이 하나도 없으면 폴백 플래그 ===
     def _query_tokens(q: str):
@@ -1084,16 +1112,32 @@ async def query(payload: dict = Body(...)):
         try:
             fallback_attempted = True
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
-            async with mcp_lock:
-                # [MOD] space/langs를 MCP로 전달
-                mcp_results = await mcp_search(
-                    q,
-                    limit=5,
-                    timeout=20,
-                    space=space,              # [ADD]
-                    langs=SEARCH_LANGS        # [ADD] ex) ["ko","en"]
-                )
 
+            mcp_results = []
+
+            if forced_page_id:
+                try:
+                    async with mcp_lock:
+                        mcp_results = await mcp_search(
+                            f"id={forced_page_id}",  # ← page 단건 조회 시도
+                            limit=1,
+                            timeout=20,
+                            space=space,
+                            langs=SEARCH_LANGS
+                        )
+                except Exception:
+                    mcp_results = []
+
+            # >>> [ADD] 1순위가 실패하면, 기존 쿼리로 일반 검색
+            if not mcp_results:
+                async with mcp_lock:
+                    mcp_results = await mcp_search(
+                        q,
+                        limit=5,
+                        timeout=20,
+                        space=space,
+                        langs=SEARCH_LANGS
+                    )
 
             # 2차: 키워드 정제
             if not mcp_results:
@@ -1110,6 +1154,10 @@ async def query(payload: dict = Body(...)):
                     best = _strip_josa(best)
                     async with mcp_lock:
                         mcp_results = await mcp_search(best, limit=5, timeout=20, space=space, langs=SEARCH_LANGS)
+
+            # >>> [ADD] pageId가 강제되었으면 결과에서 해당 pageId만 남긴다.
+            if forced_page_id and mcp_results:
+                mcp_results = [r for r in mcp_results if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id]
 
 
             # === 결과 정규화/필터링 → items/contexts 로 변환 ===
@@ -1180,6 +1228,12 @@ async def query(payload: dict = Body(...)):
                         _set_sticky(mcp_results[0].get("url") or f"confluence:{mcp_results[0].get('id')}")
                 except Exception:
                     pass
+                    source_urls = []
+                    try:
+                        urls = [ (it.get("metadata") or {}).get("source") or (it.get("metadata") or {}).get("url") for it in items ]
+                        source_urls = [u for u in dict.fromkeys([str(u) for u in urls if u])]
+                    except Exception:
+                        source_urls = []
 
                 return {
                     "hits": len(items),
@@ -1188,6 +1242,7 @@ async def query(payload: dict = Body(...)):
                     "context_texts": [it["text"] for it in items],
                     "documents": items,
                     "chunks": items,
+                    "source_urls": source_urls,
                     "notes": {"fallback_used": True, "indexed": True, "added": added}
                 }
         except Exception as e:
@@ -1205,6 +1260,7 @@ async def query(payload: dict = Body(...)):
         "context_texts": [it["text"] for it in items],
         "documents": items,
         "chunks": items,
+        "source_urls": source_urls,
         "notes": base_notes
     }
 
