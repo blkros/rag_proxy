@@ -30,6 +30,12 @@ from langchain_community.docstore.in_memory import InMemoryDocstore
 logging.basicConfig(level=logging.INFO)
 DISABLE_INTERNAL_MCP = (os.getenv("DISABLE_INTERNAL_MCP", "0").lower() in ("1","true","yes"))
 
+PAGE_FILTER_MODE = getattr(settings, "PAGE_FILTER_MODE", "soft")   # "soft"|"hard"|"off"
+PAGE_HINT_BONUS = float(getattr(settings, "PAGE_HINT_BONUS", 0.35))
+SINGLE_SOURCE_COALESCE = bool(getattr(settings, "SINGLE_SOURCE_COALESCE", True))
+COALESCE_THRESHOLD = float(getattr(settings, "COALESCE_THRESHOLD", 0.55))
+_COALESCE_TRIGGER = re.compile(r"(최근|이슈|목록|정리|요약|top\s*\d+|\d+\s*가지)", re.I)
+
 META_PAT  = re.compile(r"(주제|개요|요약|무엇|무슨\s*내용)", re.I)
 TITLE_PAT = re.compile(r"(제목|title|문서명|파일명)", re.I)
 LOGIN_PAT = re.compile(r"(Confluence에\s*로그인|로그인\s*-\s*Confluence|name=[\"']os_username[\"'])", re.I)
@@ -81,6 +87,56 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def _match_pageid(md: dict, pid: str) -> bool:
+    if not pid:
+        return True
+    pid_md = str((md or {}).get("page") or (md or {}).get("pageId") or "")
+    src = str((md or {}).get("source") or "")
+    url = str((md or {}).get("url") or "")
+    return (pid_md == pid) or (f"pageId={pid}" in src) or (f"pageId={pid}" in url)
+
+def _apply_page_hint(hits: List[dict], page_id: str | None):
+    """pageId가 오면 '가산점'만 (soft). 잠그지 않음."""
+    if not page_id or PAGE_FILTER_MODE.lower() != "soft":
+        return
+    for h in hits:
+        if _match_pageid(h.get("metadata") or {}, page_id):
+            h["score"] = float(h.get("score") or 0.0) + PAGE_HINT_BONUS
+
+def _coalesce_single_source(hits: List[dict], q: str) -> List[dict]:
+    """
+    '최근/이슈/목록/정리' 같은 질의면 여러 출처가 섞이지 않게
+    가장 점수가 높은 '단일 소스(=한 페이지)'만 남긴다.
+    """
+    if not SINGLE_SOURCE_COALESCE or not hits or not _COALESCE_TRIGGER.search(q or ""):
+        return hits
+
+    # source+page를 키로 클러스터링
+    groups = {}
+    for h in hits:
+        md = h.get("metadata") or {}
+        key = f"{md.get('url') or md.get('source') or ''}|p{md.get('page') or md.get('pageId') or ''}"
+        groups.setdefault(key, []).append(h)
+
+    scored = []
+    for key, hs in groups.items():
+        s = sum(float(x.get("score") or 0.0) for x in hs)
+        scored.append((key, s, hs))
+    if not scored:
+        return hits
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_key, best_score, best_group = scored[0]
+    total = sum(s for _, s, _ in scored) or 1.0
+    if (best_score / total) >= COALESCE_THRESHOLD or len(scored) > 1:
+        # 한 페이지로 수렴
+        try:
+            _set_sticky(best_key.split("|p", 1)[0])  # 다음 질문 안정화
+        except Exception:
+            pass
+        return best_group
+    return hits
 
 SEARCH_LANGS = [s.strip() for s in os.getenv("SEARCH_LANGS", "ko,en").split(",") if s.strip()]
 
@@ -835,6 +891,14 @@ async def query(payload: dict = Body(...)):
     if not q.strip():
         raise HTTPException(400, "question/query/q/messages is required")
     
+    # [ADD] pageId 힌트만 추출(잠금 아님)
+    page_id = (payload or {}).get("pageId")
+    if not page_id:
+        m_pid = re.search(r"pageId\s*=\s*(\d+)", q)
+        if m_pid:
+            page_id = m_pid.group(1)
+    page_id = str(page_id) if page_id is not None else None
+
     if q.strip().startswith("### Task:"):
         return {
             "hits": 0,
@@ -853,6 +917,8 @@ async def query(payload: dict = Body(...)):
     src_filter = (payload or {}).get("source")
     src_list   = (payload or {}).get("sources")
     forced_page_id = _extract_page_id(src_filter)
+    if not forced_page_id and page_id:
+        forced_page_id = page_id
     src_set    = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
 
     # >>> [ADD] 스티키가 살아있으면 우선 적용
@@ -969,8 +1035,8 @@ async def query(payload: dict = Body(...)):
     # [ADD] --- 경량 스파스(키워드) 후보 융합 ---
     if settings.ENABLE_SPARSE:
         sparse_hits = _sparse_keyword_hits(q, limit=settings.SPARSE_LIMIT, space=space)
-        # space soft 모드면 가산점 부여
         _apply_space_hint(sparse_hits, space)
+        _apply_page_hint(sparse_hits, page_id)   # ← sparse 후보들에 pageId 가산점
         pool_hits.extend(sparse_hits)
 
     # 유사도 점수 변환 (FAISS L2 → cos 유사도 근사)
@@ -1004,6 +1070,7 @@ async def query(payload: dict = Body(...)):
 
     # [ADD] dense 풀에도 space soft 보너스 적용
     _apply_space_hint(pool_hits, space)
+    _apply_page_hint(pool_hits, page_id)
     # [OPTION] dense 후보에도 제목 매치 보너스(약하게)
     q_tokens = _tokenize_query(q)
     if q_tokens:
@@ -1050,6 +1117,7 @@ async def query(payload: dict = Body(...)):
 
     # 3-E) rerank + 의도기반 주입선택
     chosen = pick_for_injection(q, pool_hits, k_default=int(k) if isinstance(k, int) else 5)
+    chosen = _coalesce_single_source(chosen, q)
     if intent.get("article_no") and src_filter and not any(
         (h.get("metadata") or {}).get("article_no") == intent["article_no"] for h in chosen
     ):
@@ -1228,12 +1296,6 @@ async def query(payload: dict = Body(...)):
                         _set_sticky(mcp_results[0].get("url") or f"confluence:{mcp_results[0].get('id')}")
                 except Exception:
                     pass
-                    source_urls = []
-                    try:
-                        urls = [ (it.get("metadata") or {}).get("source") or (it.get("metadata") or {}).get("url") for it in items ]
-                        source_urls = [u for u in dict.fromkeys([str(u) for u in urls if u])]
-                    except Exception:
-                        source_urls = []
 
                 return {
                     "hits": len(items),
