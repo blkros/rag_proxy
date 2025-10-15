@@ -1242,7 +1242,7 @@ async def query(payload: dict = Body(...)):
                     "context_texts": [it["text"] for it in items],
                     "documents": items,
                     "chunks": items,
-                    "source_urls": source_urls,
+                    "source_urls": _collect_source_urls(items),
                     "notes": {"fallback_used": True, "indexed": True, "added": added}
                 }
         except Exception as e:
@@ -1260,7 +1260,7 @@ async def query(payload: dict = Body(...)):
         "context_texts": [it["text"] for it in items],
         "documents": items,
         "chunks": items,
-        "source_urls": source_urls,
+        "source_urls": _collect_source_urls(items),
         "notes": base_notes
     }
 
@@ -1282,6 +1282,16 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
             i = 0
     return out
 
+# [ADD] ------- helper: collect source urls -------
+def _collect_source_urls(items: list[dict]) -> list[str]:
+    """items[*].metadata.url or metadata.source에서 고유 URL만 추출"""
+    urls: list[str] = []
+    for it in items or []:
+        md = (it.get("metadata") or {})
+        url = md.get("url") or md.get("source")
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 @app.post("/documents/upsert")
 async def documents_upsert(payload: dict = Body(...)):
