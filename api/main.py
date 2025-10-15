@@ -536,27 +536,13 @@ def v1_models():
         "object": "list",
         "data": [
             {
-                "id": "rag-proxy",
+                "id": "qwen3-30b-a3b-fp8-router",
                 "object": "model",
                 "created": int(time.time()),
-                "owned_by": "rag-proxy"
+                "owned_by": "router"
             }
         ]
     }
-
-# @app.post("/ask")
-# async def ask(payload: dict):
-#     """
-#     /ask 도 /query 로 위임하여:
-#       - 벡터 검색
-#       - 필요 시 MCP(Confluence) 폴백
-#     까지 한 번에 사용.
-#     """
-#     return await query(payload)
-
-# @app.post("/qa")
-# async def qa_compat(payload: dict = Body(...)):
-#     return await query(payload)
 
 
 from pydantic import BaseModel, Field
@@ -1552,3 +1538,59 @@ async def v1_upsert_alias(payload: dict = Body(...)):
     return await documents_upsert(payload)
 
 app.include_router(smart_router)
+
+from api.smart_router import ask_smart
+
+@app.post("/v1/chat/completions")
+async def v1_chat(payload: dict = Body(...)):
+    import time as _time
+
+    # 마지막 user 메시지 추출
+    q = ""
+    for m in payload.get("messages", []):
+        if m.get("role") == "user" and m.get("content"):
+            q = m["content"]
+    if not q:
+        q = payload.get("prompt") or ""
+    if not q.strip():
+        raise HTTPException(400, "user message required")
+
+    # 1) 내부 /query 직접 호출
+    r = await query({"question": q})
+
+    # 2) direct_answer가 있으면 그대로 사용
+    content = r.get("direct_answer")
+
+    # 3) 없으면 contexts를 컨텍스트로 하여 한 번 요약 생성
+    if not content:
+        ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()
+        if ctx:
+            sys = (
+                "너의 사고과정은 출력하지 말고, 아래 컨텍스트에 근거하여 간결하고 정확히 한국어로 답하라. "
+                "컨텍스트에 없는 내용은 추측하지 말라.\n\n컨텍스트:\n" + ctx
+            )
+            msgs = [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": q},
+            ]
+            try:
+                content = await _call_llm(messages=msgs)
+            except Exception:
+                content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
+        else:
+            content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
+
+    # 4) OpenAI 호환 스키마로 감싸서 반환
+    return {
+        "object": "chat.completion",
+        "model": "qwen3-30b-a3b-fp8-router",
+        "created": int(_time.time()),
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "notes": r.get("notes", {}),
+    }
