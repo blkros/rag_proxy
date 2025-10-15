@@ -47,7 +47,7 @@ class Settings:
 
     # LLM (vLLM/OpenAI 호환)
     OPENAI_API_KEY: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", "local-anything"))
-    OPENAI_BASE_URL: str = field(default_factory=lambda: os.getenv("OPENAI_BASE_URL", "http://localhost:9999/v1"))
+    OPENAI_BASE_URL: str = field(default_factory=lambda: os.getenv("OPENAI_BASE_URL", "http://172.16.10.168:9993/v1"))
     OPENAI_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "qwen3-30b-a3b-fp8"))
 
     # Web
