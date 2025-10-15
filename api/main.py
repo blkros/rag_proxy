@@ -9,6 +9,9 @@ import time
 import traceback
 import src.vectorstore as VS
 from pydantic import BaseModel
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import inspect
 
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
@@ -36,6 +39,8 @@ SINGLE_SOURCE_COALESCE = bool(getattr(settings, "SINGLE_SOURCE_COALESCE", True))
 COALESCE_THRESHOLD = float(getattr(settings, "COALESCE_THRESHOLD", 0.55))
 _COALESCE_TRIGGER = re.compile(r"(최근|이슈|목록|정리|요약|top\s*\d+|\d+\s*가지)", re.I)
 
+TZ_NAME = getattr(settings, "TZ_NAME", "Asia/Seoul")
+
 META_PAT  = re.compile(r"(주제|개요|요약|무엇|무슨\s*내용)", re.I)
 TITLE_PAT = re.compile(r"(제목|title|문서명|파일명)", re.I)
 LOGIN_PAT = re.compile(r"(Confluence에\s*로그인|로그인\s*-\s*Confluence|name=[\"']os_username[\"'])", re.I)
@@ -55,6 +60,59 @@ STICKY_SECS = 180  # 최근 파일 기준 3분 잠금
 
 # >>> [ADD] pageId 추출/URL 정규화 유틸
 _PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
+
+
+# 1) '오늘/지금/현재' 같은 지시어가 필수
+_DEICTIC_RE = re.compile(r"(오늘|지금|현재)", re.I)
+
+# 2) 사용자가 특정 날짜를 콕 집은 경우는 RAG로(예: 2025년 7월 3일)
+_EXPLICIT_DATE_RE = re.compile(r"\d{4}\s*년|\d{1,2}\s*월\s*\d{1,2}\s*일", re.I)
+
+# 3) 리스트/요약/탑N 같은 RAG 냄새 신호가 있으면 RAG로
+_RETRIEVAL_HINT_RE = re.compile(r"(최근|이슈|목록|리스트|정리|요약|top\s*\d+|\d+\s*가지|내역|중)", re.I)
+
+# 4) 날짜/시간을 '오늘' 기준으로 물어보는지
+_DATE_TIME_NEED_RE = re.compile(r"(날짜|요일|시간|시각|몇\s*시|몇\s*분|몇\s*월|몇\s*일|며칠)", re.I)
+
+_DOMAIN_HINT_RE = re.compile(r"(회의|마감|일정|보고서|티켓|이슈|장애|배포|회의록|결재|승인|요청|문서)", re.I)
+
+def _is_datetime_question(q: str) -> bool:
+    q = (q or "").strip()
+    if not q:
+        return False
+    # RAG 신호가 있으면 직접답 차단
+    if _EXPLICIT_DATE_RE.search(q) or _RETRIEVAL_HINT_RE.search(q):
+        return False
+    # '오늘/지금/현재' 같은 지시어가 반드시 있어야 함
+    if not _DEICTIC_RE.search(q):
+        return False
+    if _DOMAIN_HINT_RE.search(q):
+        return False
+    # 실제로 날짜/시간을 묻는지 확인
+    return bool(_DATE_TIME_NEED_RE.search(q))
+
+def _now_str_kst() -> tuple[str, str, str]:
+    try:
+        now = datetime.now(ZoneInfo(TZ_NAME))
+    except Exception:
+        # tzdata 미설치 등 문제 시 로컬 타임 폴백
+        now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    dow_str  = ["월","화","수","목","금","토","일"][now.weekday()]
+    time_str = now.strftime("%H:%M")
+    return date_str, dow_str, time_str
+
+async def _call_llm(messages: list[dict], **kwargs) -> str:
+    """call_chat_completions이 sync/async 어느 쪽이든 안전하게 호출"""
+    try:
+        if inspect.iscoroutinefunction(call_chat_completions):
+            return await call_chat_completions(messages=messages, **kwargs)
+        return call_chat_completions(messages=messages, **kwargs)
+    except TypeError:
+        # 혹시 위치인자만 받는 구현일 수도 있어서 백업
+        if inspect.iscoroutinefunction(call_chat_completions):
+            return await call_chat_completions(messages)
+        return call_chat_completions(messages)
 
 def _extract_page_id(src: Optional[str]) -> Optional[str]:
     """Confluence URL 에서 pageId= 숫자만 뽑는다."""
@@ -885,8 +943,6 @@ async def uploads_reset():
 async def query(payload: dict = Body(...)):
     global vectorstore, retriever
     fallback_attempted = False 
-    if vectorstore is None:
-        raise HTTPException(500, "vectorstore is not ready.")
 
     # 1) 쿼리 추출
     q = (payload or {}).get("question") \
@@ -917,6 +973,40 @@ async def query(payload: dict = Body(...)):
             "chunks": [],
             "notes": {"meta_task": True}
         }
+    
+    # === Direct-Answer 라우팅: 날짜/시간 등 상식형은 RAG/MCP를 건너뛰고 LLM이 바로 답 ===
+    if _is_datetime_question(q):
+        date_str, dow_str, time_str = _now_str_kst()
+        sys = (
+            "너는 RAG 컨텍스트 없이도 답할 수 있는 상식형 질문에 직접 답하는 어시스턴트다. "
+            f"현재 표준시({TZ_NAME})는 {date_str} {dow_str}요일 {time_str} 이다. "
+            "사용자가 날짜/요일/시간을 물으면 이 값을 활용해 간결히 한국어로 답하라. "
+            "사고과정은 절대 출력하지 말라."
+        )
+        msgs = [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": q},
+        ]
+        try:
+            direct = await _call_llm(messages=msgs)
+        except Exception:
+            # LLM 호출 실패 시 서버 시계 기반으로 최소 응답 보장
+            direct = f"오늘은 {date_str} {dow_str}요일입니다."
+
+        return {
+            "hits": 0,
+            "items": [],
+            "contexts": [],
+            "context_texts": [],
+            "documents": [],
+            "chunks": [],
+            "source_urls": [],
+            "direct_answer": direct,
+            "notes": {"routed": "no_rag", "reason": "datetime"}
+        }
+
+    if vectorstore is None:
+        raise HTTPException(500, "vectorstore is not ready.")
     
     # 2) k / source
     k = (payload or {}).get("k") or (payload or {}).get("top_k") or 5
