@@ -1565,6 +1565,9 @@ async def v1_chat(payload: dict = Body(...)):
     if not content:
         ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()
         if ctx:
+            # 🔧 길이 가드 추가 (문자 기준 8천자 정도면 vLLM 쾌적)
+            ctx = ctx[:8000]
+
             sys = (
                 "너의 사고과정은 출력하지 말고, 아래 컨텍스트에 근거하여 간결하고 정확히 한국어로 답하라. "
                 "컨텍스트에 없는 내용은 추측하지 말라.\n\n컨텍스트:\n" + ctx
@@ -1574,8 +1577,10 @@ async def v1_chat(payload: dict = Body(...)):
                 {"role": "user", "content": q},
             ]
             try:
-                content = await _call_llm(messages=msgs)
-            except Exception:
+                # 🔧 토큰/온도 명시(안정화)
+                content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
+            except Exception as e:
+                log.warning("summarize failed: %s", e)
                 content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
         else:
             content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
