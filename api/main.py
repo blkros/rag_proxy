@@ -149,6 +149,14 @@ _JOSA_RE = re.compile(
     r"으로|로서|로써|로부터|께서|와는|과는|에서는|에는|에서|에게|한테|와|과|을|를|은|는|이|가|의|에|도|만|랑|하고)$"
 )
 
+ACRONYM_RE = re.compile(r'^[A-Z]{2,5}$')
+
+def _split_core_and_acronyms(tokens: List[str]) -> Tuple[List[str], List[str]]:
+    core, acr = [], []
+    for t in tokens:
+        (acr if ACRONYM_RE.match(t) else core).append(t)
+    return core, acr
+
 # [ADD] ===== Sparse(키워드) 후보용 토크나이저/스코어러 =====
 
 _TOK_RE = re.compile(r"[A-Za-z0-9가-힣]{2,}")
@@ -1173,9 +1181,27 @@ async def query(payload: dict = Body(...)):
         return toks[:8]
 
     ctx_all = "\n".join(c["text"] for c in contexts)
-    has_any_query_token = any(t in ctx_all for t in _query_tokens(q))
+    tokens = _query_tokens(q)
+    core, acr = _split_core_and_acronyms(tokens)
 
-    NEED_FALLBACK = (len(items) == 0) or (len(pool_hits) < max(10, k*2)) or missing_article or (not has_any_query_token)
+    # 컨텍스트 본문에서 '핵심 토큰' 일부라도 맞는지
+    core_hit = any(t in ctx_all for t in core)
+
+    # 약어(NIA 등)는 본문 외에 제목/소스 메타에도 찾음
+    titles_meta = " ".join(
+        f"{(h.get('metadata') or {}).get('title','')} {(h.get('metadata') or {}).get('source','')}"
+        for h in items
+    )
+    acronym_hit = True if not acr else any(a in ctx_all or a in titles_meta for a in acr)
+
+    NEED_FALLBACK = (
+        (len(items) == 0) or
+        (len(pool_hits) < max(10, k*2)) or
+        missing_article or
+        (not core_hit) or              # 핵심 토큰이 하나도 안 맞으면 폴백
+        (acr and not acronym_hit)      # 약어가 질문에 있는데 컨텍스트/제목/소스 어디에도 없으면 폴백
+    )
+
     if NEED_FALLBACK and not DISABLE_INTERNAL_MCP:
         try:
             fallback_attempted = True
@@ -1270,14 +1296,22 @@ async def query(payload: dict = Body(...)):
                 # 폴백 결과를 인덱스로 영구 업서트
                 up_docs = []
                 for r in mcp_results[:k]:
-                    text = (r.get("body") or r.get("text") or r.get("excerpt") or "").strip()
-                    if not text:
+                    text_body = (r.get("body") or r.get("text") or r.get("excerpt") or "").strip()
+                    if not text_body:
                         continue
                     src   = (r.get("url") or f"confluence:{r.get('id') or ''}").strip()
                     title = (r.get("title") or "").strip()
                     space = (r.get("space") or "").strip()
 
-                    for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
+                    # [NEW] 제목 청크를 별도로 1개 추가 → build_openai_messages의 'title' 가중과도 맞물림
+                    if title:
+                        up_docs.append(Document(
+                            page_content=f"[TITLE] {title}",
+                            metadata={"source": src, "title": title, "space": space, "kind": "title"}
+                        ))
+
+                    text_full = ((title + "\n\n") if title else "") + text_body
+                    for c in _chunk_text(text_full, CHUNK_SIZE, CHUNK_OVERLAP):
                         up_docs.append(Document(
                             page_content=c,
                             metadata={"source": src, "title": title, "space": space, "kind": "chunk"}
