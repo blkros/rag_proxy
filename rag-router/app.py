@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from typing import List, Optional
 import os, httpx, time, uuid, re
 from html import unescape  # ← (추가) HTML 엔티티 정리용
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 RAG = os.getenv("RAG_PROXY_URL", "http://rag-proxy:8080")
 OPENAI = os.getenv("OPENAI_URL", "http://172.16.10.168:9993/v1")
@@ -246,7 +248,32 @@ async def chat(req: ChatReq):
     best_ctx = best_ctx_good or best_ctx_any
 
     if not best_ctx:
-        content = "인덱스에 근거 없음"
+        # LLM 폴백 (일반 질문/날짜/상식 응답)
+        now_kst = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d (%a) %H:%M:%S %Z")
+        sysmsg = {
+            "role": "system",
+            "content": (
+                f"현재 날짜와 시간: {now_kst}. "
+                "문서 인덱스가 없어도 일반 상식·수학·날짜/시간 등은 직접 답하세요. "
+                "‘인덱스에 근거 없음’ 같은 말은 하지 마세요."
+            ),
+        }
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": [sysmsg] + [m.model_dump() for m in req.messages],
+            "stream": False,
+            "temperature": 0,
+        }
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                r = await client.post(f"{OPENAI}/chat/completions", json=payload)
+                rj = r.json()
+                raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+                content = sanitize(strip_reasoning(raw).strip()) or "죄송해요. 지금은 답을 찾지 못했어요."
+            except (httpx.RequestError, ValueError) as e:
+                print(f"[router] OPENAI fallback error: {e}")
+                content = "죄송해요. 지금은 답을 찾지 못했어요."
+
         return {
             "id": f"cmpl-{uuid.uuid4()}",
             "object": "chat.completion",
@@ -254,6 +281,7 @@ async def chat(req: ChatReq):
             "model": req.model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         }
+
 
     ctx_text = best_ctx
     ctx_for_prompt = sanitize(ctx_text)
