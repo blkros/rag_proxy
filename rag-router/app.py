@@ -165,7 +165,7 @@ async def chat(req: ChatReq):
     qa_json = None
     qa_items = []
     # (timeout 세분화: read만 좀 더 길게)
-    timeout = httpx.Timeout(connect=5.0, read=20.0, write=20.0)
+    timeout = httpx.Timeout(30.0, connect=5.0, read=20.0, write=20.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         for v in variants:
             try:  # ← [추가] 예외 흡수해서 다음 변형 시도
