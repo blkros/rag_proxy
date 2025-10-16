@@ -10,6 +10,7 @@ RAG = os.getenv("RAG_PROXY_URL", "http://rag-proxy:8080")
 OPENAI = os.getenv("OPENAI_URL", "http://172.16.10.168:9993/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "qwen3-30b-a3b-fp8")
 ROUTER_MODEL_ID = os.getenv("ROUTER_MODEL_ID", "qwen3-30b-a3b-fp8-router")
+TZ = os.getenv("ROUTER_TZ", "Asia/Seoul")
 
 app = FastAPI()
 
