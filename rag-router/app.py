@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
-import os, httpx, time, uuid, re
+import os, httpx, time, uuid, re, math
 from html import unescape
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -13,9 +13,17 @@ ROUTER_MODEL_ID = os.getenv("ROUTER_MODEL_ID", "qwen3-30b-a3b-fp8-router")
 TZ = os.getenv("ROUTER_TZ", "Asia/Seoul")
 
 ROUTER_MAX_TOKENS = int(os.getenv("ROUTER_MAX_TOKENS", "2048"))
-ANSWER_MODE = os.getenv("ROUTER_ANSWER_MODE", "bulleted")     # bulleted | sections
+ANSWER_MODE = os.getenv("ROUTER_ANSWER_MODE", "auto")
 BULLETS_MAX = int(os.getenv("ROUTER_BULLETS_MAX", "15"))
 MAX_CTX_CHARS = int(os.getenv("MAX_CTX_CHARS", "8000"))
+_BULLET_HINTS = os.getenv(
+    "ROUTER_AUTO_BULLET_HINTS",
+    "정리 요약 항목 목록 리스트 불릿 bullet 체크리스트 장단점 비교 포인트 핵심 todo 해야할일"
+).split()
+_PARA_HINTS = os.getenv(
+    "ROUTER_AUTO_PARA_HINTS",
+    "설명 자세히 알려줘 소개 무엇 뭐야 해줘 왜 어떻게 의미 정의 개요 한문단 문단 서술형"
+).split()
 
 # [추가] 제목 접두어 완전 비활성(기본 ""), 필요시 환경변수로 켜도 됨
 HEADING = os.getenv("ROUTER_HEADING", "")
@@ -43,6 +51,37 @@ def strip_reasoning(text: str) -> str:
     text = re.sub(r'(?is)<\|assistant_response\|>', '', text)
     text = re.sub(r'(?im)^\s*(thought|reasoning)\s*:\s*.*?(?:\n\n|\Z)', '', text)
     return text.strip()
+
+# [추가] 컨텍스트가 '목록스러움'을 보이는지 가볍게 스코어링
+def _looks_structured(ctx: str) -> bool:
+    if not ctx: return False
+    lines = [ln.strip() for ln in ctx.splitlines() if ln.strip()]
+    if len(lines) < 4:  # 줄이 적으면 굳이 불릿 아님
+        return False
+    bullet_like = 0
+    for ln in lines[:40]:  # 첫 40줄만 검사
+        if re.match(r"^[-•*]\s+|\d+\.\s+|\[\w+\]\s+", ln):
+            bullet_like += 1
+        elif len(ln) <= 28:  # 짧은 단문이 많이 이어지면 목록일 확률 ↑
+            bullet_like += 0.5
+    # 대략 4점 이상이면 목록스럽다고 판단
+    return bullet_like >= 4
+
+# [추가] 사용자 질문 + 컨텍스트 기반으로 출력 모드 결정
+def pick_answer_mode(user_msg: str, ctx_text: str) -> str:
+    # 환경변수로 모드를 강제한 경우 그대로 사용
+    if ANSWER_MODE != "auto":
+        return ANSWER_MODE
+
+    um = (user_msg or "").lower()
+    # 명시 힌트 우선
+    if any(k.lower() in um for k in _BULLET_HINTS):
+        return "bulleted"
+    if any(k.lower() in um for k in _PARA_HINTS):
+        return "paragraph"
+
+    # 문서가 목록 구조이면 불릿, 아니면 문단
+    return "bulleted" if _looks_structured(ctx_text) else "paragraph"
 
 # --- utils ----------------------------------------------------
 
@@ -79,27 +118,40 @@ def sanitize(text: str) -> str:
     t = re.sub(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\b', r'\1.xxx', t)
     return t
 
-# [변경] 제목 강제 규칙 제거. 불릿/섹션만 지시(접두어 원하면 HEADING으로만 힌트)
-def build_system_with_context(ctx_text: str) -> str:
-    style = (
-        f"- 최대 {BULLETS_MAX}개 불릿으로 **구체적**으로 서술한다.\n"
-        if ANSWER_MODE == "bulleted"
-        else "- '개요 / 세부 / 추가 참고' **세 섹션**으로 문단형으로 서술한다.\n"
-    )
+# [변경] 빌더 시그니처에 mode 추가
+def build_system_with_context(ctx_text: str, mode: str) -> str:
+    if mode == "bulleted":
+        style = (
+            f"- 최대 {BULLETS_MAX}개 불릿으로 **구체적**으로 서술한다.\n"
+            "- 각 불릿은 2~4문장으로 쓴다.\n"
+            "- 불릿 외의 군더더기 서론/결론 문단은 길게 넣지 않는다.\n"
+        )
+    elif mode == "sections":
+        style = (
+            "- 2~4개의 **문단**으로 핵심→배경→세부→시사점 순으로 정리한다.\n"
+            "- 마크다운 리스트 문법은 사용하지 않는다.\n"
+        )
+    else:  # paragraph
+        style = (
+            "- **리스트/번호/하이픈(-, •, 1.) 없이** 한두 개의 **연속된 문단**으로 자연스럽게 작성한다.\n"
+            "- 첫 문장에 개념/요지를 분명히 말하고, 이어서 구성요소·동작·장점/제약을 매끄럽게 설명한다.\n"
+        )
+
     heading_hint = (f"- 가능하면 '{HEADING}' 아래로 정리한다.\n" if HEADING else "")
     return (
-        "역할: 주어진 컨텍스트를 근거로 **상세하고 실무 친화적인** 한국어 답변을 작성한다.\n"
+        "역할: 주어진 컨텍스트를 근거로 **정확하고 실무 친화적인** 한국어 답변을 작성한다.\n"
         "원칙:\n"
         "- 컨텍스트에 있는 정보만 사용하고 추측/환각 금지.\n"
-        "- 수치·정책·용어는 가능하면 그대로 인용하되 과도한 반복은 피한다.\n"
-        "- 내부 추론(<think> 등) 출력 금지, 최종 답만 출력.\n"
+        "- 수치·정책·고유명사는 가능하면 그대로 인용하되 과도한 반복은 피한다.\n"
+        "- 내부 추론(<think> 등) 출력 금지, 최종 답만 출력한다.\n"
         + heading_hint + style +
-        "- 컨텍스트가 완전히 비었거나 무관하면 정확히 `인덱스에 근거 없음`만 출력.\n"
+        "- 컨텍스트가 완전히 비었거나 무관하면 정확히 `인덱스에 근거 없음`만 출력한다.\n"
         "- 민감정보(비밀번호/토큰/IP 마지막 옥텟)는 마스킹한다.\n"
         "[컨텍스트 시작]\n"
         f"{ctx_text}\n"
         "[컨텍스트 끝]\n"
     )
+
 
 def extract_texts(items: List[dict]) -> List[str]:
     texts = []
@@ -117,24 +169,56 @@ def extract_texts(items: List[dict]) -> List[str]:
                         texts.append(unescape(val.strip())); break
     return texts
 
-# [추가] 아이템/응답에서 URL(출처) 추출
-def _collect_urls_from_items(items: List[dict]) -> List[str]:
-    urls = []
-    def add(u: Optional[str]):
-        if not u: return
-        u = str(u).strip()
-        if u and u not in urls: urls.append(u)
-    for it in items or []:
-        add(it.get("url") or it.get("source_url") or it.get("link"))
+# [추가] URL 정규화(Confluence pageId 기준으로 중복 제거)
+def _normalize_url(u: str) -> str:
+    if not u:
+        return ""
+    u = str(u).split("#")[0].strip().rstrip("/")
+    m = re.search(r"(pageId=\d+)", u)
+    if m:
+        base = u.split("?")[0]
+        return f"{base}?{m.group(1)}"
+    return u
+
+# [교체] 가장 관련도 높은 URL부터 dedup 후 상위 N개만
+def _collect_urls_from_items(items: List[dict], top_n: Optional[int] = None) -> List[str]:
+    top_n = top_n or ROUTER_SOURCES_MAX
+    cands = []
+
+    def push(it: dict):
+        if not isinstance(it, dict):
+            return
+        url = it.get("url") or it.get("source_url") or it.get("link")
+        score = it.get("score") or it.get("similarity") or 0.0
+        if url:
+            cands.append((float(score), _normalize_url(url)))
+
         payload = it.get("payload") or it.get("data") or {}
         if isinstance(payload, dict):
-            add(payload.get("url") or payload.get("source_url") or payload.get("link"))
-        # rag-proxy 일부 스키마: it["metadata"]["url"]
+            url2 = payload.get("url") or payload.get("source_url") or payload.get("link")
+            if url2:
+                cands.append((float(score), _normalize_url(url2)))
+
         meta = it.get("metadata") or {}
         if isinstance(meta, dict):
-            add(meta.get("url"))
-    # 최대 개수 제한
-    return urls[:ROUTER_SOURCES_MAX]
+            url3 = meta.get("url")
+            if url3:
+                cands.append((float(score), _normalize_url(url3)))
+
+    for it in items or []:
+        push(it)
+
+    # score 내림차순, 점수가 없으면 입력 순서 유지
+    cands = [(s, u) for (s, u) in cands if u]
+    cands.sort(key=lambda x: x[0], reverse=True)
+
+    out: List[str] = []
+    for _, u in cands:
+        if u and u not in out:
+            out.append(u)
+        if len(out) >= top_n:
+            break
+    return out
 
 def is_good_context_for_qa(ctx: str) -> bool:
     if not ctx or not ctx.strip(): return False
@@ -178,8 +262,9 @@ async def chat(req: ChatReq):
             qa_json = None
 
     if qa_json:
-        ctx_for_prompt = sanitize(ctx_text)
-        system_prompt = build_system_with_context(ctx_for_prompt)
+        ctx_for_prompt = sanitize(ctx_text)    
+        mode = pick_answer_mode(orig_user_msg, ctx_for_prompt)
+        system_prompt = build_system_with_context(ctx_for_prompt, mode)
         max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
         payload = {
             "model": OPENAI_MODEL,
@@ -280,7 +365,8 @@ async def chat(req: ChatReq):
     # QUERY 경로 LLM 호출
     ctx_text = best_ctx
     ctx_for_prompt = sanitize(ctx_text)
-    system_prompt = build_system_with_context(ctx_for_prompt)
+    mode = pick_answer_mode(orig_user_msg, ctx_for_prompt)
+    system_prompt = build_system_with_context(ctx_for_prompt, mode)
     max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
     payload = {"model": OPENAI_MODEL,
                "messages":[{"role":"system","content":system_prompt}] + [m.model_dump() for m in req.messages],
