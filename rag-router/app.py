@@ -51,20 +51,21 @@ def models():
 async def chat(req: ChatReq):
     user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "").strip()
 
-    # 1) 먼저 내부 RAG(/qa)로 컨텍스트 시도: 여기서는 FAISS만 본다.
+    # 1) 내부 RAG(/qa)로 빠른 조회
     async with httpx.AsyncClient(timeout=None) as client:
         qa = await client.post(f"{RAG}/qa", json={"q": user_msg, "k": 5})
     qa_json = qa.json()
+
     hits = qa_json.get("hits") or 0
     items = qa_json.get("items", [])
 
-    # 2-A) 히트가 있으면: 컨텍스트 붙여서 vLLM(OPENAI_URL) 직접 호출
+    # 2-A) FAISS에서라도 뭔가 나오면: 그 컨텍스트로 LLM 직접 호출
     if hits > 0:
         ctx_text = "\n\n".join([it.get("text", "") for it in items])[:8000]
         system_prompt = build_system_with_context(ctx_text)
 
         payload = {
-            "model": OPENAI_MODEL,  # ← vLLM에 직접
+            "model": OPENAI_MODEL,  # vLLM 직통
             "messages": [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in req.messages],
             "stream": False,
             "temperature": 0
@@ -79,20 +80,46 @@ async def chat(req: ChatReq):
             "id": f"cmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": req.model,  # 또는 ROUTER_MODEL_ID
+            "model": req.model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         }
 
-    # 2-B) 히트가 없으면: rag-proxy의 /v1로 포워딩 → 여기서 MCP-Confluence 폴백이 동작함
-    forward_payload = {
-        "model": ROUTER_MODEL_ID,     # ※ rag-proxy가 인식하는 모델 아이디여야 함
-        "messages": [m.model_dump() for m in req.messages],
+    # 2-B) FAISS가 0건이면: rag-proxy의 /query 로 폴백 컨텍스트 수집 → LLM 직접 요약
+    #     (여기서 MCP-Confluence가 rag-proxy 내부에서 돌고, 그 결과 텍스트만 받아서 우리가 LLM에 붙임)
+    async with httpx.AsyncClient(timeout=None) as client:
+        qres = await client.post(f"{RAG}/query", json={"q": user_msg, "k": 5})
+    qj = qres.json()
+
+    # /query 응답에서 컨텍스트 텍스트 뽑기: 구현에 따라 'context_texts' 또는 'contexts'/'items' 중 하나가 있음
+    ctx_list = (
+        qj.get("context_texts")
+        or [c.get("text", "") for c in (qj.get("contexts") or [])]
+        or [it.get("text", "") for it in (qj.get("items") or [])]
+    )
+    ctx_text = "\n\n---\n\n".join([t for t in ctx_list if t])[:8000]
+
+    if not ctx_text:
+        # MCP까지 돌았는데도 컨텍스트가 없다면 정말로 정보 없음
+        content = "인덱스에 근거 없음"
+        return {
+            "id": f"cmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        }
+
+    system_prompt = build_system_with_context(ctx_text)
+    payload = {
+        "model": OPENAI_MODEL,  # vLLM 직통
+        "messages": [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in req.messages],
         "stream": False,
-        "temperature": 0,
+        "temperature": 0
     }
     async with httpx.AsyncClient(timeout=None) as client:
-        rr = await client.post(f"{RAG}/v1/chat/completions", json=forward_payload)
-    rj = rr.json()
+        r = await client.post(f"{OPENAI}/chat/completions", json=payload)
+
+    rj = r.json()
     raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     content = strip_reasoning(raw) or "인덱스에 근거 없음"
 
