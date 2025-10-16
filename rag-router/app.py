@@ -29,6 +29,81 @@ def strip_reasoning(text: str) -> str:
     text = re.sub(r'(?im)^\s*(thought|reasoning)\s*:\s*.*?(?:\n\n|\Z)', '', text)
     return text.strip()
 
+# --- utils: query normalizer & sanitizer ---
+
+def normalize_query(q: str) -> str:
+    """
+    사용자가 'STEP'이라고 잘못 적은 걸 'SFTP'로 보정하고,
+    자주 나오는 철자 실수(sfttp, stfp 등)도 SFTP로 정규화.
+    """
+    if not q:
+        return ""
+    s = q.strip()
+
+    # 'STEP' -> 'SFTP'
+    s = re.sub(r'(?i)\bstep\b', 'SFTP', s)
+    # 흔한 오타 보정 (stfp, sfttp 등)
+    s = re.sub(r'(?i)\bstfp\b|\bsfttp\b|\bsfpt\b|\bsftp\b', 'SFTP', s)
+    # 한국어 표기 흔적
+    s = s.replace("스텝", "SFTP")
+
+    return s
+
+def generate_query_variants(q: str, limit: int = 6) -> List[str]:
+    """
+    띄어쓰기/한영 경계/자주 섞어 쓰는 합성어(개발서버/개발 서버 등) 변형을 만들어
+    /qa → /query 순으로 시도할 때 히트율을 올린다.
+    """
+    s = normalize_query(q)
+    cand: List[str] = []
+
+    def add(x: str):
+        x = re.sub(r'\s+', ' ', x).strip()
+        if x and x not in cand:
+            cand.append(x)
+
+    # 기본형
+    add(s)
+    # 공백 제거형 (예: "개발 서버 정보" → "개발서버정보")
+    add(re.sub(r'\s+', '', s))
+    # 한글-영문/숫자 경계에 공백 삽입
+    add(re.sub(r'([가-힣])([A-Za-z0-9])', r'\1 \2', s))
+    add(re.sub(r'([A-Za-z0-9])([가-힣])', r'\1 \2', s))
+
+    # 자주 헷갈리는 합성어 ↔ 분리어 쌍 (양방향 모두 추가)
+    pairs = [
+        ("개발 서버", "개발서버"),
+        ("테스트 서버", "테스트서버"),
+        ("운영 서버", "운영서버"),
+        ("계정 정보", "계정정보"),
+        ("접속 정보", "접속정보"),
+        ("IP 주소", "IP주소"),
+    ]
+    for a, b in pairs:
+        add(s.replace(a, b))
+        add(s.replace(b, a))
+
+    return cand[:limit]
+
+def sanitize(text: str) -> str:
+    """
+    민감정보 간단 마스킹: 패스워드/토큰/IPv4 마지막 옥텟 등.
+    """
+    if not text:
+        return ""
+    t = text.replace("&nbsp;", " ")
+    t = unescape(t)
+    # password / 패스워드
+    t = re.sub(r'(?i)(password|passwd|pwd|패스워드)\s*[:=]\s*\S+', r'\1: ******', t)
+    # token / key
+    t = re.sub(r'(?i)(token|secret|key|키)\s*[:=]\s*[A-Za-z0-9\-_]{6,}', r'\1: <redacted>', t)
+    # account / username (권장)
+    t = re.sub(r'(?i)(account|user(?:name)?|userid|계정|아이디)\s*[:=]\s*\S+', r'\1: <redacted>', t)  # <-- 추가
+    # IPv4 마지막 옥텟 마스킹
+    t = re.sub(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\b', r'\1.xxx', t)
+
+    return t
+
 def build_system_with_context(ctx_text: str) -> str:
     return (
         "규칙:\n"
@@ -39,6 +114,7 @@ def build_system_with_context(ctx_text: str) -> str:
         "- **내부 추론/체인오브소트(예: <think>...</think>)는 절대 출력하지 말고 최종 답변만 출력한다.**\n"
         "- 컨텍스트가 완전히 비었거나 전혀 관련이 없을 때만 정확히 `인덱스에 근거 없음`을 출력한다.\n"
         "- 부분 일치 시에는 '컨텍스트에서 확인된 항목:'으로 시작해 제공된 항목만 정리한다.\n\n"
+        "- 민감정보(비밀번호/토큰/IP 마지막 옥텟 등)는 반드시 마스킹한 뒤 답한다.\n"
         "[컨텍스트 시작]\n"
         f"{ctx_text}\n"
         "[컨텍스트 끝]\n"
@@ -78,55 +154,51 @@ def is_good_context_for_qa(ctx: str) -> bool:
 def models():
     return {"object": "list", "data": [{"id": ROUTER_MODEL_ID, "object": "model"}]}
 
-
-
 @app.post("/v1/chat/completions")
 async def chat(req: ChatReq):
     orig_user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "").strip()
-    user_msg = normalize_query(orig_user_msg)
+    variants = generate_query_variants(orig_user_msg)
 
     ctx_text = ""  # [FIX-1] 어떤 코드 경로에서도 참조 가능하도록 기본값으로 초기화
 
-    # 1) 내부 RAG(/qa) 빠른 조회
-    async with httpx.AsyncClient(timeout=None) as client:
-        qa = await client.post(f"{RAG}/qa", json={"q": user_msg, "k": 5})
-    qa_json = qa.json()
+    # 1) /qa 변형들 순차 시도
+    qa_json = None
+    qa_items = []
+    timeout = httpx.Timeout(20.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for v in variants:
+            qa = await client.post(f"{RAG}/qa", json={"q": v, "k": 5})
+            j = qa.json()
+            if (j.get("hits") or 0) > 0:
+                qa_json = j
+                qa_items = j.get("items", [])
+                break
 
-    hits = qa_json.get("hits") or 0
-    items = qa_json.get("items", [])
+    # 2-A) /qa에서 뭔가 나오면: 컨텍스트로 LLM 호출
+    if qa_json:
+        ctx_text = "\n\n".join(extract_texts(qa_items))[:8000]
+        # (선택) 너무 빈약하면 /query로 강등
+        if not is_good_context_for_qa(ctx_text):
+            qa_json = None  # 아래 2-B 경로로
 
-    # 정규화 히트 없으면 원문으로 재시도 (선택)
-    if hits <= 0 and user_msg != orig_user_msg:
-        async with httpx.AsyncClient(timeout=None) as client:
-            qa2 = await client.post(f"{RAG}/qa", json={"q": orig_user_msg, "k": 5})
-        qa2_json = qa2.json()
-        if (qa2_json.get("hits") or 0) > 0:
-            qa_json = qa2_json
-            hits = qa_json["hits"]
-            items = qa_json.get("items", [])
-
-    # 2-A) FAISS 등에서 뭔가 나오면: 그 컨텍스트로 LLM 호출
-    if hits > 0:
-        ctx_text = "\n\n".join([it.get("text", "") for it in items])[:8000]
-        system_prompt = build_system_with_context(ctx_text)
-
+    if qa_json:
+        ctx_for_prompt = sanitize(ctx_text)
+        system_prompt = build_system_with_context(ctx_for_prompt)
         payload = {
             "model": OPENAI_MODEL,
             "messages": [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in req.messages],
             "stream": False,
             "temperature": 0,
         }
-        async with httpx.AsyncClient(timeout=None) as client:
+        # 여기를 timeout=None -> timeout=timeout 으로
+        async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(f"{OPENAI}/chat/completions", json=payload)
-
         rj = r.json()
         raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
         content = strip_reasoning(raw).strip() or "인덱스에 근거 없음"
-
-        # [FIX-2] ctx_text는 이 블록 안에서만 안전하게 참조
+        content = sanitize(content)  # ← 추가
         if content == "인덱스에 근거 없음" and ctx_text.strip():
             content = "컨텍스트에서 확인된 항목:\n" + sanitize(ctx_text)[:600]
-
         return {
             "id": f"cmpl-{uuid.uuid4()}",
             "object": "chat.completion",
@@ -135,19 +207,27 @@ async def chat(req: ChatReq):
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         }
 
-    # 2-B) FAISS가 0건이면: /query 폴백 → MCP-Confluence까지 돌린 컨텍스트 사용
-    async with httpx.AsyncClient(timeout=None) as client:
-        qres = await client.post(f"{RAG}/query", json={"q": user_msg, "k": 5})
-    qj = qres.json()
+    # 2-B) /qa 전부 실패 → /query 변형들 중 '가장 많은 컨텍스트' 선택
+    best_ctx_good = ""
+    best_ctx_any = ""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for v in variants:
+            qres = await client.post(f"{RAG}/query", json={"q": v, "k": 5})
+            qj = qres.json()
+            ctx_list = (
+                qj.get("context_texts")
+                or [c.get("text", "") for c in (qj.get("contexts") or [])]
+                or [it.get("text", "") for it in (qj.get("items") or [])]
+            )
+            ctx = "\n\n---\n\n".join([t for t in ctx_list if t])[:8000]
+            if len(ctx) > len(best_ctx_any):
+                best_ctx_any = ctx
+            if is_good_context_for_qa(ctx) and len(ctx) > len(best_ctx_good):
+                best_ctx_good = ctx
 
-    ctx_list = (
-        qj.get("context_texts")
-        or [c.get("text", "") for c in (qj.get("contexts") or [])]
-        or [it.get("text", "") for it in (qj.get("items") or [])]
-    )
-    ctx_text = "\n\n---\n\n".join([t for t in ctx_list if t])[:8000]  # [중요] 여기서도 ctx_text를 **설정**
+    best_ctx = best_ctx_good or best_ctx_any
 
-    if not ctx_text:
+    if not best_ctx:
         content = "인덱스에 근거 없음"
         return {
             "id": f"cmpl-{uuid.uuid4()}",
@@ -157,21 +237,23 @@ async def chat(req: ChatReq):
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         }
 
-    system_prompt = build_system_with_context(ctx_text)
+    ctx_text = best_ctx
+    ctx_for_prompt = sanitize(ctx_text)
+    system_prompt = build_system_with_context(ctx_for_prompt)
     payload = {
         "model": OPENAI_MODEL,
         "messages": [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in req.messages],
         "stream": False,
         "temperature": 0,
     }
-    async with httpx.AsyncClient(timeout=None) as client:
+    # 여기도 timeout=None -> timeout=timeout
+    async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(f"{OPENAI}/chat/completions", json=payload)
 
     rj = r.json()
     raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     content = strip_reasoning(raw).strip() or "인덱스에 근거 없음"
-
-    # [FIX-2] 마찬가지로 이 블록 안에서만 ctx_text 사용
+    content = sanitize(content)
     if content == "인덱스에 근거 없음" and ctx_text.strip():
         content = "컨텍스트에서 확인된 항목:\n" + sanitize(ctx_text)[:600]
 
