@@ -84,11 +84,15 @@ async def chat(req: ChatReq):
     rj = r.json()
     raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     content = strip_reasoning(raw) or "인덱스에 근거 없음"
-
+    
     return {
         "id": f"cmpl-{uuid.uuid4()}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": req.model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "model": req.model,  # 또는 ROUTER_MODEL_ID
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
     }
