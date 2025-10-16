@@ -71,7 +71,7 @@ async def chat(req: ChatReq):
                     f"{RAG}/v1/chat/completions",
                     json={
                         # rag-proxy 내부에서 OPENAI_MODEL 로 알아서 호출됨
-                        "model": OPENAI_MODEL,
+                        "model": ROUTER_MODEL_ID,
                         "messages": [m.model_dump() for m in req.messages],
                         "stream": False,
                         "temperature": 0
