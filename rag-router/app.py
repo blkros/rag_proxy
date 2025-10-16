@@ -2,8 +2,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
 import os, httpx, time, uuid, re
+from html import unescape  # ← (추가) HTML 엔티티 정리용
 
-RAG = os.getenv("RAG_PROXY_URL", "http://rag-proxy:8080")  # <- 라우터 컨테이너 내부에선 서비스명 OK
+RAG = os.getenv("RAG_PROXY_URL", "http://rag-proxy:8080")
 OPENAI = os.getenv("OPENAI_URL", "http://172.16.10.168:9993/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "qwen3-30b-a3b-fp8")
 ROUTER_MODEL_ID = os.getenv("ROUTER_MODEL_ID", "qwen3-30b-a3b-fp8-router")
@@ -41,13 +42,13 @@ def build_system_with_context(ctx_text: str) -> str:
     )
 
 def extract_texts(items: List[dict]) -> List[str]:
-    """/qa 또는 /query의 item 배열에서 본문 텍스트를 폭넓게 추출"""
+    """다양한 키에서 본문을 뽑아 HTML 엔티티도 정리"""
     texts = []
     for it in items or []:
         for key in ("text", "content", "chunk", "snippet", "body", "page_text"):
             val = it.get(key)
             if isinstance(val, str) and val.strip():
-                texts.append(val.strip())
+                texts.append(unescape(val.strip()))  # ← (변경) unescape
                 break
         else:
             payload = it.get("payload") or it.get("data") or {}
@@ -55,18 +56,18 @@ def extract_texts(items: List[dict]) -> List[str]:
                 for key in ("text", "content", "body"):
                     val = payload.get(key)
                     if isinstance(val, str) and val.strip():
-                        texts.append(val.strip())
+                        texts.append(unescape(val.strip()))  # ← (변경) unescape
                         break
     return texts
 
-def is_good_context(ctx: str) -> bool:
-    """컨텍스트가 제목/짧은 스니펫 수준인지 판별해서 부실하면 False 반환"""
+def is_good_context_for_qa(ctx: str) -> bool:
+    """QA 경로에서만 쓰는 느슨한 품질 체크 (짧으면 /query 폴백)"""
     if not ctx or not ctx.strip():
         return False
-    # 길이/줄수/문장부호 기준의 간단 휴리스틱 (필요시 조정)
-    if len(ctx) < 250:
+    # 너무 짧은 제목/스니펫은 제외 (기존보다 완화)
+    if len(ctx) < 180:
         return False
-    if ctx.count("\n") < 5:
+    if ctx.count("\n") < 2:
         return False
     return True
 
@@ -86,9 +87,10 @@ async def chat(req: ChatReq):
     hits = qa_json.get("hits") or 0
     qa_items = qa_json.get("items", []) or qa_json.get("contexts", [])
     qa_ctx = "\n\n".join(extract_texts(qa_items))[:8000]
+    qa_ctx = unescape(qa_ctx)  # ← (추가) 혹시 몰라 한 번 더 정리
 
-    # 2-A) /qa 결과가 “있고 + 충분히 길다”면 그걸로 바로 LLM
-    if hits > 0 and is_good_context(qa_ctx):
+    # 2-A) /qa 결과가 “있고+적당히 길다”면 그걸로 LLM
+    if hits > 0 and is_good_context_for_qa(qa_ctx):
         system_prompt = build_system_with_context(qa_ctx)
         payload = {
             "model": OPENAI_MODEL,
@@ -109,23 +111,24 @@ async def chat(req: ChatReq):
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         }
 
-    # 2-B) /qa가 부실(짧음/없음) → 반드시 /query 폴백 (여기서 MCP-Confluence가 도는 구간)
+    # 2-B) /qa가 부실(짧음/없음) → 무조건 /query 폴백 (MCP-Confluence 포함)
     async with httpx.AsyncClient(timeout=None) as client:
         qres = await client.post(f"{RAG}/query", json={"q": user_msg, "k": 5})
     qj = qres.json()
 
     ctx_list = []
     if isinstance(qj.get("context_texts"), list):
-        ctx_list.extend([t for t in qj["context_texts"] if isinstance(t, str) and t.strip()])
+        ctx_list.extend([unescape(t) for t in qj["context_texts"] if isinstance(t, str) and t.strip()])
     if isinstance(qj.get("contexts"), list):
         ctx_list.extend(extract_texts(qj["contexts"]))
     if isinstance(qj.get("items"), list):
         ctx_list.extend(extract_texts(qj["items"]))
 
-    ctx_text = "\n\n---\n\n".join(ctx_list)[:8000]
+    ctx_text = "\n\n---\n\n".join([t for t in ctx_list if t])[:8000]
+    ctx_text = unescape(ctx_text)  # ← (추가) 최종 정리
 
-    if not is_good_context(ctx_text):
-        # MCP까지 돌렸는데도 내용이 없다면 진짜로 없음
+    # ✅ 폴백 경로에서는 “길이 체크 없이”, 1자라도 있으면 LLM 호출
+    if not ctx_text.strip():
         content = "인덱스에 근거 없음"
         return {
             "id": f"cmpl-{uuid.uuid4()}",
