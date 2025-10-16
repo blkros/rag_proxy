@@ -12,6 +12,11 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "qwen3-30b-a3b-fp8")
 ROUTER_MODEL_ID = os.getenv("ROUTER_MODEL_ID", "qwen3-30b-a3b-fp8-router")
 TZ = os.getenv("ROUTER_TZ", "Asia/Seoul")
 
+ROUTER_MAX_TOKENS = int(os.getenv("ROUTER_MAX_TOKENS", "2048"))   # 기본 출력 토큰
+ANSWER_MODE = os.getenv("ROUTER_ANSWER_MODE", "bulleted")          # bulleted | sections
+BULLETS_MAX = int(os.getenv("ROUTER_BULLETS_MAX", "15"))           # 불릿 최대 개수
+MAX_CTX_CHARS = int(os.getenv("MAX_CTX_CHARS", "8000"))            # 컨텍스트 잘라내기 길이
+
 app = FastAPI()
 
 class Msg(BaseModel):
@@ -22,6 +27,7 @@ class ChatReq(BaseModel):
     model: str
     messages: List[Msg]
     stream: Optional[bool] = False
+    max_tokens: Optional[int] = None
 
 def strip_reasoning(text: str) -> str:
     if not text:
@@ -108,16 +114,23 @@ def sanitize(text: str) -> str:
 
 
 def build_system_with_context(ctx_text: str) -> str:
+    # 스타일 지시 (불릿/섹션 선택)
+    style = (
+        f"- '컨텍스트에서 확인된 항목:' 아래 **최대 {BULLETS_MAX}개 불릿**으로 정리하고, "
+        f"각 불릿은 **2~4문장**으로 **구체적**으로 서술한다.\n"
+        if ANSWER_MODE == "bulleted"
+        else "- '개요 / 세부 / 추가 참고' **세 섹션**으로 나눠 문단형으로 **상세히** 서술한다.\n"
+    )
+
     return (
-        "규칙:\n"
-        "- 한국어로 간결하게 답한다.\n"
-        "- 아래 컨텍스트에 있는 정보만 사용한다.\n"
-        "- 질문과 완벽히 일치하지 않아도, 컨텍스트와 관련된 사실이 있으면 그 범위 안에서 요약/발췌해 답한다.\n"
-        "- 컨텍스트에 없는 내용은 추측하지 않는다.\n"
-        "- **내부 추론/체인오브소트(예: <think>...</think>)는 절대 출력하지 말고 최종 답변만 출력한다.**\n"
-        "- 컨텍스트가 완전히 비었거나 전혀 관련이 없을 때만 정확히 `인덱스에 근거 없음`을 출력한다.\n"
-        "- 부분 일치 시에는 '컨텍스트에서 확인된 항목:'으로 시작해 제공된 항목만 정리한다.\n\n"
-        "- 민감정보(비밀번호/토큰/IP 마지막 옥텟 등)는 반드시 마스킹한 뒤 답한다.\n"
+        "역할: 주어진 컨텍스트를 근거로 **상세하고 실무 친화적인** 한국어 답변을 작성한다.\n"
+        "원칙:\n"
+        "- 컨텍스트에 있는 정보만 사용하며, 추측/환각 금지.\n"
+        "- 수치·정책·용어는 가능하면 그대로 인용하되, 과도한 반복은 피한다.\n"
+        "- **내부 추론(<think> 등)은 절대 출력하지 말고 최종 답만 출력한다.**\n"
+        + style +
+        "- 컨텍스트가 완전히 비었거나 무관하면 정확히 `인덱스에 근거 없음`만 출력한다.\n"
+        "- 민감정보(비밀번호/토큰/IP 마지막 옥텟 등)는 반드시 마스킹한다.\n"
         "[컨텍스트 시작]\n"
         f"{ctx_text}\n"
         "[컨텍스트 끝]\n"
@@ -186,7 +199,7 @@ async def chat(req: ChatReq):
 
     # 2-A) /qa에서 뭔가 나오면: 컨텍스트로 LLM 호출
     if qa_json:
-        ctx_text = "\n\n".join(extract_texts(qa_items))[:8000]
+        ctx_text = "\n\n".join(extract_texts(qa_items))[:MAX_CTX_CHARS]
         # (선택) 너무 빈약하면 /query로 강등
         if not is_good_context_for_qa(ctx_text):
             qa_json = None  # 아래 2-B 경로로
@@ -194,11 +207,13 @@ async def chat(req: ChatReq):
     if qa_json:
         ctx_for_prompt = sanitize(ctx_text)
         system_prompt = build_system_with_context(ctx_for_prompt)
+        max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
         payload = {
             "model": OPENAI_MODEL,
             "messages": [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in req.messages],
             "stream": False,
             "temperature": 0,
+            "max_tokens": max_tokens,
         }
         # (qa 경로)
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -240,7 +255,7 @@ async def chat(req: ChatReq):
                 or [c.get("text", "") for c in (qj.get("contexts") or [])]
                 or [it.get("text", "") for it in (qj.get("items") or [])]
             )
-            ctx = "\n\n---\n\n".join([t for t in ctx_list if t])[:8000]
+            ctx = "\n\n---\n\n".join([t for t in ctx_list if t])[:MAX_CTX_CHARS]
             if len(ctx) > len(best_ctx_any):
                 best_ctx_any = ctx
             if is_good_context_for_qa(ctx) and len(ctx) > len(best_ctx_good):
@@ -259,11 +274,13 @@ async def chat(req: ChatReq):
                 "‘인덱스에 근거 없음’ 같은 말은 하지 마세요."
             ),
         }
+        max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
         payload = {
             "model": OPENAI_MODEL,
             "messages": [sysmsg] + [m.model_dump() for m in req.messages],
             "stream": False,
             "temperature": 0,
+            "max_tokens": max_tokens,
         }
         async with httpx.AsyncClient(timeout=timeout) as client:
             try:
@@ -287,11 +304,13 @@ async def chat(req: ChatReq):
     ctx_text = best_ctx
     ctx_for_prompt = sanitize(ctx_text)
     system_prompt = build_system_with_context(ctx_for_prompt)
+    max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
     payload = {
         "model": OPENAI_MODEL,
         "messages": [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in req.messages],
         "stream": False,
         "temperature": 0,
+        "max_tokens": max_tokens,
     }
     # 여기도 timeout=None -> timeout=timeout
     async with httpx.AsyncClient(timeout=timeout) as client:
