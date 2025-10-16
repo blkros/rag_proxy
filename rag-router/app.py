@@ -86,23 +86,23 @@ def generate_query_variants(q: str, limit: int = 6) -> List[str]:
     return cand[:limit]
 
 def sanitize(text: str) -> str:
-    """
-    민감정보 간단 마스킹: 패스워드/토큰/IPv4 마지막 옥텟 등.
-    """
     if not text:
         return ""
-    t = text.replace("&nbsp;", " ")
-    t = unescape(t)
-    # password / 패스워드
-    t = re.sub(r'(?i)(password|passwd|pwd|패스워드)\s*[:=]\s*\S+', r'\1: ******', t)
+    t = unescape(text.replace("&nbsp;", " "))
+
+    # password / 패스워드 / 비밀번호  ← [수정] '비밀번호' 추가
+    t = re.sub(r'(?i)(password|passwd|pwd|패스워드|비밀번호)\s*[:=]\s*\S+', r'\1: ******', t)
+
     # token / key
     t = re.sub(r'(?i)(token|secret|key|키)\s*[:=]\s*[A-Za-z0-9\-_]{6,}', r'\1: <redacted>', t)
-    # account / username (권장)
-    t = re.sub(r'(?i)(account|user(?:name)?|userid|계정|아이디)\s*[:=]\s*\S+', r'\1: <redacted>', t)  # <-- 추가
+
+    # account / username
+    t = re.sub(r'(?i)(account|user(?:name)?|userid|계정|아이디)\s*[:=]\s*\S+', r'\1: <redacted>', t)
+
     # IPv4 마지막 옥텟 마스킹
     t = re.sub(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\b', r'\1.xxx', t)
-
     return t
+
 
 def build_system_with_context(ctx_text: str) -> str:
     return (
@@ -164,15 +164,22 @@ async def chat(req: ChatReq):
     # 1) /qa 변형들 순차 시도
     qa_json = None
     qa_items = []
-    timeout = httpx.Timeout(20.0, connect=5.0)
+    # (timeout 세분화: read만 좀 더 길게)
+    timeout = httpx.Timeout(connect=5.0, read=20.0, write=20.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         for v in variants:
-            qa = await client.post(f"{RAG}/qa", json={"q": v, "k": 5})
-            j = qa.json()
+            try:  # ← [추가] 예외 흡수해서 다음 변형 시도
+                qa = await client.post(f"{RAG}/qa", json={"q": v, "k": 5})
+                j = qa.json()
+            except (httpx.RequestError, ValueError) as e:
+                print(f"[router] /qa error for '{v}': {e}")  # ← 로그만 찍고 계속
+                continue
+
             if (j.get("hits") or 0) > 0:
                 qa_json = j
                 qa_items = j.get("items", [])
                 break
+
 
     # 2-A) /qa에서 뭔가 나오면: 컨텍스트로 LLM 호출
     if qa_json:
@@ -190,15 +197,21 @@ async def chat(req: ChatReq):
             "stream": False,
             "temperature": 0,
         }
-        # 여기를 timeout=None -> timeout=timeout 으로
+        # (qa 경로)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(f"{OPENAI}/chat/completions", json=payload)
-        rj = r.json()
-        raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+            try:
+                r = await client.post(f"{OPENAI}/chat/completions", json=payload)
+                rj = r.json()
+                raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+            except (httpx.RequestError, ValueError) as e:
+                print(f"[router] OPENAI chat error: {e}")
+                raw = ""  # 아래 공통 처리로 폴백
+
         content = strip_reasoning(raw).strip() or "인덱스에 근거 없음"
-        content = sanitize(content)  # ← 추가
+        content = sanitize(content)
         if content == "인덱스에 근거 없음" and ctx_text.strip():
             content = "컨텍스트에서 확인된 항목:\n" + sanitize(ctx_text)[:600]
+
         return {
             "id": f"cmpl-{uuid.uuid4()}",
             "object": "chat.completion",
@@ -212,8 +225,13 @@ async def chat(req: ChatReq):
     best_ctx_any = ""
     async with httpx.AsyncClient(timeout=timeout) as client:
         for v in variants:
-            qres = await client.post(f"{RAG}/query", json={"q": v, "k": 5})
-            qj = qres.json()
+            try:  # ← [추가]
+                qres = await client.post(f"{RAG}/query", json={"q": v, "k": 5})
+                qj = qres.json()
+            except (httpx.RequestError, ValueError) as e:
+                print(f"[router] /query error for '{v}': {e}")
+                continue
+
             ctx_list = (
                 qj.get("context_texts")
                 or [c.get("text", "") for c in (qj.get("contexts") or [])]
