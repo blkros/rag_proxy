@@ -11,6 +11,7 @@ OPENAI = os.getenv("OPENAI_URL", "http://172.16.10.168:9993/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "qwen3-30b-a3b-fp8")
 ROUTER_MODEL_ID = os.getenv("ROUTER_MODEL_ID", "qwen3-30b-a3b-fp8-router")
 TZ = os.getenv("ROUTER_TZ", "Asia/Seoul")
+_NUM_ONLY_LINE = re.compile(r'(?m)^\s*(\d{1,3}(?:,\d{3})*|\d+)\s*$')
 
 ROUTER_MAX_TOKENS = int(os.getenv("ROUTER_MAX_TOKENS", "2048"))
 ANSWER_MODE = os.getenv("ROUTER_ANSWER_MODE", "auto")
@@ -51,6 +52,16 @@ def strip_reasoning(text: str) -> str:
     text = re.sub(r'(?is)<\|assistant_response\|>', '', text)
     text = re.sub(r'(?im)^\s*(thought|reasoning)\s*:\s*.*?(?:\n\n|\Z)', '', text)
     return text.strip()
+
+def mark_lonely_numbers_as_total(text: str) -> str:
+    """
+    줄 전체가 숫자만으로 이루어진 경우 '(합계: N)'으로 바꿔
+    LLM이 개별 항목 수치로 오해하지 않도록 힌트를 준다.
+    """
+    def repl(m: re.Match):
+        n = m.group(1)
+        return f"(합계: {n})"
+    return _NUM_ONLY_LINE.sub(repl, text)
 
 # [추가] 컨텍스트가 '목록스러움'을 보이는지 가볍게 스코어링
 def _looks_structured(ctx: str) -> bool:
@@ -118,7 +129,6 @@ def sanitize(text: str) -> str:
     t = re.sub(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\b', r'\1.xxx', t)
     return t
 
-# [변경] 빌더 시그니처에 mode 추가
 def build_system_with_context(ctx_text: str, mode: str) -> str:
     if mode == "bulleted":
         style = (
@@ -137,6 +147,15 @@ def build_system_with_context(ctx_text: str, mode: str) -> str:
             "- 첫 문장에 개념/요지를 분명히 말하고, 이어서 구성요소·동작·장점/제약을 매끄럽게 설명한다.\n"
         )
 
+    # 🔒 숫자/수치 인용 가드레일(핵심!)
+    numeric_rules = (
+        "- 표/목록에 있는 **수치(예: 단지 수)** 는 **같은 행(같은 항목)** 에 적힌 숫자만 인용한다.\n"
+        "- **합계/총계/요약 숫자**(행 이름이 비거나 상위 구 단위에 붙은 수치)는 **개별 항목의 값으로 배정하지 않는다.**\n"
+        "- 특정 항목의 수치가 불명확하면 **숫자를 쓰지 말고** '수치 불분명'으로 표현한다.\n"
+        "- 숫자를 쓸 때는 반드시 `항목명 숫자`로 **쌍을 이뤄** 서술한다. (예: `반포동 47`)\n"
+        "- 상위 단위 합계는 필요 시 `(서초구 합계 439)`처럼 **합계임을 명시**한다.\n"
+    )
+
     heading_hint = (f"- 가능하면 '{HEADING}' 아래로 정리한다.\n" if HEADING else "")
     return (
         "역할: 주어진 컨텍스트를 근거로 **정확하고 실무 친화적인** 한국어 답변을 작성한다.\n"
@@ -144,13 +163,14 @@ def build_system_with_context(ctx_text: str, mode: str) -> str:
         "- 컨텍스트에 있는 정보만 사용하고 추측/환각 금지.\n"
         "- 수치·정책·고유명사는 가능하면 그대로 인용하되 과도한 반복은 피한다.\n"
         "- 내부 추론(<think> 등) 출력 금지, 최종 답만 출력한다.\n"
-        + heading_hint + style +
+        + heading_hint + style + numeric_rules +
         "- 컨텍스트가 완전히 비었거나 무관하면 정확히 `인덱스에 근거 없음`만 출력한다.\n"
         "- 민감정보(비밀번호/토큰/IP 마지막 옥텟)는 마스킹한다.\n"
         "[컨텍스트 시작]\n"
         f"{ctx_text}\n"
         "[컨텍스트 끝]\n"
     )
+
 
 
 def extract_texts(items: List[dict]) -> List[str]:
@@ -258,6 +278,7 @@ async def chat(req: ChatReq):
     # 2-A) QA 성공
     if qa_json:
         ctx_text = "\n\n".join(extract_texts(qa_items))[:MAX_CTX_CHARS]
+        ctx_text = mark_lonely_numbers_as_total(ctx_text)
         if not is_good_context_for_qa(ctx_text):
             qa_json = None
 
@@ -364,6 +385,7 @@ async def chat(req: ChatReq):
 
     # QUERY 경로 LLM 호출
     ctx_text = best_ctx
+    ctx_text = mark_lonely_numbers_as_total(ctx_text) 
     ctx_for_prompt = sanitize(ctx_text)
     mode = pick_answer_mode(orig_user_msg, ctx_for_prompt)
     system_prompt = build_system_with_context(ctx_for_prompt, mode)
