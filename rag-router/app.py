@@ -33,9 +33,12 @@ def build_system_with_context(ctx_text: str) -> str:
     return (
         "규칙:\n"
         "- 한국어로 간결하게 답한다.\n"
-        "- 아래 컨텍스트 문장들에서만 답을 만든다. 없으면 정확히 `인덱스에 근거 없음`만 출력한다.\n"
-        "- 일반 지식/추측 금지, 출처/내부로그 노출 금지.\n"
-        "- **내부 추론/작업 메모/체인오브소트(예: <think>...</think>)는 절대 출력하지 말고 최종 답변만 출력한다.**\n\n"
+        "- 아래 컨텍스트에 있는 정보만 사용한다.\n"
+        "- 질문과 완벽히 일치하지 않아도, 컨텍스트와 관련된 사실이 있으면 그 범위 안에서 요약/발췌해 답한다.\n"
+        "- 컨텍스트에 없는 내용은 추측하지 않는다.\n"
+        "- **내부 추론/체인오브소트(예: <think>...</think>)는 절대 출력하지 말고 최종 답변만 출력한다.**\n"
+        "- 컨텍스트가 완전히 비었거나 전혀 관련이 없을 때만 정확히 `인덱스에 근거 없음`을 출력한다.\n"
+        "- 부분 일치 시에는 '컨텍스트에서 확인된 항목:'으로 시작해 제공된 항목만 정리한다.\n\n"
         "[컨텍스트 시작]\n"
         f"{ctx_text}\n"
         "[컨텍스트 끝]\n"
@@ -102,13 +105,18 @@ async def chat(req: ChatReq):
             r = await client.post(f"{OPENAI}/chat/completions", json=payload)
         rj = r.json()
         raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
-        content = strip_reasoning(raw) or "인덱스에 근거 없음"
+        content = strip_reasoning(raw).strip()
+        if content == "인덱스에 근거 없음" and ctx_text.strip():
+            # 너무 장문이면 앞부분만
+            safe_ctx = ctx_text.strip().replace("\u00a0", " ")[:600]
+            content = "컨텍스트에서 확인된 항목:\n" + safe_ctx
+
         return {
             "id": f"cmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": req.model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content or "인덱스에 근거 없음"}, "finish_reason": "stop"}],
         }
 
     # 2-B) /qa가 부실(짧음/없음) → 무조건 /query 폴백 (MCP-Confluence 포함)
@@ -127,7 +135,7 @@ async def chat(req: ChatReq):
     ctx_text = "\n\n---\n\n".join([t for t in ctx_list if t])[:8000]
     ctx_text = unescape(ctx_text)  # ← (추가) 최종 정리
 
-    # ✅ 폴백 경로에서는 “길이 체크 없이”, 1자라도 있으면 LLM 호출
+    # 폴백 경로에서는 “길이 체크 없이”, 1자라도 있으면 LLM 호출
     if not ctx_text.strip():
         content = "인덱스에 근거 없음"
         return {
