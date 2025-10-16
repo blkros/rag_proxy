@@ -43,7 +43,6 @@ def build_system_with_context(ctx_text: str) -> str:
         "[컨텍스트 끝]\n"
     )
 
-
 @app.get("/v1/models")
 def models():
     return {"object": "list", "data": [{"id": ROUTER_MODEL_ID, "object": "model"}]}
@@ -52,21 +51,53 @@ def models():
 async def chat(req: ChatReq):
     user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "").strip()
 
+    # 1) 먼저 /qa 로 컨텍스트 검색
     async with httpx.AsyncClient(timeout=None) as client:
         qa = await client.post(f"{RAG}/qa", json={"q": user_msg, "k": 5})
     qa_json = qa.json()
 
     hits = qa_json.get("hits") or 0
+
+    # ─────────────────────────────────────────────────────────────
+    # ▶▶ [수정 포인트 1: 폴백 추가]
+    #    검색 적중이 0이면 rag-proxy의 /v1/chat/completions 를 호출해서
+    #    MCP(Confluence) 폴백을 트리거하고, 그 완성 답변을 그대로 반환.
+    #    (strip_reasoning 으로 <think> 등 제거)
+    # ─────────────────────────────────────────────────────────────
     if hits <= 0:
-        content = "인덱스에 근거 없음"
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                r = await client.post(
+                    f"{RAG}/v1/chat/completions",
+                    json={
+                        # rag-proxy 내부에서 OPENAI_MODEL 로 알아서 호출됨
+                        "model": OPENAI_MODEL,
+                        "messages": [m.model_dump() for m in req.messages],
+                        "stream": False,
+                        "temperature": 0
+                    }
+                )
+            rj = r.json()
+            raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+            content = strip_reasoning(raw) or "인덱스에 근거 없음"
+        except Exception:
+            # rag-proxy 호출 실패 등 예외 시엔 안전하게 기존 메시지 유지
+            content = "인덱스에 근거 없음"
+
         return {
             "id": f"cmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": req.model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }],
         }
+    # ─────────────────────────────────────────────────────────────
 
+    # 2) 적중이 있으면 기존 방식대로 컨텍스트를 system 메시지에 주입해서 vLLM 호출
     items = qa_json.get("items", [])
     ctx_text = "\n\n".join([it.get("text", "") for it in items])[:8000]
     system_prompt = build_system_with_context(ctx_text)
@@ -84,12 +115,12 @@ async def chat(req: ChatReq):
     rj = r.json()
     raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     content = strip_reasoning(raw) or "인덱스에 근거 없음"
-    
+
     return {
         "id": f"cmpl-{uuid.uuid4()}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": req.model,  # 또는 ROUTER_MODEL_ID
+        "model": req.model,
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": content},
