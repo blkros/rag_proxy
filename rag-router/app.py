@@ -78,65 +78,76 @@ def is_good_context_for_qa(ctx: str) -> bool:
 def models():
     return {"object": "list", "data": [{"id": ROUTER_MODEL_ID, "object": "model"}]}
 
+
+
 @app.post("/v1/chat/completions")
 async def chat(req: ChatReq):
-    user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "").strip()
+    orig_user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "").strip()
+    user_msg = normalize_query(orig_user_msg)
 
-    # 1) /qa 먼저
+    ctx_text = ""  # [FIX-1] 어떤 코드 경로에서도 참조 가능하도록 기본값으로 초기화
+
+    # 1) 내부 RAG(/qa) 빠른 조회
     async with httpx.AsyncClient(timeout=None) as client:
         qa = await client.post(f"{RAG}/qa", json={"q": user_msg, "k": 5})
     qa_json = qa.json()
 
     hits = qa_json.get("hits") or 0
-    qa_items = qa_json.get("items", []) or qa_json.get("contexts", [])
-    qa_ctx = "\n\n".join(extract_texts(qa_items))[:8000]
-    qa_ctx = unescape(qa_ctx)  # ← (추가) 혹시 몰라 한 번 더 정리
+    items = qa_json.get("items", [])
 
-    # 2-A) /qa 결과가 “있고+적당히 길다”면 그걸로 LLM
-    if hits > 0 and is_good_context_for_qa(qa_ctx):
-        system_prompt = build_system_with_context(qa_ctx)
+    # 정규화 히트 없으면 원문으로 재시도 (선택)
+    if hits <= 0 and user_msg != orig_user_msg:
+        async with httpx.AsyncClient(timeout=None) as client:
+            qa2 = await client.post(f"{RAG}/qa", json={"q": orig_user_msg, "k": 5})
+        qa2_json = qa2.json()
+        if (qa2_json.get("hits") or 0) > 0:
+            qa_json = qa2_json
+            hits = qa_json["hits"]
+            items = qa_json.get("items", [])
+
+    # 2-A) FAISS 등에서 뭔가 나오면: 그 컨텍스트로 LLM 호출
+    if hits > 0:
+        ctx_text = "\n\n".join([it.get("text", "") for it in items])[:8000]
+        system_prompt = build_system_with_context(ctx_text)
+
         payload = {
             "model": OPENAI_MODEL,
             "messages": [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in req.messages],
             "stream": False,
-            "temperature": 0
+            "temperature": 0,
         }
         async with httpx.AsyncClient(timeout=None) as client:
             r = await client.post(f"{OPENAI}/chat/completions", json=payload)
+
         rj = r.json()
         raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
-        content = strip_reasoning(raw).strip()
+        content = strip_reasoning(raw).strip() or "인덱스에 근거 없음"
+
+        # [FIX-2] ctx_text는 이 블록 안에서만 안전하게 참조
         if content == "인덱스에 근거 없음" and ctx_text.strip():
-            # 너무 장문이면 앞부분만
-            safe_ctx = ctx_text.strip().replace("\u00a0", " ")[:600]
-            content = "컨텍스트에서 확인된 항목:\n" + safe_ctx
+            content = "컨텍스트에서 확인된 항목:\n" + sanitize(ctx_text)[:600]
 
         return {
             "id": f"cmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": req.model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content or "인덱스에 근거 없음"}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         }
 
-    # 2-B) /qa가 부실(짧음/없음) → 무조건 /query 폴백 (MCP-Confluence 포함)
+    # 2-B) FAISS가 0건이면: /query 폴백 → MCP-Confluence까지 돌린 컨텍스트 사용
     async with httpx.AsyncClient(timeout=None) as client:
         qres = await client.post(f"{RAG}/query", json={"q": user_msg, "k": 5})
     qj = qres.json()
 
-    ctx_list = []
-    if isinstance(qj.get("context_texts"), list):
-        ctx_list.extend([unescape(t) for t in qj["context_texts"] if isinstance(t, str) and t.strip()])
-    if isinstance(qj.get("contexts"), list):
-        ctx_list.extend(extract_texts(qj["contexts"]))
-    if isinstance(qj.get("items"), list):
-        ctx_list.extend(extract_texts(qj["items"]))
+    ctx_list = (
+        qj.get("context_texts")
+        or [c.get("text", "") for c in (qj.get("contexts") or [])]
+        or [it.get("text", "") for it in (qj.get("items") or [])]
+    )
+    ctx_text = "\n\n---\n\n".join([t for t in ctx_list if t])[:8000]  # [중요] 여기서도 ctx_text를 **설정**
 
-    ctx_text = "\n\n---\n\n".join([t for t in ctx_list if t])[:8000]
-    ctx_text = unescape(ctx_text)  # ← (추가) 최종 정리
-
-    # 폴백 경로에서는 “길이 체크 없이”, 1자라도 있으면 LLM 호출
-    if not ctx_text.strip():
+    if not ctx_text:
         content = "인덱스에 근거 없음"
         return {
             "id": f"cmpl-{uuid.uuid4()}",
@@ -151,13 +162,18 @@ async def chat(req: ChatReq):
         "model": OPENAI_MODEL,
         "messages": [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in req.messages],
         "stream": False,
-        "temperature": 0
+        "temperature": 0,
     }
     async with httpx.AsyncClient(timeout=None) as client:
         r = await client.post(f"{OPENAI}/chat/completions", json=payload)
+
     rj = r.json()
     raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
-    content = strip_reasoning(raw) or "인덱스에 근거 없음"
+    content = strip_reasoning(raw).strip() or "인덱스에 근거 없음"
+
+    # [FIX-2] 마찬가지로 이 블록 안에서만 ctx_text 사용
+    if content == "인덱스에 근거 없음" and ctx_text.strip():
+        content = "컨텍스트에서 확인된 항목:\n" + sanitize(ctx_text)[:600]
 
     return {
         "id": f"cmpl-{uuid.uuid4()}",
