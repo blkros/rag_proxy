@@ -41,6 +41,9 @@ _COALESCE_TRIGGER = re.compile(r"(최근|이슈|목록|정리|요약|top\s*\d+|\
 
 TZ_NAME = getattr(settings, "TZ_NAME", "Asia/Seoul")
 
+LOCAL_FIRST = bool(getattr(settings, "LOCAL_FIRST", True))
+LOCAL_BONUS = float(getattr(settings, "LOCAL_BONUS", 0.25))
+
 META_PAT  = re.compile(r"(주제|개요|요약|무엇|무슨\s*내용)", re.I)
 TITLE_PAT = re.compile(r"(제목|title|문서명|파일명)", re.I)
 LOGIN_PAT = re.compile(r"(Confluence에\s*로그인|로그인\s*-\s*Confluence|name=[\"']os_username[\"'])", re.I)
@@ -199,6 +202,16 @@ def _match_pageid(md: dict, pid: str) -> bool:
     src = str((md or {}).get("source") or "")
     url = str((md or {}).get("url") or "")
     return (pid_md == pid) or (f"pageId={pid}" in src) or (f"pageId={pid}" in url)
+
+def _apply_local_bonus(hits: list[dict]):
+    if not LOCAL_FIRST:
+        return
+    for h in hits:
+        md = (h.get("metadata") or {})
+        src = str(md.get("source") or "")
+        # 업로드 경로(uploads/ 또는 /app/uploads/)는 보너스
+        if src.startswith("uploads/") or "/uploads/" in src:
+            h["score"] = float(h.get("score") or 0.0) + LOCAL_BONUS
 
 def _apply_page_hint(hits: List[dict], page_id: str | None):
     """pageId가 오면 '가산점'만 (soft). 잠그지 않음."""
@@ -1226,6 +1239,7 @@ async def query(payload: dict = Body(...)):
     # [ADD] dense 풀에도 space soft 보너스 적용
     _apply_space_hint(pool_hits, space)
     _apply_page_hint(pool_hits, page_id)
+    _apply_local_bonus(pool_hits)
     # [OPTION] dense 후보에도 제목 매치 보너스(약하게)
     q_tokens = _tokenize_query(q)
     if q_tokens:
@@ -1731,15 +1745,18 @@ async def v1_chat(payload: dict = Body(...)):
         else:
             content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
 
-    allowed = set(r.get("source_urls", []))
-    if content and allowed:
+    allowed_list = r.get("source_urls", []) or []
+
+    if content and allowed_list:
         def _keep_allowed(m):
             url = m.group(0)
-            # 허용 URL이 접두/부분으로 포함되면 유지, 아니면 제거
-            return url if any(a and url.startswith(a) for a in allowed) else ""
+            return url if any(a and url.startswith(a) for a in allowed_list) else ""
         content = re.sub(r'https?://[^\s\)\]]+', _keep_allowed, content)
 
-
+    if allowed_list:
+        src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_list)
+        content = (content or "") + src_block
+        
     # 4) OpenAI 호환 스키마로 감싸서 반환
     return {
         "object": "chat.completion",
