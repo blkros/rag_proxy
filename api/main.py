@@ -981,7 +981,8 @@ async def uploads_reset():
 @app.post("/query", include_in_schema=False)
 async def query(payload: dict = Body(...)):
     global vectorstore, retriever, current_source, current_source_until
-    fallback_attempted = False 
+    fallback_attempted = False
+    added = 0  # ←← 미리 초기화(하단에서 안전하게 notes에 넣거나 안 넣기 위함)
 
     # 1) 쿼리 추출
     q = (payload or {}).get("question") \
@@ -1475,16 +1476,16 @@ async def query(payload: dict = Body(...)):
                 except Exception:
                     pass
 
-                return {
-                    "hits": len(items),
-                    "items": items,
-                    "contexts": contexts,
-                    "context_texts": [it["text"] for it in items],
-                    "documents": items,
-                    "chunks": items,
-                    "source_urls": _collect_source_urls(items),
-                    "notes": {"fallback_used": True, "indexed": True, "added": added}
-                }
+                # return {
+                #     "hits": len(items),
+                #     "items": items,
+                #     "contexts": contexts,
+                #     "context_texts": [it["text"] for it in items],
+                #     "documents": items,
+                #     "chunks": items,
+                #     "source_urls": _collect_source_urls(items),
+                #     "notes": {"fallback_used": True, "indexed": True, "added": added}
+                # }
         except Exception as e:
             log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
@@ -1493,15 +1494,16 @@ async def query(payload: dict = Body(...)):
         ctx_all_final = "\n".join(c["text"] for c in contexts)
         core_final = [t for t in _query_tokens(q) if not ACRONYM_RE.match(t)]
         if core_final and not any(t in ctx_all_final for t in core_final):
-            log.info("Low relevance guard tripped. Q=%r core=%r", q, core_final)
             items, contexts = [], []
 
     base_notes = {"missing_article": missing_article, "article_no": intent.get("article_no")}
     if fallback_attempted:
+        # indexed/added는 MCP 업서트가 실제로 있었는지에 따라 값 세팅(위에서 added=0으로 시작)
         base_notes["fallback_used"] = True
-        base_notes["indexed"] = False
+        base_notes["indexed"] = (added > 0)
+        if added > 0:
+            base_notes["added"] = added
 
-    # 관련 자료가 없다고 판단되면 직답을 같이 내려 UI가 그대로 보여주도록
     if not items:
         return {
             "hits": 0,
@@ -1511,7 +1513,7 @@ async def query(payload: dict = Body(...)):
             "documents": [],
             "chunks": [],
             "source_urls": [],
-            "direct_answer": "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다",  # ← 여기!
+            "direct_answer": "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다",
             "notes": base_notes | {"low_relevance": True},
         }
 
@@ -1523,8 +1525,9 @@ async def query(payload: dict = Body(...)):
         "documents": items,
         "chunks": items,
         "source_urls": _collect_source_urls(items),
-        "notes": base_notes
+        "notes": base_notes,
     }
+
 
 # ------- helper: chunk text -------
 def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
