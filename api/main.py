@@ -1488,10 +1488,32 @@ async def query(payload: dict = Body(...)):
         except Exception as e:
             log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
+    # 최종 적합성 가드: 핵심 토큰이 전혀 없으면 '정보 없음'으로 처리
+    if items:
+        ctx_all_final = "\n".join(c["text"] for c in contexts)
+        core_final = [t for t in _query_tokens(q) if not ACRONYM_RE.match(t)]
+        if core_final and not any(t in ctx_all_final for t in core_final):
+            log.info("Low relevance guard tripped. Q=%r core=%r", q, core_final)
+            items, contexts = [], []
+
     base_notes = {"missing_article": missing_article, "article_no": intent.get("article_no")}
     if fallback_attempted:
         base_notes["fallback_used"] = True
         base_notes["indexed"] = False
+
+    # 관련 자료가 없다고 판단되면 직답을 같이 내려 UI가 그대로 보여주도록
+    if not items:
+        return {
+            "hits": 0,
+            "items": [],
+            "contexts": [],
+            "context_texts": [],
+            "documents": [],
+            "chunks": [],
+            "source_urls": [],
+            "direct_answer": "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다",  # ← 여기!
+            "notes": base_notes | {"low_relevance": True},
+        }
 
     return {
         "hits": len(items),
@@ -1503,8 +1525,6 @@ async def query(payload: dict = Body(...)):
         "source_urls": _collect_source_urls(items),
         "notes": base_notes
     }
-
-
 
 # ------- helper: chunk text -------
 def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
