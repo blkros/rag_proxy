@@ -55,6 +55,9 @@ THIS_FILE_PAT = re.compile(
     r"위\s*(?:파일|문서|자료))",
     re.I
 )
+_CHAPTER_RE = re.compile(r"제\s*(\d+)\s*장")
+_ARTICLE_RE = re.compile(r"제\s*(\d+)\s*조")
+
 last_source: Optional[str] = None
 # >>> [ADD] 최근 소스 잠금 상태 (연속 질문 안정화용)
 current_source: Optional[str] = None
@@ -1252,6 +1255,11 @@ async def query(payload: dict = Body(...)):
     # === 3-D) 의도 파악
     intent = parse_query_intent(q)
 
+    m_art = _ARTICLE_RE.search(q)
+    article_no = intent.get("article_no") if m_art else None
+    m_ch = _CHAPTER_RE.search(q)
+    chapter_no = int(m_ch.group(1)) if m_ch else None
+
     # 조문 질의여도, 사용자가 source를 명시한 경우에만 그 값으로 고정
     # (명시 안 했으면 sticky/last_source 그대로 유지)
     if intent.get("article_no") and ("source" in (payload or {})):
@@ -1267,22 +1275,33 @@ async def query(payload: dict = Body(...)):
 
     # --- 조문 텍스트 가산점/누락 플래그 ---
     def _bonus_for_article_text(h, artno: int) -> float:
-        # 텍스트 내 '제{n}조'가 OCR 노이즈(공백/세로바 등) 제거 후 보이면 가산점
-        t = (h.get("text") or "")
-        t2 = re.sub(r"[ \t\r\n│|¦┃┆┇┊┋丨ㅣ]", "", t)  # 공백/세로바 제거
-        return 0.15 if re.search(fr"제{artno}조", t2) else 0.0
+        t = re.sub(r"[ \t\r\n│|¦┃┆┇┊┋丨ㅣ]", "", h.get("text") or "")
+        return 0.15 if re.search(fr"제{artno}조", t) else 0.0
 
+    # [추가] 장 보너스
+    def _bonus_for_chapter_text(h, chapno: int) -> float:
+        t = re.sub(r"[ \t\r\n│|¦┃┆┇┊┋丨ㅣ]", "", h.get("text") or "")
+        return 0.20 if re.search(fr"제{chapno}장", t) else 0.0
+    
+    # --- 조문/장 보너스 적용
+    if article_no:
+        for h in pool_hits:
+            h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, article_no)
+
+    if chapter_no:
+        for h in pool_hits:
+            h["score"] = float(h.get("score") or 0.0) + _bonus_for_chapter_text(h, chapter_no)
+    
+    # --- 누락 플래그는 '조'일 때만
     missing_article = False
-    if intent.get("article_no"):
-        art = intent["article_no"]
-        # 메타(article_no)로 잡혔거나, 텍스트 패턴으로라도 보이면 '존재'로 판단
-        have_meta = any((h.get("metadata") or {}).get("article_no") == art for h in pool_hits)
-        have_text = any(_bonus_for_article_text(h, art) > 0 for h in pool_hits)
+    if article_no:
+        have_meta = any((h.get("metadata") or {}).get("article_no") == article_no for h in pool_hits)
+        have_text = any(_bonus_for_article_text(h, article_no) > 0 for h in pool_hits)
         missing_article = not (have_meta or have_text)
 
         # 조문 질의면 관련 히트에 가산점 부여
         for h in pool_hits:
-            h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, art)
+            h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, article_no)
 
     if forced_page_id and PAGE_FILTER_MODE.lower() == "hard":
         def _hit_has_pid(h, pid):
@@ -1510,16 +1529,6 @@ async def query(payload: dict = Body(...)):
                 except Exception:
                     pass
 
-                # return {
-                #     "hits": len(items),
-                #     "items": items,
-                #     "contexts": contexts,
-                #     "context_texts": [it["text"] for it in items],
-                #     "documents": items,
-                #     "chunks": items,
-                #     "source_urls": _collect_source_urls(items),
-                #     "notes": {"fallback_used": True, "indexed": True, "added": added}
-                # }
         except Exception as e:
             log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
@@ -1553,7 +1562,7 @@ async def query(payload: dict = Body(...)):
                     mcp_results = await mcp_search(q, limit=5, timeout=20,
                                                 space=space, langs=SEARCH_LANGS)
 
-    base_notes = {"missing_article": missing_article, "article_no": intent.get("article_no")}
+    base_notes = {"missing_article": missing_article, "article_no": article_no}
     if fallback_attempted:
         # indexed/added는 MCP 업서트가 실제로 있었는지에 따라 값 세팅(위에서 added=0으로 시작)
         base_notes["fallback_used"] = True
@@ -1727,10 +1736,11 @@ async def v1_chat(payload: dict = Body(...)):
             ctx = ctx[:8000]
 
             sys = (
-            "사고과정을 출력하지 말고, 아래 컨텍스트에 **근거한 사실만** 한국어로 답하라. "
-            "컨텍스트에 없는 내용은 절대 추측하지 말고, 부족하면 "
-            "'컨텍스트에 해당 정보가 없습니다'라고 말한 뒤, 컨텍스트에 실제로 있는 항목만 요약하라.\n\n"
-            "컨텍스트:\n" + ctx
+                "사고과정을 출력하지 말고, 아래 컨텍스트에 **근거한 사실만** 한국어로 답하라. "
+                "질문에 '제 N장' 또는 '제 N조'가 있으면, 컨텍스트에서 해당 장/조를 먼저 **그대로 인용(>)**하고, "
+                "다음 줄에 한 문장 요약을 붙여라. "
+                "컨텍스트에 없는 내용은 절대 추측하지 말고, 부족하면 '컨텍스트에 해당 정보가 없습니다'라고 말하라.\n\n"
+                "컨텍스트:\n" + ctx
             )
             msgs = [
                 {"role": "system", "content": sys},
@@ -1756,7 +1766,7 @@ async def v1_chat(payload: dict = Body(...)):
     if allowed_list:
         src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_list)
         content = (content or "") + src_block
-        
+
     # 4) OpenAI 호환 스키마로 감싸서 반환
     return {
         "object": "chat.completion",
