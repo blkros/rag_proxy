@@ -64,8 +64,7 @@ STICKY_FROM_COALESCE = bool(getattr(settings, "STICKY_FROM_COALESCE", False))  #
 STICKY_AFTER_MCP = bool(getattr(settings, "STICKY_AFTER_MCP", False))          # 기본 False
 
 # ← [ADD] 앵커 추출(질문 핵심어) + sticky 유효성 검사
-_GENERIC = set("nia 보고 보고서 리포트 정보 정리 페이지 자료 문서 요약 정책 통계 항목 사이트 url 링크 출처".split())
-
+_GENERIC = set("보고 보고서 리포트 정보 정리 페이지 자료 문서 요약 정책 통계 항목 사이트 url 링크 출처".split())
 
 # >>> [ADD] pageId 추출/URL 정규화 유틸
 _PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
@@ -253,7 +252,8 @@ SEARCH_LANGS = [s.strip() for s in os.getenv("SEARCH_LANGS", "ko,en").split(",")
 
 # 키워드 정제(Confluence CQL용)
 _K_STOP = {"관련","내용","찾아줘","찾아","알려줘","정리","컨플루언스","에서","해줘",
-           "무엇","어떤","대한","관련한","좀","좀만","계속","그리고","거나"}
+           "무엇","어떤","대한","관련한","좀","좀만","계속","그리고","거나",
+           "설명","소개","정의","토큰","token","코인"}
 
 _JOSA_RE = re.compile(
     r"(으로써|으로서|으로부터|라고는|라고도|라고|처럼|까지|부터|에게서|한테서|에게|한테|께|이며|이자|"
@@ -1322,6 +1322,13 @@ async def query(payload: dict = Body(...)):
 
     # 컨텍스트 본문에서 '핵심 토큰' 일부라도 맞는지
     core_hit = any(t in ctx_all for t in core)
+    titles_meta = " ".join(
+         f"{(h.get('metadata') or {}).get('title','')} {(h.get('metadata') or {}).get('source','')}"
+         for h in items
+     )
+    acronym_hit = True if not acr else any(a in ctx_all or a in titles_meta for a in acr)
+    anchors = _anchor_tokens_from_query(q)
+    anchor_hit = (not anchors) or any(a.lower() in (ctx_all + " " + titles_meta).lower() for a in anchors)
 
     # 약어(NIA 등)는 본문 외에 제목/소스 메타에도 찾음
     titles_meta = " ".join(
@@ -1334,8 +1341,8 @@ async def query(payload: dict = Body(...)):
         (len(items) == 0) or
         (len(pool_hits) < max(10, k*2)) or
         missing_article or
-        (not core_hit) or              # 핵심 토큰이 하나도 안 맞으면 폴백
-        (acr and not acronym_hit)      # 약어가 질문에 있는데 컨텍스트/제목/소스 어디에도 없으면 폴백
+        (acr and not acronym_hit) or
+        (anchors and not anchor_hit)
     )
 
     if NEED_FALLBACK and not DISABLE_INTERNAL_MCP:
@@ -1489,12 +1496,22 @@ async def query(payload: dict = Body(...)):
         except Exception as e:
             log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
-    # 최종 적합성 가드: 핵심 토큰이 전혀 없으면 '정보 없음'으로 처리
     if items:
         ctx_all_final = "\n".join(c["text"] for c in contexts)
+        titles_meta_final = " ".join(
+            f"{(h.get('metadata') or {}).get('title','')} {(h.get('metadata') or {}).get('source','')}"
+            for h in items
+        )
+        # ① 기존 핵심토큰 가드
         core_final = [t for t in _query_tokens(q) if not ACRONYM_RE.match(t)]
         if core_final and not any(t in ctx_all_final for t in core_final):
             items, contexts = [], []
+        # ② 앵커(질문 핵심어 + 약어) 가드
+        if items:
+            anchors = _anchor_tokens_from_query(q) + re.findall(r"[A-Z]{2,5}", q)
+            blob = (ctx_all_final + " " + titles_meta_final).lower()
+            if anchors and not any(a.lower() in blob for a in anchors):
+                items, contexts = [], []
 
     base_notes = {"missing_article": missing_article, "article_no": intent.get("article_no")}
     if fallback_attempted:
