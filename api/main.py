@@ -58,7 +58,6 @@ current_source: Optional[str] = None
 current_source_until: float = 0.0
 STICKY_SECS = 180  # 최근 파일 기준 3분 잠금
 
-# ← [ADD] sticky 동작 제어용 옵션 (settings.py에서 바꿀 수 있게)
 STICKY_STRICT = bool(getattr(settings, "STICKY_STRICT", True))
 STICKY_FROM_COALESCE = bool(getattr(settings, "STICKY_FROM_COALESCE", False))  # 기본 False
 STICKY_AFTER_MCP = bool(getattr(settings, "STICKY_AFTER_MCP", False))          # 기본 False
@@ -613,14 +612,13 @@ class AskPayload(BaseModel):
     sources: list[str] | None = Field(None, description="소스 다중 필터")
     space: str | None = Field(None, description="Confluence space 힌트")
     spaceKey: str | None = Field(None, description="space와 동일(클라이언트 호환)")
+    pageId: str | None = Field(None, description="Confluence pageId 힌트/잠금")
     messages: list[dict] | None = Field(None, description="대화형 호환 필드")
 
     def to_query_dict(self) -> dict:
         d = self.model_dump(exclude_none=True)
-        # 호환: top_k만 왔으면 k로 치환
         if "top_k" in d and "k" not in d:
             d["k"] = d.pop("top_k")
-        # 호환: spaceKey만 왔으면 space로 치환
         if "spaceKey" in d and "space" not in d:
             d["space"] = d.pop("spaceKey")
         return d
@@ -931,17 +929,22 @@ def index_list(
         raise HTTPException(500, "vectorstore is not ready.")
     ds = vectorstore.docstore._dict
 
+    def _norm_text(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").replace("\u00A0"," ").strip())
+    norm_contains = _norm_text(contains) if contains else None
+
     rows = []
     for doc_id, doc in ds.items():
         src  = str(doc.metadata.get("source",""))
         knd  = doc.metadata.get("kind", "chunk")
         text = doc.page_content or ""
-
+        title = str(doc.metadata.get("title",""))
+        
         if source and src != source:
             continue
         if kind and knd != kind:
             continue
-        if contains and contains not in text:
+        if norm_contains and (norm_contains not in _norm_text(text)) and (norm_contains not in _norm_text(title)):
             continue
 
         rows.append({
@@ -1156,6 +1159,14 @@ async def query(payload: dict = Body(...)):
     elif src_filter:
         wanted = _norm_source(str(src_filter))
         docs = [d for d in docs if _norm_source(str((d.metadata or {}).get("source",""))) == wanted]
+
+    if forced_page_id and PAGE_FILTER_MODE.lower() == "hard":
+        def _doc_has_pid(d, pid):
+            md = d.metadata or {}
+            pid_md = str(md.get("page") or md.get("pageId") or "")
+            url = str(md.get("url") or md.get("source") or "")
+            return (pid_md == pid) or (f"pageId={pid}" in url)
+        docs = [d for d in docs if _doc_has_pid(d, forced_page_id)]
     docs = docs[:k]
 
     # 3-B) 넉넉한 후보 풀을 구성하고 점수/메타를 붙인다
@@ -1259,6 +1270,14 @@ async def query(payload: dict = Body(...)):
         for h in pool_hits:
             h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, art)
 
+    if forced_page_id and PAGE_FILTER_MODE.lower() == "hard":
+        def _hit_has_pid(h, pid):
+            md  = h.get("metadata") or {}
+            pid_md = str(md.get("page") or md.get("pageId") or "")
+            url = str(md.get("url") or md.get("source") or "")
+            return (pid_md == pid) or (f"pageId={pid}" in url)
+        pool_hits = [h for h in pool_hits if _hit_has_pid(h, forced_page_id)]
+
     # 3-E) rerank + 의도기반 주입선택
     chosen = pick_for_injection(q, pool_hits, k_default=int(k) if isinstance(k, int) else 5)
     chosen = _coalesce_single_source(chosen, q)
@@ -1326,16 +1345,10 @@ async def query(payload: dict = Body(...)):
          f"{(h.get('metadata') or {}).get('title','')} {(h.get('metadata') or {}).get('source','')}"
          for h in items
      )
+    
     acronym_hit = True if not acr else any(a in ctx_all or a in titles_meta for a in acr)
     anchors = _anchor_tokens_from_query(q)
     anchor_hit = (not anchors) or any(a.lower() in (ctx_all + " " + titles_meta).lower() for a in anchors)
-
-    # 약어(NIA 등)는 본문 외에 제목/소스 메타에도 찾음
-    titles_meta = " ".join(
-        f"{(h.get('metadata') or {}).get('title','')} {(h.get('metadata') or {}).get('source','')}"
-        for h in items
-    )
-    acronym_hit = True if not acr else any(a in ctx_all or a in titles_meta for a in acr)
 
     NEED_FALLBACK = (
         (len(items) == 0) or
@@ -1512,6 +1525,19 @@ async def query(payload: dict = Body(...)):
             blob = (ctx_all_final + " " + titles_meta_final).lower()
             if anchors and not any(a.lower() in blob for a in anchors):
                 items, contexts = [], []
+        
+        # 필터로 비어버리면 지금이라도 MCP 폴백 시도
+        if not items and not DISABLE_INTERNAL_MCP:
+            fallback_attempted = True
+            mcp_results = []
+            if forced_page_id:
+                async with mcp_lock:
+                    mcp_results = await mcp_search(f"id={forced_page_id}", limit=1, timeout=20,
+                                                space=space, langs=SEARCH_LANGS)
+            if not mcp_results:
+                async with mcp_lock:
+                    mcp_results = await mcp_search(q, limit=5, timeout=20,
+                                                space=space, langs=SEARCH_LANGS)
 
     base_notes = {"missing_article": missing_article, "article_no": intent.get("article_no")}
     if fallback_attempted:
@@ -1664,7 +1690,17 @@ async def v1_chat(payload: dict = Body(...)):
         raise HTTPException(400, "user message required")
 
     # 1) 내부 /query 직접 호출
-    r = await query({"question": q})
+    page_id = payload.get("pageId") or payload.get("page_id")
+    space   = payload.get("space") or payload.get("spaceKey")
+    source  = payload.get("source")
+    sources = payload.get("sources")
+    r = await query({
+        "question": q,
+        "pageId": page_id,
+        "space": space,
+        "source": source,
+        "sources": sources
+    })
 
     # 2) direct_answer가 있으면 그대로 사용
     content = r.get("direct_answer")
@@ -1677,8 +1713,10 @@ async def v1_chat(payload: dict = Body(...)):
             ctx = ctx[:8000]
 
             sys = (
-                "너의 사고과정은 출력하지 말고, 아래 컨텍스트에 근거하여 간결하고 정확히 한국어로 답하라. "
-                "컨텍스트에 없는 내용은 추측하지 말라.\n\n컨텍스트:\n" + ctx
+            "사고과정을 출력하지 말고, 아래 컨텍스트에 **근거한 사실만** 한국어로 답하라. "
+            "컨텍스트에 없는 내용은 절대 추측하지 말고, 부족하면 "
+            "'컨텍스트에 해당 정보가 없습니다'라고 말한 뒤, 컨텍스트에 실제로 있는 항목만 요약하라.\n\n"
+            "컨텍스트:\n" + ctx
             )
             msgs = [
                 {"role": "system", "content": sys},
@@ -1692,6 +1730,15 @@ async def v1_chat(payload: dict = Body(...)):
                 content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
         else:
             content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
+
+    allowed = set(r.get("source_urls", []))
+    if content and allowed:
+        def _keep_allowed(m):
+            url = m.group(0)
+            # 허용 URL이 접두/부분으로 포함되면 유지, 아니면 제거
+            return url if any(a and url.startswith(a) for a in allowed) else ""
+        content = re.sub(r'https?://[^\s\)\]]+', _keep_allowed, content)
+
 
     # 4) OpenAI 호환 스키마로 감싸서 반환
     return {
