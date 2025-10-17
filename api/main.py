@@ -58,6 +58,15 @@ current_source: Optional[str] = None
 current_source_until: float = 0.0
 STICKY_SECS = 180  # 최근 파일 기준 3분 잠금
 
+# ← [ADD] sticky 동작 제어용 옵션 (settings.py에서 바꿀 수 있게)
+STICKY_STRICT = bool(getattr(settings, "STICKY_STRICT", True))
+STICKY_FROM_COALESCE = bool(getattr(settings, "STICKY_FROM_COALESCE", False))  # 기본 False
+STICKY_AFTER_MCP = bool(getattr(settings, "STICKY_AFTER_MCP", False))          # 기본 False
+
+# ← [ADD] 앵커 추출(질문 핵심어) + sticky 유효성 검사
+_GENERIC = set("nia 보고 보고서 리포트 정보 정리 페이지 자료 문서 요약 정책 통계 항목 사이트 url 링크 출처".split())
+
+
 # >>> [ADD] pageId 추출/URL 정규화 유틸
 _PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
 
@@ -75,6 +84,45 @@ _RETRIEVAL_HINT_RE = re.compile(r"(최근|이슈|목록|리스트|정리|요약|
 _DATE_TIME_NEED_RE = re.compile(r"(날짜|요일|시간|시각|몇\s*시|몇\s*분|몇\s*월|몇\s*일|며칠)", re.I)
 
 _DOMAIN_HINT_RE = re.compile(r"(회의|마감|일정|보고서|티켓|이슈|장애|배포|회의록|결재|승인|요청|문서)", re.I)
+
+def _anchor_tokens_from_query(q: str) -> list[str]:
+    # _tokenize_query는 파일에 이미 정의되어 있음
+    toks = _tokenize_query(q)
+    return [t for t in toks if len(t) >= 3 and t not in _GENERIC]
+
+def _collect_text_of_source(src: str, limit_chars: int = 2000) -> str:
+    """docstore에서 해당 source 텍스트/제목을 조금 모아 샘플링"""
+    try:
+        ds = getattr(vectorstore, "docstore", None)
+        dct = getattr(ds, "_dict", {}) if ds else {}
+    except Exception:
+        dct = {}
+    norm = _norm_source(src)
+    buf_title, buf_body = [], []
+    for d in dct.values():
+        md = d.metadata or {}
+        if _norm_source(str(md.get("source",""))) != norm:
+            continue
+        if md.get("title"):
+            buf_title.append(str(md.get("title")))
+        if d.page_content:
+            buf_body.append(d.page_content)
+        if sum(len(x) for x in buf_body) > limit_chars:
+            break
+    title_part = " ".join(buf_title)
+    body_part  = " ".join(buf_body)[:limit_chars]
+    return (title_part + "\n" + body_part).strip()
+
+def _sticky_is_relevant(q: str, src: str) -> bool:
+    anchors = _anchor_tokens_from_query(q)
+    if not anchors:
+        return True  # 앵커가 없으면 관대하게 허용
+    sample = _collect_text_of_source(src, limit_chars=3000).lower()
+    if not sample:
+        return False
+    hit = sum(1 for a in anchors if a.lower() in sample)
+    need = 1 if len(anchors) <= 2 else max(2, int(len(anchors)*0.5))
+    return hit >= need
 
 def _is_datetime_question(q: str) -> bool:
     q = (q or "").strip()
@@ -190,7 +238,12 @@ def _coalesce_single_source(hits: List[dict], q: str) -> List[dict]:
     if (best_score / total) >= COALESCE_THRESHOLD or len(scored) > 1:
         # 한 페이지로 수렴
         try:
-            _set_sticky(best_key.split("|p", 1)[0])  # 다음 질문 안정화
+            # _set_sticky(best_key.split("|p", 1)[0])  # 다음 질문 안정화
+            if STICKY_FROM_COALESCE:
+                try:
+                    _set_sticky(best_key.split("|p", 1)[0])
+                except Exception:
+                    pass
         except Exception:
             pass
         return best_group
@@ -927,7 +980,7 @@ async def uploads_reset():
 
 @app.post("/query", include_in_schema=False)
 async def query(payload: dict = Body(...)):
-    global vectorstore, retriever
+    global vectorstore, retriever, current_source, current_source_until
     fallback_attempted = False 
 
     # 1) 쿼리 추출
@@ -949,7 +1002,7 @@ async def query(payload: dict = Body(...)):
             page_id = m_pid.group(1)
     page_id = str(page_id) if page_id is not None else None
 
-    if q.strip().startswith("### Task:"):
+    if re.match(r"(?is)^\s*#{3}\s*task\s*:", q):  # ← 메타태스크는 RAG/MCP 건너뜀
         return {
             "hits": 0,
             "items": [],
@@ -959,7 +1012,7 @@ async def query(payload: dict = Body(...)):
             "chunks": [],
             "notes": {"meta_task": True}
         }
-    
+        
     # === Direct-Answer 라우팅: 날짜/시간 등 상식형은 RAG/MCP를 건너뛰고 LLM이 바로 답 ===
     if _is_datetime_question(q):
         date_str, dow_str, time_str = _now_str_kst()
@@ -1007,8 +1060,14 @@ async def query(payload: dict = Body(...)):
 
     # >>> [ADD] 스티키가 살아있으면 우선 적용
     now = time.time()
+    # (교체) 앵커 매치에 실패하면 sticky 무시 + 해제
     if not src_filter and not src_set and current_source and now < current_source_until:
-        src_filter = current_source
+        if (not STICKY_STRICT) or _sticky_is_relevant(q, current_source):  # ← 앵커 매치
+            src_filter = current_source
+        else:
+            # sticky 해제
+            current_source = None
+            current_source_until = 0.0
 
     # "이 파일/첨부한 파일" 지시어면 최근 업로드 파일로 고정
     global last_source
@@ -1403,7 +1462,16 @@ async def query(payload: dict = Body(...)):
                 # 첫 결과를 최근 소스로 스티키 처리하면 연속 후속질문 안정적
                 try:
                     if mcp_results and (mcp_results[0].get("url") or mcp_results[0].get("id")):
-                        _set_sticky(mcp_results[0].get("url") or f"confluence:{mcp_results[0].get('id')}")
+                        # _set_sticky(mcp_results[0].get("url") or f"confluence:{mcp_results[0].get('id')}")
+                        want_sticky = False
+                        if forced_page_id or THIS_FILE_PAT.search(q) or re.search(r'([^\s"\'()]+\.pdf)', q, re.I):
+                            want_sticky = True
+                        if STICKY_AFTER_MCP and want_sticky:
+                            try:
+                                first = mcp_results[0]
+                                _set_sticky(first.get("url") or f"confluence:{first.get('id')}")
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
