@@ -33,6 +33,34 @@ HEADING = os.getenv("ROUTER_HEADING", "")
 ROUTER_SHOW_SOURCES = (os.getenv("ROUTER_SHOW_SOURCES", "1").lower() not in ("0","false","no"))
 ROUTER_SOURCES_MAX  = int(os.getenv("ROUTER_SOURCES_MAX", "5"))
 
+# === relevance gate ===
+_KO_EN_TOKEN = re.compile(r"[A-Za-z0-9]+|[가-힣]{2,}")
+
+_STOPWORDS = set("""
+은 는 이 가 을 를 에 의 와 과 도 로 으로 에서 에게 그리고 그러나 그래서
+무엇 뭐야 뭐지 설명 해줘 대한 대해 정리 개요 소개 자세히
+""".split())
+
+def _tokens(s: str) -> list[str]:
+    return [t.lower() for t in _KO_EN_TOKEN.findall(s or "")]
+
+def relevance_ratio(q: str, ctx: str, ctx_limit: int = 2000) -> float:
+    qk = [t for t in _tokens(q) if t not in _STOPWORDS]
+    if not qk:
+        return 0.0
+    ck = set(_tokens((ctx or "")[:ctx_limit]))
+    common = sum(1 for t in qk if t in ck)
+    return common / len(qk)
+
+# 환경변수로 문턱값 조정 가능 (기본 0.2)
+REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.2"))
+
+def is_relevant(q: str, ctx: str) -> bool:
+    return relevance_ratio(q, ctx) >= REL_THRESH
+
+def _is_webui_task(s: str) -> bool:
+    return (s or "").lstrip().startswith("###Task:")
+
 app = FastAPI()
 
 class Msg(BaseModel):
@@ -255,6 +283,19 @@ async def chat(req: ChatReq):
     orig_user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "").strip()
     variants = generate_query_variants(orig_user_msg)
 
+    # ★ 메타 태스크면 RAG 건너뛰고 그대로 모델로 전달 (JSON 형식 보존)
+    if _is_webui_task(orig_user_msg):
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": [m.model_dump() for m in req.messages],  # 시스템 프롬프트 추가 금지
+            "stream": False,
+            "temperature": 0,
+            "max_tokens": req.max_tokens or ROUTER_MAX_TOKENS,
+        }
+        async with httpx.AsyncClient() as client:
+            r = await client.post(f"{OPENAI}/chat/completions", json=payload)
+        return r.json()
+
     ctx_text = ""
     qa_json = None
     qa_items = []
@@ -279,8 +320,8 @@ async def chat(req: ChatReq):
     if qa_json:
         ctx_text = "\n\n".join(extract_texts(qa_items))[:MAX_CTX_CHARS]
         ctx_text = mark_lonely_numbers_as_total(ctx_text)
-        if not is_good_context_for_qa(ctx_text):
-            qa_json = None
+        if (not is_good_context_for_qa(ctx_text)) or (not is_relevant(orig_user_msg, ctx_text)):
+            qa_json = None   # → QUERY 또는 LLM 단독 경로로 폴백
 
     if qa_json:
         ctx_for_prompt = sanitize(ctx_text)    
@@ -357,6 +398,10 @@ async def chat(req: ChatReq):
     best_ctx = best_ctx_good or best_ctx_any
     src_urls = best_urls_good or best_urls_any  # [추가]
 
+    if best_ctx and not is_relevant(orig_user_msg, best_ctx):
+        best_ctx = ""
+        src_urls = []
+
     if not best_ctx:
         # 일반 LLM 폴백
         now_kst = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d (%a) %H:%M:%S %Z")
@@ -390,14 +435,20 @@ async def chat(req: ChatReq):
     mode = pick_answer_mode(orig_user_msg, ctx_for_prompt)
     system_prompt = build_system_with_context(ctx_for_prompt, mode)
     max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
-    payload = {"model": OPENAI_MODEL,
-               "messages":[{"role":"system","content":system_prompt}] + [m.model_dump() for m in req.messages],
-               "stream": False, "temperature": 0, "max_tokens": max_tokens}
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages":[{"role":"system","content":system_prompt}] + [m.model_dump() for m in req.messages],
+        "stream": False, "temperature": 0, "max_tokens": max_tokens
+    }
     async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(f"{OPENAI}/chat/completions", json=payload)
+        try:
+            r = await client.post(f"{OPENAI}/chat/completions", json=payload)
+            rj = r.json()
+            raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+        except (httpx.RequestError, ValueError) as e:
+            print(f"[router] OPENAI chat error: {e}")
+            raw = ""
 
-    rj = r.json()
-    raw = rj.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     content = sanitize(strip_reasoning(raw).strip()) or "인덱스에 근거 없음"
 
     # [변경] 폴백 시 제목 접두어 제거
