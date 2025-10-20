@@ -1300,8 +1300,8 @@ async def query(payload: dict = Body(...)):
         missing_article = not (have_meta or have_text)
 
         # 조문 질의면 관련 히트에 가산점 부여
-        for h in pool_hits:
-            h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, article_no)
+        # for h in pool_hits:
+        #     h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, article_no)
 
     if forced_page_id and PAGE_FILTER_MODE.lower() == "hard":
         def _hit_has_pid(h, pid):
@@ -1383,13 +1383,37 @@ async def query(payload: dict = Body(...)):
     anchors = _anchor_tokens_from_query(q)
     anchor_hit = (not anchors) or any(a.lower() in (ctx_all + " " + titles_meta).lower() for a in anchors)
 
-    NEED_FALLBACK = (
-        (len(items) == 0) or
-        (len(pool_hits) < max(10, k*2)) or
-        missing_article or
-        (acr and not acronym_hit) or
-        (anchors and not anchor_hit)
-    )
+    # NEED_FALLBACK = (
+    #     (len(items) == 0) or
+    #     (len(pool_hits) < max(10, k*2)) or
+    #     missing_article or
+    #     (acr and not acronym_hit) or
+    #     (anchors and not anchor_hit)
+    # )
+
+    # [ADD] 로컬 업로드 기반 히트가 있는지 확인 (uploads/ 경로 여부)
+    local_ok = _has_local_hits(items) or _has_local_hits(pool_hits)
+
+    # [CHANGE] 로컬 히트가 있으면 '진짜 실패' 상황에서만 MCP 폴백
+    if local_ok:
+        NEED_FALLBACK = (len(items) == 0) or missing_article
+    else:
+        NEED_FALLBACK = (
+            (len(items) == 0) or
+            (len(pool_hits) < max(10, k*2)) or
+            missing_article or
+            (acr and not acronym_hit) or
+            (anchors and not anchor_hit)
+        )
+
+    # [DEBUG] 왜 폴백인지 이유를 로그로 남기면 추적 쉬움
+    reasons = []
+    if len(items) == 0: reasons.append("no_items")
+    if len(pool_hits) < max(10, k*2): reasons.append("small_pool")
+    if missing_article: reasons.append("missing_article")
+    if (acr and not acronym_hit): reasons.append("acronym_miss")
+    if (anchors and not anchor_hit): reasons.append("anchor_miss")
+    log.info("fallback_check reasons=%s local_hits=%s", reasons, local_ok)
 
     if NEED_FALLBACK and not DISABLE_INTERNAL_MCP:
         try:
@@ -1621,6 +1645,16 @@ def _collect_source_urls(items: list[dict]) -> list[str]:
         if url and url not in urls:
             urls.append(url)
     return urls
+
+
+def _has_local_hits(entries) -> bool:
+    # items 또는 pool_hits 모두에 사용할 수 있게 범용으로 구현
+    for it in entries or []:
+        md = it.get("metadata") or {}
+        src = str(md.get("source") or "")
+        if src.startswith("uploads/") or "/uploads/" in src:
+            return True
+    return False
 
 @app.post("/documents/upsert")
 async def documents_upsert(payload: dict = Body(...)):
