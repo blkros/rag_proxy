@@ -143,32 +143,22 @@ def _expand_synonyms(s: str) -> list[str]:
         if k in s:
             for v in vs:
                 out.append(s.replace(k, v))
-    # 공백/붙여쓰기 변형도 함께
     ss = s.replace("상가 정보", "상가정보")
     if ss != s: out.append(ss)
-    return list(dict.fromkeys(out))  # dedup
+    return list(dict.fromkeys(out))
 
 def generate_query_variants(q: str, limit: int = 12) -> List[str]:
     s = normalize_query(q)
-    cand: List[str] = []
-    def add(x: str):
-        x = re.sub(r'\s+', ' ', x).strip()
+    cand = []
+    def add(x): 
+        x = re.sub(r'\s+',' ',x).strip()
         if x and x not in cand: cand.append(x)
-
-    add(s)
-    add(re.sub(r'\s+', '', s))
+    add(s); add(re.sub(r'\s+','',s))
     add(re.sub(r'([가-힣])([A-Za-z0-9])', r'\1 \2', s))
     add(re.sub(r'([A-Za-z0-9])([가-힣])', r'\1 \2', s))
-
-    # 동의어 확장 추가
     for v in _expand_synonyms(s):
-        add(v); add(re.sub(r'\s+', '', v))
-
-    # 기존 페어 바꿔치기도 유지
-    pairs = [("개발 서버","개발서버"), ("테스트 서버","테스트서버"), ("운영 서버","운영서버"),
-             ("계정 정보","계정정보"), ("접속 정보","접속정보"), ("IP 주소","IP주소")]
-    for a,b in pairs:
-        add(s.replace(a,b)); add(s.replace(b,a))
+        add(v); add(re.sub(r'\s+','',v))
+    # 기존 pairs 유지
     return cand[:limit]
 
 def sanitize(text: str) -> str:
