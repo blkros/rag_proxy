@@ -53,7 +53,7 @@ def relevance_ratio(q: str, ctx: str, ctx_limit: int = 2000) -> float:
     return common / len(qk)
 
 # 환경변수로 문턱값 조정 가능 (기본 0.2)
-REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.2"))
+REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.08"))
 
 def is_relevant(q: str, ctx: str) -> bool:
     return relevance_ratio(q, ctx) >= REL_THRESH
@@ -320,8 +320,10 @@ async def chat(req: ChatReq):
     if qa_json:
         ctx_text = "\n\n".join(extract_texts(qa_items))[:MAX_CTX_CHARS]
         ctx_text = mark_lonely_numbers_as_total(ctx_text)
-        if (not is_good_context_for_qa(ctx_text)) or (not is_relevant(orig_user_msg, ctx_text)):
-            qa_json = None   # → QUERY 또는 LLM 단독 경로로 폴백
+    # 변경: 텍스트만 있으면(예: 80자↑) QA를 수용. 관련도/형식이 다소 약해도 허용
+    qa_ok = bool(ctx_text.strip()) and (len(ctx_text) >= 80 or is_good_context_for_qa(ctx_text) or is_relevant(orig_user_msg, ctx_text))
+    if not qa_ok:
+        qa_json = None
 
     if qa_json:
         ctx_for_prompt = sanitize(ctx_text)    
@@ -398,7 +400,8 @@ async def chat(req: ChatReq):
     best_ctx = best_ctx_good or best_ctx_any
     src_urls = best_urls_good or best_urls_any  # [추가]
 
-    if best_ctx and not is_relevant(orig_user_msg, best_ctx):
+    # 변경: 80자 이상이면 관련도 낮아도 수용
+    if best_ctx and not (len(best_ctx) >= 80 or is_relevant(orig_user_msg, best_ctx)):
         best_ctx = ""
         src_urls = []
 
