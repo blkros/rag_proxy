@@ -49,6 +49,21 @@ ALIASES = {
 
 _STOPWORDS = set("은 는 이 가 을 를 에 의 와 과 도 로 으로 에서 에게 그리고 그러나 그래서 무엇 뭐야 뭐지 설명 해줘 대한 대해 정리 개요 소개 자세히".split())
 
+# ===== httpx timeout/env =====
+ROUTER_CONNECT_TIMEOUT = float(os.getenv("ROUTER_CONNECT_TIMEOUT", "20"))
+ROUTER_READ_TIMEOUT    = float(os.getenv("ROUTER_READ_TIMEOUT", "180"))  # <- 120 → 180로 여유
+ROUTER_WRITE_TIMEOUT   = float(os.getenv("ROUTER_WRITE_TIMEOUT", "60"))
+ROUTER_POOL_TIMEOUT    = float(os.getenv("ROUTER_POOL_TIMEOUT", "180"))
+
+def _httpx_timeout():
+    import httpx
+    return httpx.Timeout(
+        connect=ROUTER_CONNECT_TIMEOUT,
+        read=ROUTER_READ_TIMEOUT,
+        write=ROUTER_WRITE_TIMEOUT,
+        pool=ROUTER_POOL_TIMEOUT,
+    )
+
 
 def _spaces_from_env():
     raw = os.getenv("CONFLUENCE_SPACE", "").strip()
@@ -347,21 +362,36 @@ async def chat(req: ChatReq):
             "temperature": 0,
             "max_tokens": req.max_tokens or ROUTER_MAX_TOKENS,
         }
-        async with httpx.AsyncClient() as client:
-            r = await client.post(f"{OPENAI}/chat/completions", json=payload)
-        return r.json()
+        import httpx, time, uuid  # 위에 이미 있으면 생략
+        try:
+            async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
+                r = await client.post(f"{OPENAI}/chat/completions", json=payload)
+                return r.json()
+        except (httpx.RequestError, ValueError) as e:
+            # 타임아웃/네트워크 장애는 200으로 안전하게 래핑해 돌려줌
+            return {
+                "id": f"cmpl-{uuid.uuid4()}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "메타 태스크 처리 중 백엔드 응답 지연으로 실패했어요. 잠시 후 다시 시도해주세요."
+                    },
+                    "finish_reason": "stop"
+                }],
+                "error": {"type": e.__class__.__name__, "message": str(e)}
+            }
+
 
     ctx_text = ""
     qa_json = None
     qa_items = []
     qa_urls: List[str] = []     # QA 경로 출처
 
-    timeout = httpx.Timeout(
-        connect=20.0,  # TCP 연결
-        read=120.0,    # 응답 바디 읽기 (모델 생성 시간)
-        write=60.0,    # 요청 전송
-        pool=120.0     # 커넥션 풀 대기
-    )
+    timeout = _httpx_timeout()
     async with httpx.AsyncClient(timeout=timeout) as client:
         spaces_hint = await _auto_pick_spaces(orig_user_msg, client)
 
