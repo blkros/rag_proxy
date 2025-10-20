@@ -40,6 +40,15 @@ class Settings:
     RETRIEVER_FETCH_K: int = field(default_factory=lambda: int(os.getenv("RETRIEVER_FETCH_K", "40")))
     SEARCH_TYPE: str = field(default_factory=lambda: os.getenv("SEARCH_TYPE", "mmr"))
 
+    # STICKY SEC 설정 (로컬 파일 올려두고 얼마나 지속할건지)
+    STICKY_SECS: int = field(default_factory=lambda: int(os.getenv("STICKY_SECS", "180")))
+    STICKY_STRICT: bool = field(default_factory=lambda: _as_bool(os.getenv("STICKY_STRICT"), True))
+    STICKY_FROM_COALESCE: bool = field(default_factory=lambda: _as_bool(os.getenv("STICKY_FROM_COALESCE"), False))
+    STICKY_AFTER_MCP: bool = field(default_factory=lambda: _as_bool(os.getenv("STICKY_AFTER_MCP"), False))
+    LOCAL_FIRST: bool = field(default_factory=lambda: _as_bool(os.getenv("LOCAL_FIRST"), True))
+    LOCAL_BONUS: float = field(default_factory=lambda: float(os.getenv("LOCAL_BONUS", "0.25")))
+
+
     # 재랭커
     ENABLE_RERANKER: bool = field(default_factory=lambda: _as_bool(os.getenv("ENABLE_RERANKER"), False))
     RERANKER_MODEL: str = field(default_factory=lambda: os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base"))

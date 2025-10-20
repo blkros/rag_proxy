@@ -62,7 +62,7 @@ last_source: Optional[str] = None
 # >>> [ADD] 최근 소스 잠금 상태 (연속 질문 안정화용)
 current_source: Optional[str] = None
 current_source_until: float = 0.0
-STICKY_SECS = 180  # 최근 파일 기준 3분 잠금
+STICKY_SECS = int(getattr(settings, "STICKY_SECS", 180))
 
 STICKY_STRICT = bool(getattr(settings, "STICKY_STRICT", True))
 STICKY_FROM_COALESCE = bool(getattr(settings, "STICKY_FROM_COALESCE", False))  # 기본 False
@@ -1414,19 +1414,22 @@ async def query(payload: dict = Body(...)):
     #     (anchors and not anchor_hit)
     # )
 
-    # [ADD] 로컬 업로드 기반 히트가 있는지 확인 (uploads/ 경로 여부)
+    # tokens / acr / anchors / acronym_hit / anchor_hit 등이 계산된 상태
+    anchor_miss = bool(anchors) and not anchor_hit
+    acronym_miss = bool(acr) and not acronym_hit
+
     local_ok = _has_local_hits(items) or _has_local_hits(pool_hits)
 
-    # [CHANGE] 로컬 히트가 있으면 '진짜 실패' 상황에서만 MCP 폴백
     if local_ok:
-        NEED_FALLBACK = (len(items) == 0) or missing_article
+        # 로컬 히트가 있어도 앵커/약어가 안 맞으면 폴백
+        NEED_FALLBACK = (len(items) == 0) or missing_article or anchor_miss or acronym_miss
     else:
         NEED_FALLBACK = (
             (len(items) == 0) or
             (len(pool_hits) < max(10, k*2)) or
             missing_article or
-            (acr and not acronym_hit) or
-            (anchors and not anchor_hit)
+            acronym_miss or
+            anchor_miss
         )
 
     ### [ADD] '제 N장/조' 질의는 아이템이 이미 있으면 앵커 미스만으로 폴백 금지
