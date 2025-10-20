@@ -36,6 +36,11 @@ ROUTER_SOURCES_MAX  = int(os.getenv("ROUTER_SOURCES_MAX", "5"))
 # === relevance gate ===
 _KO_EN_TOKEN = re.compile(r"[A-Za-z0-9]+|[가-힣]{2,}")
 
+SYNONYMS = {
+    "NIA": ["한국지능정보사회진흥원", "지능정보사회진흥원", "국가정보화진흥원"],
+    "상가정보": ["상권정보", "상권 분석", "상권", "상업용 부동산 정보", "상가 매물"]
+}
+
 _STOPWORDS = set("""
 은 는 이 가 을 를 에 의 와 과 도 로 으로 에서 에게 그리고 그러나 그래서
 무엇 뭐야 뭐지 설명 해줘 대한 대해 정리 개요 소개 자세히
@@ -132,16 +137,34 @@ def normalize_query(q: str) -> str:
     s = s.replace("스텝", "SFTP")
     return s
 
-def generate_query_variants(q: str, limit: int = 6) -> List[str]:
+def _expand_synonyms(s: str) -> list[str]:
+    out = [s]
+    for k, vs in SYNONYMS.items():
+        if k in s:
+            for v in vs:
+                out.append(s.replace(k, v))
+    # 공백/붙여쓰기 변형도 함께
+    ss = s.replace("상가 정보", "상가정보")
+    if ss != s: out.append(ss)
+    return list(dict.fromkeys(out))  # dedup
+
+def generate_query_variants(q: str, limit: int = 12) -> List[str]:
     s = normalize_query(q)
     cand: List[str] = []
     def add(x: str):
         x = re.sub(r'\s+', ' ', x).strip()
         if x and x not in cand: cand.append(x)
+
     add(s)
     add(re.sub(r'\s+', '', s))
     add(re.sub(r'([가-힣])([A-Za-z0-9])', r'\1 \2', s))
     add(re.sub(r'([A-Za-z0-9])([가-힣])', r'\1 \2', s))
+
+    # 동의어 확장 추가
+    for v in _expand_synonyms(s):
+        add(v); add(re.sub(r'\s+', '', v))
+
+    # 기존 페어 바꿔치기도 유지
     pairs = [("개발 서버","개발서버"), ("테스트 서버","테스트서버"), ("운영 서버","운영서버"),
              ("계정 정보","계정정보"), ("접속 정보","접속정보"), ("IP 주소","IP주소")]
     for a,b in pairs:
