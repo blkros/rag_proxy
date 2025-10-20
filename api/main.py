@@ -642,6 +642,7 @@ class AskPayload(BaseModel):
     spaceKey: str | None = Field(None, description="space와 동일(클라이언트 호환)")
     pageId: str | None = Field(None, description="Confluence pageId 힌트/잠금")
     messages: list[dict] | None = Field(None, description="대화형 호환 필드")
+    sticky: bool | None = Field(None, description="이 요청에서 sticky 소스를 사용하지 않음")
 
     def to_query_dict(self) -> dict:
         d = self.model_dump(exclude_none=True)
@@ -767,39 +768,46 @@ async def update_index(payload: dict):
     if vectorstore is None:
         raise HTTPException(500, "vectorstore is not ready.")
 
-    rel = (payload or {}).get("path") or ""
-    parser = (payload or {}).get("parser", "auto")
+    # [FIX] 안전한 경로 결합 + 경로 탈출 방지 (py3.10+ 호환: relative_to 사용)
+    base = Path(UPLOAD_DIR).resolve()
+    rel  = str((payload or {}).get("path") or "").replace("\\", "/")
     if not rel:
-        raise HTTPException(400, "path is required (e.g., 'uploads/doc.pdf')")
+        raise HTTPException(400, "payload.path is required")
 
-    # 경로 정규화
-    path = Path(rel)
-    if not path.is_absolute():
-        path = Path(UPLOAD_DIR) / rel if not rel.startswith(UPLOAD_DIR) else Path(rel)
-    if not path.exists():
-        raise HTTPException(404, f"file not found: {path}")
-    
+    candidate = (base / rel).resolve()
+    try:
+        # base의 하위 경로인지 확인 (is_relative_to 대체)
+        candidate.relative_to(base)
+    except Exception:
+        raise HTTPException(403, "path must be inside uploads")
+
+    if not candidate.exists():
+        raise HTTPException(404, f"file not found: {candidate}")
+
+    # [FIX] NameError 방지: parser를 payload에서 추출 (기본값 'auto')
+    parser = (payload or {}).get("parser", "auto")
+
+    # 최근 소스/스티키 업데이트 (연속 질문 안정화)
     global last_source
-    last_source = _norm_source(str(path))
-    # >>> [ADD] 업데이트 직후 최근 소스 잠금
+    last_source = _norm_source(str(candidate))
     _set_sticky(last_source)
 
     # 1) 문서 로딩
     try:
         docs = load_docs_any(
-            path,
+            candidate,                 # [FIX] 검증된 candidate만 사용
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
-            parser=parser,           # ← 자동/표친화 감지 반영
+            parser=parser,             # 자동/표 친화 파서
         )
         if not docs:
-            raise HTTPException(400, f"no docs parsed from {path}")
+            raise HTTPException(400, f"no docs parsed from {candidate}")
     except ValueError as ve:
         raise HTTPException(415, str(ve))
     except Exception as e:
         raise HTTPException(500, f"load failed: {e}")
 
-     # 2) 업서트 + 저장 + 리트리버 갱신
+    # 2) 업서트 + 저장 + 리트리버 갱신
     try:
         async with index_lock:
             before = len(vectorstore.docstore._dict)
@@ -810,7 +818,7 @@ async def update_index(payload: dict):
             "indexed": len(docs),
             "added": added,
             "doc_total": after,
-            "source": str(path),
+            "source": str(candidate),  # [NOTE] 실제 인덱싱한 경로 반환
             "chunks": CHUNK_SIZE,
             "overlap": CHUNK_OVERLAP,
             "parser": parser,
@@ -1090,14 +1098,17 @@ async def query(payload: dict = Body(...)):
         forced_page_id = page_id
     src_set    = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
 
+    # [ADD] 요청 단위 sticky 비활성화 플래그
+    sticky_flag = (payload or {}).get("sticky")
+    ignore_sticky = (sticky_flag is False) or (isinstance(sticky_flag, str) and str(sticky_flag).lower() in ("0","false","no"))
+
     # >>> [ADD] 스티키가 살아있으면 우선 적용
     now = time.time()
-    # (교체) 앵커 매치에 실패하면 sticky 무시 + 해제
-    if not src_filter and not src_set and current_source and now < current_source_until:
-        if (not STICKY_STRICT) or _sticky_is_relevant(q, current_source):  # ← 앵커 매치
+    # [CHANGE] sticky 적용은 ignore_sticky가 아닐 때만
+    if (not ignore_sticky) and not src_filter and not src_set and current_source and now < current_source_until:
+        if (not STICKY_STRICT) or _sticky_is_relevant(q, current_source):
             src_filter = current_source
         else:
-            # sticky 해제
             current_source = None
             current_source_until = 0.0
 
@@ -1786,7 +1797,9 @@ async def v1_chat(payload: dict = Body(...)):
         "pageId": page_id,
         "space": space,
         "source": source,
-        "sources": sources
+        "sources": sources,
+        "sticky": False,  # 대화형 라우팅은 매질의 전환이 잦으므로 sticky 비활성
+
     })
 
     # 2) direct_answer가 있으면 그대로 사용

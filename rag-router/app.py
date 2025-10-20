@@ -1,3 +1,4 @@
+# rag-router/app.py
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
@@ -64,7 +65,7 @@ def is_relevant(q: str, ctx: str) -> bool:
     return relevance_ratio(q, ctx) >= REL_THRESH
 
 def _is_webui_task(s: str) -> bool:
-    return (s or "").lstrip().startswith("###Task:")
+    return bool(re.match(r"(?is)^\s*#{3}\s*task\s*:", (s or "")))
 
 app = FastAPI()
 
@@ -104,7 +105,7 @@ def _looks_structured(ctx: str) -> bool:
         return False
     bullet_like = 0
     for ln in lines[:40]:  # 첫 40줄만 검사
-        if re.match(r"^[-•*]\s+|\d+\.\s+|\[\w+\]\s+", ln):
+        if re.match(r"^(?:[-•*]\s+|\d+\.\s+|\[\w+\]\s+)", ln):
             bullet_like += 1
         elif len(ln) <= 28:  # 짧은 단문이 많이 이어지면 목록일 확률 ↑
             bullet_like += 0.5
@@ -132,7 +133,7 @@ def pick_answer_mode(user_msg: str, ctx_text: str) -> str:
 def normalize_query(q: str) -> str:
     if not q: return ""
     s = q.strip()
-    s = re.sub(r'(?i)\bstep\b', 'SFTP', s)
+    # s = re.sub(r'(?i)\bstep\b', 'SFTP', s)
     s = re.sub(r'(?i)\bstfp\b|\bsfttp\b|\bsfpt\b|\bsftp\b', 'SFTP', s)
     s = s.replace("스텝", "SFTP")
     return s
@@ -312,13 +313,14 @@ async def chat(req: ChatReq):
     ctx_text = ""
     qa_json = None
     qa_items = []
-    qa_urls: List[str] = []     # [추가] QA 경로 출처
+    qa_urls: List[str] = []     # QA 경로 출처
 
     timeout = httpx.Timeout(30.0, connect=5.0, read=20.0, write=20.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         for v in variants:
             try:
-                qa = await client.post(f"{RAG}/qa", json={"q": v, "k": 5})
+                # sticky 비활성화 플래그 추가
+                qa = await client.post(f"{RAG}/qa", json={"q": v, "k": 5, "sticky": False})
                 j = qa.json()
             except (httpx.RequestError, ValueError) as e:
                 print(f"[router] /qa error for '{v}': {e}")
@@ -326,15 +328,15 @@ async def chat(req: ChatReq):
             if (j.get("hits") or 0) > 0:
                 qa_json = j
                 qa_items = j.get("items", [])
-                qa_urls = _collect_urls_from_items(qa_items)   # [추가]
+                qa_urls = _collect_urls_from_items(qa_items)
                 break
 
     # 2-A) QA 성공
     if qa_json:
         ctx_text = "\n\n".join(extract_texts(qa_items))[:MAX_CTX_CHARS]
         ctx_text = mark_lonely_numbers_as_total(ctx_text)
-    # 변경: 텍스트만 있으면(예: 80자↑) QA를 수용. 관련도/형식이 다소 약해도 허용
-    qa_ok = bool(ctx_text.strip()) and (len(ctx_text) >= 80 or is_good_context_for_qa(ctx_text) or is_relevant(orig_user_msg, ctx_text))
+    # [CHANGE] 길이(80자) 허용 삭제 → 관련도/컨텍스트 품질만
+    qa_ok = bool(ctx_text.strip()) and (is_good_context_for_qa(ctx_text) or is_relevant(orig_user_msg, ctx_text))
     if not qa_ok:
         qa_json = None
 
@@ -361,8 +363,8 @@ async def chat(req: ChatReq):
 
         content = sanitize(strip_reasoning(raw).strip()) or "인덱스에 근거 없음"
         # [변경] 폴백 시 제목 접두어 제거
-        if content == "인덱스에 근거 없음" and ctx_text.strip():
-            content = sanitize(ctx_text)[:600]
+        # if content == "인덱스에 근거 없음" and ctx_text.strip():
+        #     content = sanitize(ctx_text)[:600]
 
         # [추가] 출처 붙이기 (MCP/Confluence 경로일 때)
         if ROUTER_SHOW_SOURCES and qa_urls:
@@ -384,7 +386,8 @@ async def chat(req: ChatReq):
     async with httpx.AsyncClient(timeout=timeout) as client:
         for v in variants:
             try:
-                qres = await client.post(f"{RAG}/query", json={"q": v, "k": 5})
+                # [CHANGE] sticky 비활성화 플래그 추가
+                qres = await client.post(f"{RAG}/query", json={"q": v, "k": 5, "sticky": False})
                 qj = qres.json()
             except (httpx.RequestError, ValueError) as e:
                 print(f"[router] /query error for '{v}': {e}")
@@ -413,8 +416,8 @@ async def chat(req: ChatReq):
     best_ctx = best_ctx_good or best_ctx_any
     src_urls = best_urls_good or best_urls_any  # [추가]
 
-    # 변경: 80자 이상이면 관련도 낮아도 수용
-    if best_ctx and not (len(best_ctx) >= 80 or is_relevant(orig_user_msg, best_ctx)):
+    # [CHANGE] 길이(80자) 조건 삭제 → 관련도만
+    if best_ctx and not is_relevant(orig_user_msg, best_ctx):
         best_ctx = ""
         src_urls = []
 
@@ -468,8 +471,8 @@ async def chat(req: ChatReq):
     content = sanitize(strip_reasoning(raw).strip()) or "인덱스에 근거 없음"
 
     # [변경] 폴백 시 제목 접두어 제거
-    if content == "인덱스에 근거 없음" and ctx_text.strip():
-        content = sanitize(ctx_text)[:600]
+    # if content == "인덱스에 근거 없음" and ctx_text.strip():
+    #     content = sanitize(ctx_text)[:600]
 
     # [추가] 출처 붙이기
     if ROUTER_SHOW_SOURCES and src_urls:
