@@ -15,6 +15,10 @@ ROUTER_MODEL_ID = os.getenv("ROUTER_MODEL_ID", "qwen3-30b-a3b-fp8-router")
 TZ = os.getenv("ROUTER_TZ", "Asia/Seoul")
 _NUM_ONLY_LINE = re.compile(r'(?m)^\s*(\d{1,3}(?:,\d{3})*|\d+)\s*$')
 
+ROUTER_STRICT_RAG = (os.getenv("ROUTER_STRICT_RAG", "1").lower() not in ("0","false","no"))
+ANSWER_MIN_OVERLAP = float(os.getenv("ROUTER_ANSWER_MIN_OVERLAP", "0.2"))
+
+
 ROUTER_MAX_TOKENS = int(os.getenv("ROUTER_MAX_TOKENS", "2048"))
 ANSWER_MODE = os.getenv("ROUTER_ANSWER_MODE", "auto")
 BULLETS_MAX = int(os.getenv("ROUTER_BULLETS_MAX", "15"))
@@ -70,6 +74,12 @@ def _httpx_timeout():
         pool=ROUTER_POOL_TIMEOUT,
     )
 
+def _qa_score(j):
+    if not j: return -1
+    hits = float(j.get("hits") or 0)
+    items = j.get("items") or []
+    ctx = "\n\n".join(extract_texts(items))[:MAX_CTX_CHARS]
+    return hits + (len(ctx) / 10000.0)  # 아주 단순 가중치
 
 def _spaces_from_env():
     raw = os.getenv("CONFLUENCE_SPACE", "").strip()
@@ -137,6 +147,14 @@ def relevance_ratio(q: str, ctx: str, ctx_limit: int = 2000) -> float:
 
 # 환경변수로 문턱값 조정 가능 (기본 0.2)
 REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.08"))
+
+
+def supported_by_context(answer: str, ctx: str) -> bool:
+    if not answer or not ctx:
+        return False
+    ov = relevance_ratio(answer, ctx, ctx_limit=MAX_CTX_CHARS)
+    return ov >= ANSWER_MIN_OVERLAP
+
 
 def _normalize_query(s: str) -> str:
     s = unicodedata.normalize("NFKC", s or "")
@@ -441,41 +459,44 @@ async def chat(req: ChatReq):
     qa_items = []
     qa_urls: List[str] = []     # QA 경로 출처
 
+    best_ctx = ""
+    src_urls: List[str] = []
+
     timeout = _httpx_timeout()
     async with httpx.AsyncClient(timeout=timeout) as client:
         spaces_hint = await _auto_pick_spaces(orig_user_msg, client)
 
-        # ====== 2-A) QA 경로 시도 ======
+        # === QA 경로 ===
         qa_json = None; qa_items = []; qa_urls = []
 
         for v in variants:
-            # 1) 글로벌(Confluence 등) 검색: sticky False
             try:
                 j1 = (await client.post(f"{RAG}/qa", json={"q": v, "k": 5, "sticky": False})).json()
-            except Exception as e:
-                print(f"[router] /qa global error for '{v}': {e}")
-                j1 = {}
-
-            # 2) PDF(세션 sticky) 검색: sticky True   ※ /qa에는 spaces 절대 넣지 않음
+            except Exception: j1 = {}
             try:
                 j2 = (await client.post(f"{RAG}/qa", json={"q": v, "k": 5, "sticky": True})).json()
-            except Exception as e:
-                print(f"[router] /qa pdf error for '{v}': {e}")
-                j2 = {}
+            except Exception: j2 = {}
 
-            # 두 결과 중 더 나은 쪽을 선택
-            cand = None
-            for jj in (j1, j2):
-                if (jj.get("hits") or 0) > 0:
-                    cand = jj; break
-            if not cand:
+            # 더 나은 쪽 선택
+            best = max([j1, j2], key=_qa_score)
+            if _qa_score(best) <= 0:
                 continue
 
-            qa_json = cand
-            qa_items = cand.get("items", [])
-            qa_urls  = (_limit_urls(cand.get("source_urls"))
-                        if cand.get("source_urls") else _collect_urls_from_items(qa_items, top_n=ROUTER_SOURCES_MAX))
+            items = best.get("items") or []
+            ctx_text = "\n\n".join(extract_texts(items))[:MAX_CTX_CHARS]
+            ctx_text = mark_lonely_numbers_as_total(ctx_text)
+
+            if not (ctx_text.strip() and (is_good_context_for_qa(ctx_text) or is_relevant(orig_user_msg, ctx_text))):
+                # 이 변형(v)은 패스하고 다음 변형으로 계속
+                continue
+
+            # 확정
+            qa_json  = best
+            qa_items = items
+            qa_urls  = (_limit_urls(best.get("source_urls"))
+                        if best.get("source_urls") else _collect_urls_from_items(items, top_n=ROUTER_SOURCES_MAX))
             break
+
 
 
     # 2-A) QA 성공
@@ -513,6 +534,11 @@ async def chat(req: ChatReq):
         # if content == "인덱스에 근거 없음" and ctx_text.strip():
         #     content = sanitize(ctx_text)[:600]
 
+        # ▶ 컨텍스트 근거성 확인: 낮으면 답변 버리고 ‘인덱스에 근거 없음’
+        if ROUTER_STRICT_RAG and not supported_by_context(content, ctx_for_prompt):
+            content = "인덱스에 근거 없음"
+            qa_urls = []  # 근거 없는 답에 출처 붙이지 않기
+
         # [추가] 출처 붙이기 (MCP/Confluence 경로일 때)
         if ROUTER_SHOW_SOURCES and qa_urls:
             content += "\n\n출처:\n" + "\n".join(f"- {u}" for u in qa_urls)
@@ -532,23 +558,19 @@ async def chat(req: ChatReq):
         used_q_good=None; used_q_any=None
 
         for v in variants:
-            # 1) 글로벌
             try:
                 payload = {"q": v, "k": 5, "sticky": False}
-                if spaces_hint: payload["spaces"] = spaces_hint  # QUERY엔 spaces OK
+                if spaces_hint: payload["spaces"] = spaces_hint
                 qj1 = (await client.post(f"{RAG}/query", json=payload)).json()
-            except Exception as e:
-                print(f"[router] /query global error for '{v}': {e}")
+            except Exception:
                 qj1 = {}
 
-            # 2) PDF
             try:
                 qj2 = (await client.post(f"{RAG}/query", json={"q": v, "k": 5, "sticky": True})).json()
-            except Exception as e:
-                print(f"[router] /query pdf error for '{v}': {e}")
+            except Exception:
                 qj2 = {}
 
-            # ★ 두 후보를 모두 평가하면서 best 갱신 (여기서 끝!)
+            # ★ 여기서 바로 평가/갱신 (바깥에 동일 코드 두지 말기)
             for qj in (qj1, qj2):
                 items = (qj.get("items") or qj.get("contexts") or [])
                 urls  = (_limit_urls(qj.get("source_urls"))
@@ -559,14 +581,9 @@ async def chat(req: ChatReq):
                 ctx = "\n\n---\n\n".join([t for t in ctx_list if t])[:MAX_CTX_CHARS]
 
                 if len(ctx) > len(best_ctx_any):
-                    best_ctx_any = ctx
-                    best_urls_any = urls[:]
-                    used_q_any = v
+                    best_ctx_any = ctx; best_urls_any = urls[:]; used_q_any = v
                 if is_good_context_for_qa(ctx) and len(ctx) > len(best_ctx_good):
-                    best_ctx_good = ctx
-                    best_urls_good = urls[:]
-                    used_q_good = v
-
+                    best_ctx_good = ctx; best_urls_good = urls[:]; used_q_good = v
 
         best_ctx = best_ctx_good or best_ctx_any
         src_urls = best_urls_good or best_urls_any
@@ -579,17 +596,42 @@ async def chat(req: ChatReq):
             src_urls = []
 
 
+
+
     if not best_ctx:
-        # 일반 LLM 폴백
+        # STRICT 모드면: 인덱스 근거 없음을 즉시 반환
+        if ROUTER_STRICT_RAG:
+            return {
+                "id": f"cmpl-{uuid.uuid4()}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "인덱스에 근거 없음"},
+                    "finish_reason": "stop"
+                }],
+            }
+
+        # 비-STRICT: 일반 LLM 폴백을 호출하고 **바로 return**
         now_kst = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d (%a) %H:%M:%S %Z")
         sysmsg = {
             "role": "system",
-            "content": f"현재 날짜와 시간: {now_kst}. 문서 인덱스가 없어도 일반 상식·수학·날짜/시간 등은 직접 답하세요. ‘인덱스에 근거 없음’ 같은 말은 하지 마세요."
+            "content": (
+                f"현재 날짜와 시간: {now_kst}. "
+                "문서 인덱스가 없어도 일반 상식·수학·날짜/시간 등은 직접 답하세요. "
+                "‘인덱스에 근거 없음’ 같은 말은 하지 마세요."
+            )
         }
         max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
-        payload = {"model": OPENAI_MODEL, "messages": [sysmsg] + [m.model_dump() for m in req.messages],
-                   "stream": False, "temperature": 0, "max_tokens": max_tokens}
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": [sysmsg] + [m.model_dump() for m in req.messages],
+            "stream": False,
+            "temperature": 0,
+            "max_tokens": max_tokens
+        }
+        async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
             try:
                 r = await client.post(f"{OPENAI}/chat/completions", json=payload)
                 rj = r.json()
@@ -597,14 +639,20 @@ async def chat(req: ChatReq):
                 content = sanitize(strip_reasoning(raw).strip()) or "죄송해요. 지금은 답을 찾지 못했어요."
             except (httpx.RequestError, ValueError):
                 content = "죄송해요. 지금은 답을 찾지 못했어요."
+
         return {
             "id": f"cmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": req.model,
-            "choices": [{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }],
         }
 
+    
     # QUERY 경로 LLM 호출
     ctx_text = best_ctx
     ctx_text = mark_lonely_numbers_as_total(ctx_text) 
@@ -631,6 +679,10 @@ async def chat(req: ChatReq):
     # [변경] 폴백 시 제목 접두어 제거
     # if content == "인덱스에 근거 없음" and ctx_text.strip():
     #     content = sanitize(ctx_text)[:600]
+
+    if ROUTER_STRICT_RAG and not supported_by_context(content, ctx_for_prompt):
+        content = "인덱스에 근거 없음"
+        src_urls = []
 
     # [추가] 출처 붙이기
     if ROUTER_SHOW_SOURCES and src_urls:
