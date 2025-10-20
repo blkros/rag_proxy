@@ -68,9 +68,9 @@ class Settings:
     # --- Hybrid(경량 스파스) / 타이틀/스페이스 힌트 ---
     ENABLE_SPARSE: bool = field(default_factory=lambda: _as_bool(os.getenv("ENABLE_SPARSE"), True))
     SPARSE_LIMIT: int = field(default_factory=lambda: int(os.getenv("SPARSE_LIMIT", "150")))
-    TITLE_BONUS: float = field(default_factory=lambda: float(os.getenv("TITLE_BONUS", "0.25")))
+    TITLE_BONUS: float = field(default_factory=lambda: float(os.getenv("TITLE_BONUS", "0.4")))
     SPACE_FILTER_MODE: str = field(default_factory=lambda: os.getenv("SPACE_FILTER_MODE", "soft"))  # "soft"|"hard"
-    SPACE_HINT_BONUS: float = field(default_factory=lambda: float(os.getenv("SPACE_HINT_BONUS", "0.2")))
+    SPACE_HINT_BONUS: float = field(default_factory=lambda: float(os.getenv("SPACE_HINT_BONUS", "0.3")))
 
     # --- e5(instruct) 프리픽스 사용 ---
     E5_USE_PREFIX: bool = field(default_factory=lambda: _as_bool(os.getenv("E5_USE_PREFIX"), True))
