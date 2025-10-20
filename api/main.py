@@ -753,13 +753,11 @@ async def qa_compat(payload: AskPayload = Body(
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), overwrite: bool = Form(False)):
-    # --- uploads 하위에만 저장 (경로 탈출 방지) ---
     ensure_dirs()
     safe_name = os.path.basename(file.filename).replace("\\", "/")
     dest = Path(UPLOAD_DIR) / safe_name
     if dest.exists() and not overwrite:
         raise HTTPException(409, f"File already exists: {dest}")
-
     try:
         with dest.open("wb") as f:
             shutil.copyfileobj(file.file, f)
@@ -768,10 +766,7 @@ async def upload(file: UploadFile = File(...), overwrite: bool = Form(False)):
             await file.close()
         except Exception:
             pass
-
-    return {
-        "saved": {"filename": safe_name, "path": str(dest), "bytes": dest.stat().st_size}
-    }
+    return {"saved": {"filename": safe_name, "path": str(dest), "bytes": dest.stat().st_size}}
 
 
 @app.post("/ingest")
@@ -780,13 +775,12 @@ async def ingest(
     overwrite: bool = Form(False),
     parser: str = Form("auto"),
 ):
-    """파일 저장 + 파싱/청킹 + 임베딩/업서트까지 원샷."""
-    global vectorstore
+    global vectorstore, last_source   # ← 함수 제일 위에 둡니다
+
     if vectorstore is None:
         raise HTTPException(500, "vectorstore is not ready.")
 
     ensure_dirs()
-    # >>> FIX: 경로 탈출 방지
     safe_name = os.path.basename(file.filename).replace("\\", "/")
     dest = Path(UPLOAD_DIR) / safe_name
     if dest.exists() and not overwrite:
@@ -820,8 +814,7 @@ async def ingest(
             added = _upsert_docs_no_dup(docs)
             after = len(vectorstore.docstore._dict)
 
-            # 업서트 직후 최근 소스 추적 + sticky
-            global last_source
+            # ← 여기서 전역 업데이트 & sticky (전역선언은 함수 맨 위에서 이미 했음)
             last_source = _norm_source(str(dest))
             _set_sticky(last_source)
 
@@ -838,15 +831,11 @@ async def ingest(
 
 @app.post("/update")
 async def update_index(payload: dict):
-    """
-    업로드된 파일을 인덱스에 추가(멀티포맷: pdf/xlsx/pptx/txt, hwp 제외)
-    payload 예: {"path": "uploads/문서.pdf", "parser": "auto|pdf_table"}
-    """
-    global vectorstore
+    global vectorstore, last_source   # ← 함수 제일 위에 둡니다
+
     if vectorstore is None:
         raise HTTPException(500, "vectorstore is not ready.")
 
-    # --- 안전한 경로 결합 + parser 기본값 확보 ---
     base = Path(UPLOAD_DIR).resolve()
     rel  = str((payload or {}).get("path") or "").replace("\\", "/")
     if not rel:
@@ -854,30 +843,24 @@ async def update_index(payload: dict):
 
     candidate = (base / rel).resolve()
     try:
-        candidate.relative_to(base)  # uploads 바깥은 금지
+        candidate.relative_to(base)
     except Exception:
         raise HTTPException(403, "path must be inside uploads")
 
     if not candidate.exists():
         raise HTTPException(404, f"file not found: {candidate}")
 
-    parser = (payload or {}).get("parser", "auto")  # ← NameError 방지
+    parser = (payload or {}).get("parser", "auto")
 
-
-    # 최근 소스/스티키 업데이트 (연속 질문 안정화)
-    global last_source
-    # 업서트 직후 최근 소스 추적 + sticky
-    last_source = _norm_source(str(dest if 'dest' in locals() else candidate))
-    _set_sticky(last_source)
-
+    # (주의) 여기서 last_source 건드리지 말 것!  ←←← 기존의 임시 sticky 라인 삭제
 
     # 1) 문서 로딩
     try:
         docs = load_docs_any(
-            candidate,                 # [FIX] 검증된 candidate만 사용
+            candidate,
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
-            parser=parser,             # 자동/표 친화 파서
+            parser=parser,
         )
         if not docs:
             raise HTTPException(400, f"no docs parsed from {candidate}")
@@ -893,8 +876,7 @@ async def update_index(payload: dict):
             added = _upsert_docs_no_dup(docs)
             after = len(vectorstore.docstore._dict)
 
-            # 업서트 성공 → 최근 소스 sticky
-            global last_source
+            # 업서트 성공 후에만 최근 소스/sticky 갱신
             last_source = _norm_source(str(candidate))
             _set_sticky(last_source)
 
