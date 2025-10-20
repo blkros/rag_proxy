@@ -206,14 +206,26 @@ def _match_pageid(md: dict, pid: str) -> bool:
     url = str((md or {}).get("url") or "")
     return (pid_md == pid) or (f"pageId={pid}" in src) or (f"pageId={pid}" in url)
 
+### [ADD] 로컬 업로드 소스 판별(경로 정규화 포함)
+def _is_local_source(src: str) -> bool:
+    s = (src or "").replace("\\", "/")
+    s = _norm_source(s)  # '/app/' 프리픽스 제거 → 'uploads/...'
+    up = (UPLOAD_DIR or "uploads").replace("\\", "/").strip("/")
+    # uploads/ , /uploads/ , 커스텀 업로드 디렉토리 모두 감지
+    return (
+        s.startswith("uploads/") or
+        f"/{up}/" in f"/{s}" or
+        s.startswith(f"{up}/")
+    )
+
 def _apply_local_bonus(hits: list[dict]):
     if not LOCAL_FIRST:
         return
     for h in hits:
         md = (h.get("metadata") or {})
-        src = str(md.get("source") or "")
-        # 업로드 경로(uploads/ 또는 /app/uploads/)는 보너스
-        if src.startswith("uploads/") or "/uploads/" in src:
+        src = str(md.get("source") or md.get("url") or "")
+        ### [FIX] 경로 표준화 기반의 로컬 판별 사용
+        if _is_local_source(src):
             h["score"] = float(h.get("score") or 0.0) + LOCAL_BONUS
 
 def _apply_page_hint(hits: List[dict], page_id: str | None):
@@ -1196,6 +1208,15 @@ async def query(payload: dict = Body(...)):
     except Exception:
         pairs = []
 
+    # [DEBUG] pool 상위 몇 개 소스 찍기
+    try:
+        if pool_hits:
+            _peek = [((h.get("metadata") or {}).get("source") or (h.get("metadata") or {}).get("url") or "")
+                    for h in pool_hits[:5]]
+            log.info("pool peek sources: %s", _peek)
+    except Exception:
+        pass
+
     # (선택) retriever 결과도 풀에 합치기
     base_docs = []
     try:
@@ -1405,6 +1426,10 @@ async def query(payload: dict = Body(...)):
             (acr and not acronym_hit) or
             (anchors and not anchor_hit)
         )
+
+    ### [ADD] '제 N장/조' 질의는 아이템이 이미 있으면 앵커 미스만으로 폴백 금지
+    if (chapter_no or article_no) and items:
+        NEED_FALLBACK = False
 
     # [DEBUG] 왜 폴백인지 이유를 로그로 남기면 추적 쉬움
     reasons = []
@@ -1647,12 +1672,12 @@ def _collect_source_urls(items: list[dict]) -> list[str]:
     return urls
 
 
+### [FIX] 로컬 히트 감지: source와 url 모두 확인 + 경로 정규화
 def _has_local_hits(entries) -> bool:
-    # items 또는 pool_hits 모두에 사용할 수 있게 범용으로 구현
     for it in entries or []:
         md = it.get("metadata") or {}
-        src = str(md.get("source") or "")
-        if src.startswith("uploads/") or "/uploads/" in src:
+        src = str(md.get("source") or md.get("url") or "")
+        if _is_local_source(src):
             return True
     return False
 
