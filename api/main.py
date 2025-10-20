@@ -208,14 +208,13 @@ def _match_pageid(md: dict, pid: str) -> bool:
 
 ### [ADD] 로컬 업로드 소스 판별(경로 정규화 포함)
 def _is_local_source(src: str) -> bool:
-    s = (src or "").replace("\\", "/")
-    s = _norm_source(s)  # '/app/' 프리픽스 제거 → 'uploads/...'
+    s = _norm_source((src or "").replace("\\", "/"))
     up = (UPLOAD_DIR or "uploads").replace("\\", "/").strip("/")
-    # uploads/ , /uploads/ , 커스텀 업로드 디렉토리 모두 감지
     return (
         s.startswith("uploads/") or
+        s.startswith(f"{up}/") or
         f"/{up}/" in f"/{s}" or
-        s.startswith(f"{up}/")
+        (s.endswith(".pdf") and f"/{up}/" in f"/{s}")  # 옵션
     )
 
 def _apply_local_bonus(hits: list[dict]):
@@ -280,7 +279,8 @@ SEARCH_LANGS = [s.strip() for s in os.getenv("SEARCH_LANGS", "ko,en").split(",")
 # 키워드 정제(Confluence CQL용)
 _K_STOP = {"관련","내용","찾아줘","찾아","알려줘","정리","컨플루언스","에서","해줘",
            "무엇","어떤","대한","관련한","좀","좀만","계속","그리고","거나",
-           "설명","소개","정의","토큰","token","코인"}
+           "설명","소개","정의","토큰","token","코인", "해주세요","해 주세요","해줘요","해줘","주세요","대하여","대해","설명해줘","설명해주세요","말해줘","알려","알려줘","부탁해"
+           }
 
 _JOSA_RE = re.compile(
     r"(으로써|으로서|으로부터|라고는|라고도|라고|처럼|까지|부터|에게서|한테서|에게|한테|께|이며|이자|"
@@ -1208,15 +1208,6 @@ async def query(payload: dict = Body(...)):
     except Exception:
         pairs = []
 
-    # [DEBUG] pool 상위 몇 개 소스 찍기
-    try:
-        if pool_hits:
-            _peek = [((h.get("metadata") or {}).get("source") or (h.get("metadata") or {}).get("url") or "")
-                    for h in pool_hits[:5]]
-            log.info("pool peek sources: %s", _peek)
-    except Exception:
-        pass
-
     # (선택) retriever 결과도 풀에 합치기
     base_docs = []
     try:
@@ -1238,6 +1229,17 @@ async def query(payload: dict = Body(...)):
             return max(0.0, min(1.0, s))
         except Exception:
             return 0.0
+        
+    # [DEBUG] pool 상위 몇 개 소스 찍기
+    try:
+        if pool_hits:
+            _peek = []
+            for h in pool_hits[:8]:
+                md = (h.get("metadata") or {})
+                _peek.append(md.get("source") or md.get("url") or "")
+            log.info("pool peek sources: %s", _peek)
+    except Exception:
+        pass
 
     # 3-B-1) similarity_search_with_score 풀
     for d, dist in pairs:
@@ -1581,17 +1583,17 @@ async def query(payload: dict = Body(...)):
         except Exception as e:
             log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
-    if items:
+
+    # 장/조 질의면 필터 스킵
+    if items and not (chapter_no or article_no):
         ctx_all_final = "\n".join(c["text"] for c in contexts)
         titles_meta_final = " ".join(
             f"{(h.get('metadata') or {}).get('title','')} {(h.get('metadata') or {}).get('source','')}"
             for h in items
         )
-        # ① 기존 핵심토큰 가드
         core_final = [t for t in _query_tokens(q) if not ACRONYM_RE.match(t)]
         if core_final and not any(t in ctx_all_final for t in core_final):
             items, contexts = [], []
-        # ② 앵커(질문 핵심어 + 약어) 가드
         if items:
             anchors = _anchor_tokens_from_query(q) + re.findall(r"[A-Z]{2,5}", q)
             blob = (ctx_all_final + " " + titles_meta_final).lower()
@@ -1815,12 +1817,14 @@ async def v1_chat(payload: dict = Body(...)):
             content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
 
     allowed_list = r.get("source_urls", []) or []
+    allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://","https://"))]
 
-    if content and allowed_list:
+    if content and allowed_http:
         def _keep_allowed(m):
             url = m.group(0)
-            return url if any(a and url.startswith(a) for a in allowed_list) else ""
+            return url if any(url.startswith(a) for a in allowed_http) else ""
         content = re.sub(r'https?://[^\s\)\]]+', _keep_allowed, content)
+
 
     if allowed_list:
         src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_list)
