@@ -47,10 +47,8 @@ ALIASES = {
     "NIA": ["NIA", "한국지능정보사회진흥원", "지능정보사회진흥원", "국가정보화진흥원"]
 }
 
-_STOPWORDS = set("""
-은 는 이 가 을 를 에 의 와 과 도 로 으로 에서 에게 그리고 그러나 그래서
-무엇 뭐야 뭐지 설명 해줘 대한 대해 정리 개요 소개 자세히
-""".split())
+_STOPWORDS = set("은 는 이 가 을 를 에 의 와 과 도 로 으로 에서 에게 그리고 그러나 그래서 무엇 뭐야 뭐지 설명 해줘 대한 대해 정리 개요 소개 자세히".split())
+
 
 def _spaces_from_env():
     raw = os.getenv("CONFLUENCE_SPACE", "").strip()
@@ -151,32 +149,26 @@ def mark_lonely_numbers_as_total(text: str) -> str:
 def _looks_structured(ctx: str) -> bool:
     if not ctx: return False
     lines = [ln.strip() for ln in ctx.splitlines() if ln.strip()]
-    if len(lines) < 4:  # 줄이 적으면 굳이 불릿 아님
+    if len(lines) < 4:
         return False
     bullet_like = 0
-    for ln in lines[:40]:  # 첫 40줄만 검사
+    for ln in lines[:40]:
         if re.match(r"^(?:[-•*]\s+|\d+\.\s+|\[\w+\]\s+)", ln):
             bullet_like += 1
-        elif len(ln) <= 28:  # 짧은 단문이 많이 이어지면 목록일 확률 ↑
+        elif len(ln) <= 28:
             bullet_like += 0.5
-    # 대략 4점 이상이면 목록스럽다고 판단
     return bullet_like >= 4
 
-# [추가] 사용자 질문 + 컨텍스트 기반으로 출력 모드 결정
 def pick_answer_mode(user_msg: str, ctx_text: str) -> str:
-    # 환경변수로 모드를 강제한 경우 그대로 사용
     if ANSWER_MODE != "auto":
         return ANSWER_MODE
-
     um = (user_msg or "").lower()
-    # 명시 힌트 우선
     if any(k.lower() in um for k in _BULLET_HINTS):
         return "bulleted"
     if any(k.lower() in um for k in _PARA_HINTS):
         return "paragraph"
-
-    # 문서가 목록 구조이면 불릿, 아니면 문단
     return "bulleted" if _looks_structured(ctx_text) else "paragraph"
+
 
 # --- utils ----------------------------------------------------
 
@@ -233,27 +225,26 @@ def build_system_with_context(ctx_text: str, mode: str) -> str:
             "- 2~4개의 **문단**으로 핵심→배경→세부→시사점 순으로 정리한다.\n"
             "- 마크다운 리스트 문법은 사용하지 않는다.\n"
         )
-    else:  # paragraph
+    else:
         style = (
             "- **리스트/번호/하이픈(-, •, 1.) 없이** 한두 개의 **연속된 문단**으로 자연스럽게 작성한다.\n"
-            "- 첫 문장에 개념/요지를 분명히 말하고, 이어서 구성요소·동작·장점/제약을 매끄럽게 설명한다.\n"
+            "- 첫 문장에 요지를 분명히 말하고, 이어서 구성요소·동작·제약을 설명한다.\n"
         )
 
-    # 🔒 숫자/수치 인용 가드레일(핵심!)
     numeric_rules = (
-        "- 표/목록에 있는 **수치(예: 단지 수)** 는 **같은 행(같은 항목)** 에 적힌 숫자만 인용한다.\n"
-        "- **합계/총계/요약 숫자**(행 이름이 비거나 상위 구 단위에 붙은 수치)는 **개별 항목의 값으로 배정하지 않는다.**\n"
-        "- 특정 항목의 수치가 불명확하면 **숫자를 쓰지 말고** '수치 불분명'으로 표현한다.\n"
-        "- 숫자를 쓸 때는 반드시 `항목명 숫자`로 **쌍을 이뤄** 서술한다. (예: `반포동 47`)\n"
+        "- 표/목록의 **수치**는 **같은 행(같은 항목)** 에 적힌 숫자만 인용한다.\n"
+        "- **합계/총계** 숫자를 개별 항목 값으로 배정하지 않는다.\n"
+        "- 숫자를 쓸 때는 반드시 `항목명 숫자`로 **쌍**을 이뤄 서술한다. (예: `반포동 47`)\n"
         "- 상위 단위 합계는 필요 시 `(서초구 합계 439)`처럼 **합계임을 명시**한다.\n"
+        "- 불명확하면 숫자 대신 '수치 불분명'으로 적는다.\n"
     )
-
     heading_hint = (f"- 가능하면 '{HEADING}' 아래로 정리한다.\n" if HEADING else "")
+
     return (
         "역할: 주어진 컨텍스트를 근거로 **정확하고 실무 친화적인** 한국어 답변을 작성한다.\n"
         "원칙:\n"
-        "- 컨텍스트에 있는 정보만 사용하고 추측/환각 금지.\n"
-        "- 수치·정책·고유명사는 가능하면 그대로 인용하되 과도한 반복은 피한다.\n"
+        "- 컨텍스트에 있는 정보만 사용하고 추측 금지.\n"
+        "- 고유명사/수치는 가능한 그대로 인용하되 과도한 반복은 피한다.\n"
         "- 내부 추론(<think> 등) 출력 금지, 최종 답만 출력한다.\n"
         + heading_hint + style + numeric_rules +
         "- 컨텍스트가 완전히 비었거나 무관하면 정확히 `인덱스에 근거 없음`만 출력한다.\n"
@@ -292,7 +283,6 @@ def _normalize_url(u: str) -> str:
         return f"{base}?{m.group(1)}"
     return u
 
-# [교체] 가장 관련도 높은 URL부터 dedup 후 상위 N개만
 def _collect_urls_from_items(items: List[dict], top_n: Optional[int] = None) -> List[str]:
     top_n = top_n or ROUTER_SOURCES_MAX
     cands = []
@@ -301,36 +291,27 @@ def _collect_urls_from_items(items: List[dict], top_n: Optional[int] = None) -> 
         if not isinstance(it, dict):
             return
         score = float(it.get("score") or it.get("similarity") or 0.0)
-
-        # 1) 최우선: url 필드
         url = it.get("url") or it.get("source_url") or it.get("link")
         if url:
             cands.append((score, _normalize_url(str(url))))
-
-        # 2) payload/metadata 안의 url
         payload = it.get("payload") or it.get("data") or {}
         if isinstance(payload, dict):
             url2 = payload.get("url") or payload.get("source_url") or payload.get("link")
             if url2:
                 cands.append((score, _normalize_url(str(url2))))
-
         meta = it.get("metadata") or {}
         if isinstance(meta, dict):
             url3 = meta.get("url")
             if url3:
                 cands.append((score, _normalize_url(str(url3))))
-
-            # [ADD] URL이 전혀 없으면, 로컬 파일 경로라도 출처로 기록
-            #       (uploads/xxx.pdf 같은 경로가 사용자에게도 유용)
             if not (url or (payload if isinstance(payload, dict) else {}).get("url") or url3):
                 src = meta.get("source")
                 if src:
-                    cands.append((score, str(src)))  # ← 그대로 표시 (ex: uploads/문서.pdf)
+                    cands.append((score, str(src)))
 
     for it in items or []:
         push(it)
 
-    # score 내림차순, 중복 제거
     cands = [(s, u) for (s, u) in cands if u]
     cands.sort(key=lambda x: x[0], reverse=True)
 

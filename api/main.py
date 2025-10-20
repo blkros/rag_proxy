@@ -753,18 +753,25 @@ async def qa_compat(payload: AskPayload = Body(
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), overwrite: bool = Form(False)):
+    # --- uploads 하위에만 저장 (경로 탈출 방지) ---
     ensure_dirs()
-    # >>> FIX: 경로 탈출 방지 + 윈도우 역슬래시 제거
     safe_name = os.path.basename(file.filename).replace("\\", "/")
     dest = Path(UPLOAD_DIR) / safe_name
     if dest.exists() and not overwrite:
         raise HTTPException(409, f"File already exists: {dest}")
+
     try:
         with dest.open("wb") as f:
             shutil.copyfileobj(file.file, f)
     finally:
-        await file.close()
-    return {"saved": {"filename": safe_name, "path": str(dest), "bytes": dest.stat().st_size}}  # ← safe_name 반영
+        try:
+            await file.close()
+        except Exception:
+            pass
+
+    return {
+        "saved": {"filename": safe_name, "path": str(dest), "bytes": dest.stat().st_size}
+    }
 
 
 @app.post("/ingest")
@@ -812,10 +819,12 @@ async def ingest(
             before = len(vectorstore.docstore._dict)
             added = _upsert_docs_no_dup(docs)
             after = len(vectorstore.docstore._dict)
+
+            # 업서트 직후 최근 소스 추적 + sticky
             global last_source
             last_source = _norm_source(str(dest))
-            # >>> [ADD] 업로드 직후 최근 소스 잠금
             _set_sticky(last_source)
+
         return {
             "saved": {"path": str(dest), "bytes": dest.stat().st_size},
             "indexed": len(docs),
@@ -825,6 +834,7 @@ async def ingest(
         }
     except Exception as e:
         raise HTTPException(500, f"index failed: {e}")
+
 
 @app.post("/update")
 async def update_index(payload: dict):
@@ -836,7 +846,7 @@ async def update_index(payload: dict):
     if vectorstore is None:
         raise HTTPException(500, "vectorstore is not ready.")
 
-    # [FIX] 안전한 경로 결합 + 경로 탈출 방지 (py3.10+ 호환: relative_to 사용)
+    # --- 안전한 경로 결합 + parser 기본값 확보 ---
     base = Path(UPLOAD_DIR).resolve()
     rel  = str((payload or {}).get("path") or "").replace("\\", "/")
     if not rel:
@@ -844,21 +854,22 @@ async def update_index(payload: dict):
 
     candidate = (base / rel).resolve()
     try:
-        # base의 하위 경로인지 확인 (is_relative_to 대체)
-        candidate.relative_to(base)
+        candidate.relative_to(base)  # uploads 바깥은 금지
     except Exception:
         raise HTTPException(403, "path must be inside uploads")
 
     if not candidate.exists():
         raise HTTPException(404, f"file not found: {candidate}")
 
-    # [FIX] NameError 방지: parser를 payload에서 추출 (기본값 'auto')
-    parser = (payload or {}).get("parser", "auto")
+    parser = (payload or {}).get("parser", "auto")  # ← NameError 방지
+
 
     # 최근 소스/스티키 업데이트 (연속 질문 안정화)
     global last_source
-    last_source = _norm_source(str(candidate))
+    # 업서트 직후 최근 소스 추적 + sticky
+    last_source = _norm_source(str(dest if 'dest' in locals() else candidate))
     _set_sticky(last_source)
+
 
     # 1) 문서 로딩
     try:
@@ -881,12 +892,18 @@ async def update_index(payload: dict):
             before = len(vectorstore.docstore._dict)
             added = _upsert_docs_no_dup(docs)
             after = len(vectorstore.docstore._dict)
+
+            # 업서트 성공 → 최근 소스 sticky
+            global last_source
+            last_source = _norm_source(str(candidate))
+            _set_sticky(last_source)
+
         return {
             "ok": True,
             "indexed": len(docs),
             "added": added,
             "doc_total": after,
-            "source": str(candidate),  # [NOTE] 실제 인덱싱한 경로 반환
+            "source": str(candidate),
             "chunks": CHUNK_SIZE,
             "overlap": CHUNK_OVERLAP,
             "parser": parser,
@@ -895,6 +912,7 @@ async def update_index(payload: dict):
         log.exception("update failed")
         detail = str(e) or e.__class__.__name__
         raise HTTPException(500, f"update failed: {detail}")
+
 
 
 # api/main.py 의 delete_index 전체를 아래로 교체
@@ -929,15 +947,14 @@ async def delete_index(payload: Optional[dict] = None):
                         except Exception:
                             pass
 
-            # ←←← (수정) '전체 삭제'에서는 target 같은 부분 삭제 로직 쓰지 말고,
-            #             인덱스를 통째로 재초기화합니다.
+            # 빈 인덱스로 재초기화
             vectorstore = _empty_faiss()
             vectorstore.save_local(INDEX_DIR)
             _reload_retriever()
             VS.vectorstore = vectorstore
             VS.retriever  = retriever
 
-            # ←←← (추가) sticky/last 상태도 초기화
+            # sticky 상태도 초기화
             current_source = None
             current_source_until = 0.0
             last_source = None
@@ -948,6 +965,7 @@ async def delete_index(payload: Optional[dict] = None):
             }
         except Exception as e:
             raise HTTPException(500, f"delete all failed: {e}")
+
 
     if source:
         try:
@@ -1166,13 +1184,12 @@ async def query(payload: dict = Body(...)):
         forced_page_id = page_id
     src_set    = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
 
-    # [ADD] 요청 단위 sticky 비활성화 플래그
+    # 요청 단위 sticky 비활성화 옵션
     sticky_flag = (payload or {}).get("sticky")
     ignore_sticky = (sticky_flag is False) or (isinstance(sticky_flag, str) and str(sticky_flag).lower() in ("0","false","no"))
 
-    # >>> [ADD] 스티키가 살아있으면 우선 적용
+    # sticky 적용 (유효기간 + 관련성 체크)
     now = time.time()
-    # [CHANGE] sticky 적용은 ignore_sticky가 아닐 때만
     if (not ignore_sticky) and not src_filter and not src_set and current_source and now < current_source_until:
         if (not STICKY_STRICT) or _sticky_is_relevant(q, current_source):
             src_filter = current_source
@@ -1180,12 +1197,14 @@ async def query(payload: dict = Body(...)):
             current_source = None
             current_source_until = 0.0
 
+
     # "이 파일/첨부한 파일" 지시어면 최근 업로드 파일로 고정
     global last_source
+    # 최근 업로드 파일 지시어(이 파일/첨부/해당 문서 등) → last_source 고정
     if not src_filter and not src_set and last_source and THIS_FILE_PAT.search(q):
         src_filter = last_source
-        # >>> [ADD] 지시어 등장 시 스티키 연장
-        _set_sticky(last_source)
+        _set_sticky(last_source)  # 연속 질문 안정화
+
 
     # 3-A) 후보 선택은 MMR로(기존 그대로)
     try:
@@ -1909,7 +1928,7 @@ async def v1_chat(payload: dict = Body(...)):
     if not content:
         ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()
         if ctx:
-            # 🔧 길이 가드 추가 (문자 기준 8천자 정도면 vLLM 쾌적)
+            # 길이 가드 추가 (문자 기준 8천자 정도면 vLLM 쾌적)
             ctx = ctx[:8000]
 
             sys = (
@@ -1924,7 +1943,7 @@ async def v1_chat(payload: dict = Body(...)):
                 {"role": "user", "content": q},
             ]
             try:
-                # 🔧 토큰/온도 명시(안정화)
+                # 토큰/온도 명시(안정화)
                 content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
             except Exception as e:
                 log.warning("summarize failed: %s", e)
