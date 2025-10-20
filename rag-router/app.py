@@ -112,9 +112,17 @@ def relevance_ratio(q: str, ctx: str, ctx_limit: int = 2000) -> float:
     qk = [t for t in _tokens(q) if t not in _STOPWORDS]
     if not qk:
         return 0.0
+
+    # [추가] 공백 제거 후 부분문자열 매칭(한글 합성어 대응)
+    qnorm = re.sub(r'\s+', '', _normalize_query(q).lower())
+    cnorm = re.sub(r'\s+', '', (ctx or "")[:ctx_limit].lower())
+    if len(qnorm) >= 4 and qnorm in cnorm:
+        return 1.0
+
     ck = set(_tokens((ctx or "")[:ctx_limit]))
     common = sum(1 for t in qk if t in ck)
     return common / len(qk)
+
 
 # 환경변수로 문턱값 조정 가능 (기본 0.2)
 REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.08"))
@@ -143,12 +151,24 @@ class ChatReq(BaseModel):
     max_tokens: Optional[int] = None
 
 def strip_reasoning(text: str) -> str:
-    if not text: return text
-    text = re.sub(r'(?is)<think>.*?</think>\s*', '', text)
+    if not text:
+        return text
+    # assistant_thought 블록 제거 (response 토큰 전까지)
     text = re.sub(r'(?is)<\|assistant_thought\|>.*?(?=<\|assistant_response\|>|\Z)', '', text)
+    # response 토큰 마커 제거
     text = re.sub(r'(?is)<\|assistant_response\|>', '', text)
-    text = re.sub(r'(?im)^\s*(thought|reasoning)\s*:\s*.*?(?:\n\n|\Z)', '', text)
+
+    # <think>…</think> 또는 </think> 없이 끝까지
+    text = re.sub(r'(?is)<think\b[^>]*>.*?(?:</think>|$)', '', text)
+
+    # 코드블록 형태의 생각/추론
+    text = re.sub(r'(?is)```(?:thinking|reasoning|thought|scratchpad)[\s\S]*?```', '', text)
+
+    # “Thought:” “Reasoning:” 스타일(빈 줄까지)
+    text = re.sub(r'(?im)^\s*(?:thought|reasoning|scratchpad)\s*:\s*[\s\S]*?(?:\n{2,}|\Z)', '', text)
+
     return text.strip()
+
 
 def mark_lonely_numbers_as_total(text: str) -> str:
     """
@@ -365,7 +385,18 @@ async def chat(req: ChatReq):
         try:
             async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
                 r = await client.post(f"{OPENAI}/chat/completions", json=payload)
-                return r.json()
+                j = r.json()
+
+                # ★ 추가: 메타 태스크 응답도 think 제거
+                try:
+                    msg = j.get("choices", [{}])[0].get("message", {})
+                    c = msg.get("content") or ""
+                    msg["content"] = strip_reasoning(c)
+                    j["choices"][0]["message"] = msg
+                except Exception:
+                    pass
+
+                return j
         except (httpx.RequestError, ValueError) as e:
             # 타임아웃/네트워크 장애는 200으로 안전하게 래핑해 돌려줌
             return {
