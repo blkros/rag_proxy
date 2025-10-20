@@ -357,12 +357,11 @@ async def chat(req: ChatReq):
     if _is_webui_task(orig_user_msg):
         payload = {
             "model": OPENAI_MODEL,
-            "messages": [m.model_dump() for m in req.messages],  # 시스템 프롬프트 추가 금지
+            "messages": [m.model_dump() for m in req.messages],
             "stream": False,
             "temperature": 0,
             "max_tokens": req.max_tokens or ROUTER_MAX_TOKENS,
         }
-        import httpx, time, uuid  # 위에 이미 있으면 생략
         try:
             async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
                 r = await client.post(f"{OPENAI}/chat/completions", json=payload)
