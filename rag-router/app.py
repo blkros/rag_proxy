@@ -250,33 +250,43 @@ def _collect_urls_from_items(items: List[dict], top_n: Optional[int] = None) -> 
     def push(it: dict):
         if not isinstance(it, dict):
             return
-        url = it.get("url") or it.get("source_url") or it.get("link")
-        score = it.get("score") or it.get("similarity") or 0.0
-        if url:
-            cands.append((float(score), _normalize_url(url)))
+        score = float(it.get("score") or it.get("similarity") or 0.0)
 
+        # 1) 최우선: url 필드
+        url = it.get("url") or it.get("source_url") or it.get("link")
+        if url:
+            cands.append((score, _normalize_url(str(url))))
+
+        # 2) payload/metadata 안의 url
         payload = it.get("payload") or it.get("data") or {}
         if isinstance(payload, dict):
             url2 = payload.get("url") or payload.get("source_url") or payload.get("link")
             if url2:
-                cands.append((float(score), _normalize_url(url2)))
+                cands.append((score, _normalize_url(str(url2))))
 
         meta = it.get("metadata") or {}
         if isinstance(meta, dict):
             url3 = meta.get("url")
             if url3:
-                cands.append((float(score), _normalize_url(url3)))
+                cands.append((score, _normalize_url(str(url3))))
+
+            # [ADD] URL이 전혀 없으면, 로컬 파일 경로라도 출처로 기록
+            #       (uploads/xxx.pdf 같은 경로가 사용자에게도 유용)
+            if not (url or (payload if isinstance(payload, dict) else {}).get("url") or url3):
+                src = meta.get("source")
+                if src:
+                    cands.append((score, str(src)))  # ← 그대로 표시 (ex: uploads/문서.pdf)
 
     for it in items or []:
         push(it)
 
-    # score 내림차순, 점수가 없으면 입력 순서 유지
+    # score 내림차순, 중복 제거
     cands = [(s, u) for (s, u) in cands if u]
     cands.sort(key=lambda x: x[0], reverse=True)
 
     out: List[str] = []
     for _, u in cands:
-        if u and u not in out:
+        if u not in out:
             out.append(u)
         if len(out) >= top_n:
             break
@@ -315,7 +325,12 @@ async def chat(req: ChatReq):
     qa_items = []
     qa_urls: List[str] = []     # QA 경로 출처
 
-    timeout = httpx.Timeout(30.0, connect=5.0, read=20.0, write=20.0, pool=5.0)
+    timeout = httpx.Timeout(
+        connect=20.0,  # TCP 연결
+        read=120.0,    # 응답 바디 읽기 (모델 생성 시간)
+        write=60.0,    # 요청 전송
+        pool=120.0     # 커넥션 풀 대기
+    )
     async with httpx.AsyncClient(timeout=timeout) as client:
         for v in variants:
             try:
@@ -328,7 +343,7 @@ async def chat(req: ChatReq):
             if (j.get("hits") or 0) > 0:
                 qa_json = j
                 qa_items = j.get("items", [])
-                qa_urls = _collect_urls_from_items(qa_items)
+                qa_urls = (j.get("source_urls") or _collect_urls_from_items(qa_items))
                 break
 
     # 2-A) QA 성공
@@ -394,10 +409,8 @@ async def chat(req: ChatReq):
                 continue
 
             # [추가] items/contexts 등에서 텍스트와 URL 모두 수집
-            items = (qj.get("items") or
-                     qj.get("contexts") or
-                     [])
-            urls = _collect_urls_from_items(items)
+            items = (qj.get("items") or qj.get("contexts") or [])
+            urls = (qj.get("source_urls") or _collect_urls_from_items(items))
 
             ctx_list = (
                 qj.get("context_texts")

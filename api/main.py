@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import inspect
+import unicodedata
 
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
@@ -367,6 +368,44 @@ def _sparse_keyword_hits(q: str, limit: int = 150, space: Optional[str] = None) 
     # 상위 limit만
     out.sort(key=lambda h: h["score"], reverse=True)
     return out[:int(limit)]
+
+# 1) 기본 정규화: 호환성 정규화 + 공백 축약
+def _basic_normalize(text: str) -> str:
+    # NFC로 정규화 (한글 결합형 안정화)
+    t = unicodedata.normalize("NFC", text)
+    # 전각/반각, 제어문자 정리 (필요하면 NFKC 고려)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+# 2) 한국어 특화: 의미보존 범위에서 공백 제거(명사연속부)
+#    - "지역 정보" → "지역정보" 같은 변이를 줄이기 위해 한글+숫자 연속부 내 공백 제거
+_HANGUL_BLOCK = r"[가-힣0-9A-Za-z]"
+def _collapse_korean_compounds(text: str) -> str:
+    # 한글/숫자/영문 사이의 단일 공백 제거
+    return re.sub(fr"(?<={_HANGUL_BLOCK})\s+(?={_HANGUL_BLOCK})", "", text)
+
+# 3) 도메인 동의어/약어 매핑 (좌변 패턴 → 우변 표준형)
+CANON_MAP = {
+    r"\bNIA\b": "한국지능정보사회진흥원",
+    r"한국\s*지능\s*정보\s*사회\s*진흥원": "한국지능정보사회진흥원",
+    r"국가\s*정보화\s*진흥원": "한국지능정보사회진흥원",  # 옛 명칭
+    r"지역\s*정보": "지역정보",
+}
+
+def _apply_canon_map(text: str) -> str:
+    t = text
+    for pat, rep in CANON_MAP.items():
+        t = re.sub(pat, rep, t, flags=re.IGNORECASE)
+    return t
+
+def normalize_query(q: str) -> str:
+    # 1단계: 기본 정규화
+    t = _basic_normalize(q)
+    # 2단계: 도메인 동의어 치환
+    t = _apply_canon_map(t)
+    # 3단계: 한국어 복합명사 공백 축약
+    t = _collapse_korean_compounds(t)
+    return t
 
 def _apply_space_hint(hits: List[dict], space: Optional[str]):
     """SPACE_FILTER_MODE == soft 일 때, space 일치 항목에 가산점"""
@@ -1648,6 +1687,20 @@ async def query(payload: dict = Body(...)):
             "notes": base_notes | {"low_relevance": True},
         }
 
+    # [OPT-ADD] items가 비면 contexts에서도 수집(방어 코팅)
+    def _collect_source_urls_from_contexts(ctxs: list[dict]) -> list[str]:
+        urls = []
+        for c in ctxs or []:
+            u = c.get("source") or c.get("url")
+            if u and u not in urls:
+                urls.append(u)
+        return urls
+
+    # (교체)
+    src_urls = _collect_source_urls(items)
+    if not src_urls:
+        src_urls = _collect_source_urls_from_contexts(contexts)
+
     return {
         "hits": len(items),
         "items": items,
@@ -1655,9 +1708,19 @@ async def query(payload: dict = Body(...)):
         "context_texts": [it["text"] for it in items],
         "documents": items,
         "chunks": items,
-        "source_urls": _collect_source_urls(items),
+        "source_urls": src_urls,  # ← 보강된 리스트
         "notes": base_notes,
     }
+    # return {
+    #     "hits": len(items),
+    #     "items": items,
+    #     "contexts": contexts,
+    #     "context_texts": [it["text"] for it in items],
+    #     "documents": items,
+    #     "chunks": items,
+    #     "source_urls": _collect_source_urls(items),
+    #     "notes": base_notes,
+    # }
 
 
 # ------- helper: chunk text -------
