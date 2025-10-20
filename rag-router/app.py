@@ -90,7 +90,7 @@ async def _auto_pick_spaces(q: str, client: httpx.AsyncClient) -> list[str] | No
         probe_q = q.strip()
         for sp in SPACES:
             # 프리뷰: LLM 생성 없이 검색만(k=3) 해서 '적합도' 점수 계산
-            r = await client.post(f"{RAG}/query", json={ "q": probe_q, "k": 3, "sticky": "" , "spaces": [sp] })
+            r = await client.post(f"{RAG}/query", json={ "q": probe_q, "k": 3, "sticky": False , "spaces": [sp] })
 
             j = r.json()
             # 컨텍스트 텍스트를 조금 모아서 질문과의 토큰 겹침(relevance_ratio)로 스코어링
@@ -393,7 +393,7 @@ async def chat(req: ChatReq):
     orig_user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "").strip()
     variants = generate_query_variants(orig_user_msg)
 
-    # ★ 메타 태스크면 RAG 건너뛰고 그대로 모델로 전달 (JSON 형식 보존)
+    # 메타 태스크면 RAG 건너뛰고 그대로 모델로 전달 (JSON 형식 보존)
     if _is_webui_task(orig_user_msg):
         payload = {
             "model": OPENAI_MODEL,
@@ -446,26 +446,37 @@ async def chat(req: ChatReq):
         spaces_hint = await _auto_pick_spaces(orig_user_msg, client)
 
         # ====== 2-A) QA 경로 시도 ======
-        qa_json = None
-        qa_items = []
-        qa_urls = []
+        qa_json = None; qa_items = []; qa_urls = []
 
         for v in variants:
+            # 1) 글로벌(Confluence 등) 검색: sticky False
             try:
-                # [CHANGE] spaces 전달 (있을 때만)
-                payload = {"q": v, "k": 5, "sticky": ""}
-                if spaces_hint: payload["spaces"] = spaces_hint
-                qa = await client.post(f"{RAG}/qa", json=payload)
-                j = qa.json()
-            except (httpx.RequestError, ValueError) as e:
-                print(f"[router] /qa error for '{v}': {e}")
+                j1 = (await client.post(f"{RAG}/qa", json={"q": v, "k": 5, "sticky": False})).json()
+            except Exception as e:
+                print(f"[router] /qa global error for '{v}': {e}")
+                j1 = {}
+
+            # 2) PDF(세션 sticky) 검색: sticky True   ※ /qa에는 spaces 절대 넣지 않음
+            try:
+                j2 = (await client.post(f"{RAG}/qa", json={"q": v, "k": 5, "sticky": True})).json()
+            except Exception as e:
+                print(f"[router] /qa pdf error for '{v}': {e}")
+                j2 = {}
+
+            # 두 결과 중 더 나은 쪽을 선택
+            cand = None
+            for jj in (j1, j2):
+                if (jj.get("hits") or 0) > 0:
+                    cand = jj; break
+            if not cand:
                 continue
-            if (j.get("hits") or 0) > 0:
-                qa_json = j
-                qa_items = j.get("items", [])
-                qa_urls = (_limit_urls(j.get("source_urls"))
-                    if j.get("source_urls") else _collect_urls_from_items(qa_items, top_n=ROUTER_SOURCES_MAX))
-                break
+
+            qa_json = cand
+            qa_items = cand.get("items", [])
+            qa_urls  = (_limit_urls(cand.get("source_urls"))
+                        if cand.get("source_urls") else _collect_urls_from_items(qa_items, top_n=ROUTER_SOURCES_MAX))
+            break
+
 
     # 2-A) QA 성공
     if qa_json:
@@ -521,36 +532,41 @@ async def chat(req: ChatReq):
         used_q_good=None; used_q_any=None
 
         for v in variants:
+            # 1) 글로벌
             try:
-                # [CHANGE] spaces 전달 (있을 때만)
-                payload = {"q": v, "k": 5, "sticky": ""}
-                if spaces_hint: payload["spaces"] = spaces_hint
-                qres = await client.post(f"{RAG}/query", json=payload)
-                qj = qres.json()
-            except (httpx.RequestError, ValueError) as e:
-                print(f"[router] /query error for '{v}': {e}")
-                continue
+                payload = {"q": v, "k": 5, "sticky": False}
+                if spaces_hint: payload["spaces"] = spaces_hint  # QUERY엔 spaces OK
+                qj1 = (await client.post(f"{RAG}/query", json=payload)).json()
+            except Exception as e:
+                print(f"[router] /query global error for '{v}': {e}")
+                qj1 = {}
 
-            # [추가] items/contexts 등에서 텍스트와 URL 모두 수집
-            items = (qj.get("items") or qj.get("contexts") or [])
-            urls = (_limit_urls(qj.get("source_urls"))
-                if qj.get("source_urls") else _collect_urls_from_items(items, top_n=ROUTER_SOURCES_MAX))
+            # 2) PDF
+            try:
+                qj2 = (await client.post(f"{RAG}/query", json={"q": v, "k": 5, "sticky": True})).json()
+            except Exception as e:
+                print(f"[router] /query pdf error for '{v}': {e}")
+                qj2 = {}
 
-            ctx_list = (
-                qj.get("context_texts")
-                or [c.get("text","") for c in (qj.get("contexts") or [])]
-                or [it.get("text","") for it in (qj.get("items") or [])]
-            )
-            ctx = "\n\n---\n\n".join([t for t in ctx_list if t])[:MAX_CTX_CHARS]
+            # ★ 두 후보를 모두 평가하면서 best 갱신 (여기서 끝!)
+            for qj in (qj1, qj2):
+                items = (qj.get("items") or qj.get("contexts") or [])
+                urls  = (_limit_urls(qj.get("source_urls"))
+                        if qj.get("source_urls") else _collect_urls_from_items(items, top_n=ROUTER_SOURCES_MAX))
+                ctx_list = (qj.get("context_texts")
+                            or [c.get("text","") for c in (qj.get("contexts") or [])]
+                            or [it.get("text","") for it in (qj.get("items") or [])])
+                ctx = "\n\n---\n\n".join([t for t in ctx_list if t])[:MAX_CTX_CHARS]
 
-            if len(ctx) > len(best_ctx_any):
-                best_ctx_any = ctx
-                best_urls_any = urls[:]
-                used_q_any = v
-            if is_good_context_for_qa(ctx) and len(ctx) > len(best_ctx_good):
-                best_ctx_good = ctx
-                best_urls_good = urls[:]
-                used_q_good = v
+                if len(ctx) > len(best_ctx_any):
+                    best_ctx_any = ctx
+                    best_urls_any = urls[:]
+                    used_q_any = v
+                if is_good_context_for_qa(ctx) and len(ctx) > len(best_ctx_good):
+                    best_ctx_good = ctx
+                    best_urls_good = urls[:]
+                    used_q_good = v
+
 
         best_ctx = best_ctx_good or best_ctx_any
         src_urls = best_urls_good or best_urls_any
