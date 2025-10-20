@@ -2,10 +2,11 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
-import os, httpx, time, uuid, re, math
+import os, httpx, time, uuid, re, math, unicodedata
 from html import unescape
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from functools import lru_cache
 
 RAG = os.getenv("RAG_PROXY_URL", "http://rag-proxy:8080")
 OPENAI = os.getenv("OPENAI_URL", "http://172.16.10.168:9993/v1")
@@ -42,10 +43,54 @@ SYNONYMS = {
     "상가정보": ["상권정보", "상권 분석", "상권", "상업용 부동산 정보", "상가 매물"]
 }
 
+ALIASES = {
+    "NIA": ["NIA", "한국지능정보사회진흥원", "지능정보사회진흥원", "국가정보화진흥원"]
+}
+
 _STOPWORDS = set("""
 은 는 이 가 을 를 에 의 와 과 도 로 으로 에서 에게 그리고 그러나 그래서
 무엇 뭐야 뭐지 설명 해줘 대한 대해 정리 개요 소개 자세히
 """.split())
+
+def _spaces_from_env():
+    raw = os.getenv("CONFLUENCE_SPACE", "").strip()
+    if not raw:
+        return None
+    return [s.strip().upper() for s in raw.split(",") if s.strip()] or None
+
+SPACES = _spaces_from_env()
+
+# [ADD] 질문에 가장 잘 맞는 space를 자동 선택 (없으면 None 반환 → 제한 없이 진행)
+async def _auto_pick_spaces(q: str, client: httpx.AsyncClient) -> list[str] | None:
+    if not SPACES or len(SPACES) <= 1:
+        return SPACES  # 단일 스페이스거나 미설정이면 굳이 선택 안 함
+
+    scores = []
+    try:
+        # 한 번만 탐색해도 충분하니 첫 변형 쿼리로 간단 프리뷰
+        probe_q = q.strip()
+        for sp in SPACES:
+            # 프리뷰: LLM 생성 없이 검색만(k=3) 해서 '적합도' 점수 계산
+            r = await client.post(f"{RAG}/query", json={
+                "q": probe_q, "k": 3, "sticky": False, "spaces": [sp]
+            })
+            j = r.json()
+            # 컨텍스트 텍스트를 조금 모아서 질문과의 토큰 겹침(relevance_ratio)로 스코어링
+            ctx = "\n\n".join(extract_texts(j.get("items") or j.get("contexts") or []))[:1500]
+            score = float(j.get("hits") or 0) + relevance_ratio(probe_q, ctx)  # 간단 복합 점수
+            scores.append((score, sp))
+    except Exception as e:
+        print(f"[router] space probe failed: {e}")
+
+    # 최고 점수만 채택 (0 이하면 제한 하지 않음)
+    if not scores:
+        return None
+    scores.sort(key=lambda x: x[0], reverse=True)
+    top = scores[0]
+    # 동률이거나 근소 차이면 제한하지 않고(None) 진행 → 오탐 방지
+    if top[0] > 0 and (len(scores) == 1 or top[0] >= scores[1][0] + 0.2):
+        return [top[1]]
+    return None
 
 def _tokens(s: str) -> list[str]:
     return [t.lower() for t in _KO_EN_TOKEN.findall(s or "")]
@@ -60,6 +105,11 @@ def relevance_ratio(q: str, ctx: str, ctx_limit: int = 2000) -> float:
 
 # 환경변수로 문턱값 조정 가능 (기본 0.2)
 REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.08"))
+
+def _normalize_query(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def is_relevant(q: str, ctx: str) -> bool:
     return relevance_ratio(q, ctx) >= REL_THRESH
@@ -332,10 +382,19 @@ async def chat(req: ChatReq):
         pool=120.0     # 커넥션 풀 대기
     )
     async with httpx.AsyncClient(timeout=timeout) as client:
+        spaces_hint = await _auto_pick_spaces(orig_user_msg, client)
+
+        # ====== 2-A) QA 경로 시도 ======
+        qa_json = None
+        qa_items = []
+        qa_urls = []
+
         for v in variants:
             try:
-                # sticky 비활성화 플래그 추가
-                qa = await client.post(f"{RAG}/qa", json={"q": v, "k": 5, "sticky": False})
+                # [CHANGE] spaces 전달 (있을 때만)
+                payload = {"q": v, "k": 5, "sticky": False}
+                if spaces_hint: payload["spaces"] = spaces_hint
+                qa = await client.post(f"{RAG}/qa", json=payload)
                 j = qa.json()
             except (httpx.RequestError, ValueError) as e:
                 print(f"[router] /qa error for '{v}': {e}")
@@ -393,16 +452,17 @@ async def chat(req: ChatReq):
             "choices": [{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
         }
 
-    # 2-B) QA 실패 → QUERY
-    best_ctx_good = ""; best_ctx_any = ""
-    best_urls_good: List[str] = []     # [추가]
-    best_urls_any: List[str] = []      # [추가]
-
+    # ====== 2-B) QA 실패 → QUERY 경로 ======
     async with httpx.AsyncClient(timeout=timeout) as client:
+        best_ctx_good = ""; best_ctx_any = ""
+        best_urls_good = []; best_urls_any = []
+
         for v in variants:
             try:
-                # [CHANGE] sticky 비활성화 플래그 추가
-                qres = await client.post(f"{RAG}/query", json={"q": v, "k": 5, "sticky": False})
+                # [CHANGE] spaces 전달 (있을 때만)
+                payload = {"q": v, "k": 5, "sticky": False}
+                if spaces_hint: payload["spaces"] = spaces_hint
+                qres = await client.post(f"{RAG}/query", json=payload)
                 qj = qres.json()
             except (httpx.RequestError, ValueError) as e:
                 print(f"[router] /query error for '{v}': {e}")

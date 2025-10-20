@@ -40,6 +40,12 @@ SINGLE_SOURCE_COALESCE = bool(getattr(settings, "SINGLE_SOURCE_COALESCE", True))
 COALESCE_THRESHOLD = float(getattr(settings, "COALESCE_THRESHOLD", 0.55))
 _COALESCE_TRIGGER = re.compile(r"(최근|이슈|목록|정리|요약|top\s*\d+|\d+\s*가지)", re.I)
 
+SPACE_FILTER_MODE = getattr(settings, "SPACE_FILTER_MODE", "hard")
+SPACE_HINT_BONUS = float(getattr(settings, "SPACE_HINT_BONUS", 0.25))
+TITLE_BONUS      = float(getattr(settings, "TITLE_BONUS", 0.20))
+ENABLE_SPARSE    = bool(getattr(settings, "ENABLE_SPARSE", False))
+SPARSE_LIMIT     = int(getattr(settings, "SPARSE_LIMIT", 150))
+
 TZ_NAME = getattr(settings, "TZ_NAME", "Asia/Seoul")
 
 LOCAL_FIRST = bool(getattr(settings, "LOCAL_FIRST", True))
@@ -89,6 +95,28 @@ _RETRIEVAL_HINT_RE = re.compile(r"(최근|이슈|목록|리스트|정리|요약|
 _DATE_TIME_NEED_RE = re.compile(r"(날짜|요일|시간|시각|몇\s*시|몇\s*분|몇\s*월|몇\s*일|며칠)", re.I)
 
 _DOMAIN_HINT_RE = re.compile(r"(회의|마감|일정|보고서|티켓|이슈|장애|배포|회의록|결재|승인|요청|문서)", re.I)
+
+# 맨 위 import들 아래 어딘가
+def _spaces_from_env():
+    raw = os.getenv("CONFLUENCE_SPACE", "").strip()
+    if not raw:
+        return None
+    return [s.strip().upper() for s in raw.split(",") if s.strip()] or None
+
+ENV_SPACES = _spaces_from_env()
+
+def _resolve_allowed_spaces(client_spaces: list | None) -> list | None:
+    """
+    ENV_SPACES가 있으면 그게 '최대 허용치'.
+    클라이언트가 spaces를 보냈으면 교집합만 허용.
+    둘 다 없으면 제한 없음(None).
+    """
+    cs = [s.strip().upper() for s in (client_spaces or []) if isinstance(s, str) and s.strip()]
+    if ENV_SPACES and cs:
+        inter = [s for s in cs if s in ENV_SPACES]
+        return inter or ENV_SPACES
+    return ENV_SPACES or (cs or None)
+
 
 def _anchor_tokens_from_query(q: str) -> list[str]:
     # _tokenize_query는 파일에 이미 정의되어 있음
@@ -321,7 +349,7 @@ def _keyword_overlap_score(q_tokens: List[str], text: str, title: str = "") -> f
     if title:
         title_hits = sum(1 for t in q_tokens if t in title)
         if title_hits:
-            base += settings.TITLE_BONUS         # 제목 매치 보너스 (가산점)
+            base += TITLE_BONUS         # 제목 매치 보너스 (가산점)
     return float(base)
 
 def _sparse_keyword_hits(q: str, limit: int = 150, space: Optional[str] = None) -> List[dict]:
@@ -347,7 +375,7 @@ def _sparse_keyword_hits(q: str, limit: int = 150, space: Optional[str] = None) 
         src = str(md.get("source", ""))
 
         # (옵션) space 하드필터
-        if space and settings.SPACE_FILTER_MODE.lower() == "hard":
+        if space and SPACE_FILTER_MODE.lower() == "hard":
             s = (md.get("space") or "").strip()
             if not s or s.lower() != space.lower():
                 continue
@@ -409,13 +437,13 @@ def normalize_query(q: str) -> str:
 
 def _apply_space_hint(hits: List[dict], space: Optional[str]):
     """SPACE_FILTER_MODE == soft 일 때, space 일치 항목에 가산점"""
-    if not space or settings.SPACE_FILTER_MODE.lower() != "soft":
+    if not space or SPACE_FILTER_MODE.lower() != "soft":
         return
     sp = space.lower()
     for h in hits:
         s = ((h.get("metadata") or {}).get("space") or "").lower()
         if s and s == sp:
-            h["score"] = float(h.get("score") or 0.0) + settings.SPACE_HINT_BONUS
+            h["score"] = float(h.get("score") or 0.0) + SPACE_HINT_BONUS
 
 def _strip_josa(t: str) -> str:
     return _JOSA_RE.sub("", t)
@@ -682,6 +710,7 @@ class AskPayload(BaseModel):
     pageId: str | None = Field(None, description="Confluence pageId 힌트/잠금")
     messages: list[dict] | None = Field(None, description="대화형 호환 필드")
     sticky: bool | None = Field(None, description="이 요청에서 sticky 소스를 사용하지 않음")
+    spaces: list[str] | None = Field(None, description="허용할 space 리스트(복수)")
 
     def to_query_dict(self) -> dict:
         d = self.model_dump(exclude_none=True)
@@ -1015,7 +1044,7 @@ def index_list(
         text = doc.page_content or ""
         title = str(doc.metadata.get("title",""))
         
-        if source and src != source:
+        if source and _norm_source(src) != _norm_source(source):
             continue
         if kind and knd != kind:
             continue
@@ -1227,6 +1256,12 @@ async def query(payload: dict = Body(...)):
 
     # [ADD] space 힌트 (Confluence space 키)
     space = (payload or {}).get("space") or (payload or {}).get("spaceKey")
+    allowed_spaces = _resolve_allowed_spaces((payload or {}).get("spaces"))
+
+    # 단일 space 힌트가 없다면, ENV나 클라의 allowed_spaces가 1개일 때 그걸 단일 힌트로 활용
+    if not space and allowed_spaces and len(allowed_spaces) == 1:
+        space = allowed_spaces[0]
+
     if isinstance(space, str):
         space = space.strip() or None
 
@@ -1266,8 +1301,8 @@ async def query(payload: dict = Body(...)):
         base_docs = []
 
     # [ADD] --- 경량 스파스(키워드) 후보 융합 ---
-    if settings.ENABLE_SPARSE:
-        sparse_hits = _sparse_keyword_hits(q, limit=settings.SPARSE_LIMIT, space=space)
+    if ENABLE_SPARSE:
+        sparse_hits = _sparse_keyword_hits(q, limit=SPARSE_LIMIT, space=space)
         _apply_space_hint(sparse_hits, space)
         _apply_page_hint(sparse_hits, page_id)   # ← sparse 후보들에 pageId 가산점
         pool_hits.extend(sparse_hits)
@@ -1323,7 +1358,23 @@ async def query(payload: dict = Body(...)):
             md = h.get("metadata") or {}
             title = (md.get("title") or "")
             if title and any(t in title for t in q_tokens):
-                h["score"] = float(h.get("score") or 0.0) + (settings.TITLE_BONUS * 0.5)
+                h["score"] = float(h.get("score") or 0.0) + (TITLE_BONUS * 0.5)
+
+    # --- space 제한 적용 ---
+    if allowed_spaces:
+        mode = SPACE_FILTER_MODE.lower()
+        allowed_set = {s.lower() for s in allowed_spaces}
+
+        if mode == "hard":
+            # 허용된 space만 남김
+            pool_hits = [
+                h for h in pool_hits
+                if ((h.get("metadata") or {}).get("space","") or "").lower() in allowed_set
+            ]
+        else:
+            # soft: 허용된 space에 가산점 부여
+            for sp in allowed_spaces:
+                _apply_space_hint(pool_hits, sp)
 
     # === 3-D) 의도 파악
     intent = parse_query_intent(q)
@@ -1501,46 +1552,31 @@ async def query(payload: dict = Body(...)):
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
 
             mcp_results = []
+            spaces_for_mcp = allowed_spaces or ([space] if space else [None])
+            for sp_hint in spaces_for_mcp:
+                part = await mcp_search(q,  limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
+                mcp_results.extend(part or [])
+                if mcp_results:  # 첫 space에서라도 결과가 나오면 멈춰도 OK (원하면 이어서 더 합쳐도 됨)
+                    break
 
-            if forced_page_id:
-                try:
-                    async with mcp_lock:
-                        mcp_results = await mcp_search(
-                            f"id={forced_page_id}",  # ← page 단건 조회 시도
-                            limit=1,
-                            timeout=20,
-                            space=space,
-                            langs=SEARCH_LANGS
-                        )
-                except Exception:
-                    mcp_results = []
-
-            # >>> [ADD] 1순위가 실패하면, 기존 쿼리로 일반 검색
-            if not mcp_results:
-                async with mcp_lock:
-                    mcp_results = await mcp_search(
-                        q,
-                        limit=5,
-                        timeout=20,
-                        space=space,
-                        langs=SEARCH_LANGS
-                    )
-
-            # 2차: 키워드 정제
             if not mcp_results:
                 q2 = _to_mcp_keywords(q)
-                if q2 != q:
-                    async with mcp_lock:
-                        mcp_results = await mcp_search(q2, limit=5, timeout=20, space=space, langs=SEARCH_LANGS)
+                for sp_hint in spaces_for_mcp:
+                    part = await mcp_search(q2, limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
+                    mcp_results.extend(part or [])
+                    if mcp_results:
+                        break
 
-            # 3차: 가장 긴 한글 토큰
             if not mcp_results:
                 ko = re.findall(r"[가-힣]{2,}", q)
                 if ko:
-                    best = sorted(ko, key=len, reverse=True)[0]
-                    best = _strip_josa(best)
-                    async with mcp_lock:
-                        mcp_results = await mcp_search(best, limit=5, timeout=20, space=space, langs=SEARCH_LANGS)
+                    best = _strip_josa(sorted(ko, key=len, reverse=True)[0])
+                    for sp_hint in spaces_for_mcp:
+                        part = await mcp_search(best, limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
+                        mcp_results.extend(part or [])
+                        if mcp_results:
+                            break
+
 
             # >>> [ADD] pageId가 강제되었으면 결과에서 해당 pageId만 남긴다.
             if forced_page_id and mcp_results:
@@ -1855,14 +1891,15 @@ async def v1_chat(payload: dict = Body(...)):
     space   = payload.get("space") or payload.get("spaceKey")
     source  = payload.get("source")
     sources = payload.get("sources")
+    spaces = payload.get("spaces")
     r = await query({
         "question": q,
         "pageId": page_id,
         "space": space,
         "source": source,
         "sources": sources,
+        "spaces": spaces,  # ← 추가
         "sticky": False,  # 대화형 라우팅은 매질의 전환이 잦으므로 sticky 비활성
-
     })
 
     # 2) direct_answer가 있으면 그대로 사용
