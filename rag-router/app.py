@@ -55,6 +55,12 @@ ROUTER_READ_TIMEOUT    = float(os.getenv("ROUTER_READ_TIMEOUT", "180"))  # <- 12
 ROUTER_WRITE_TIMEOUT   = float(os.getenv("ROUTER_WRITE_TIMEOUT", "60"))
 ROUTER_POOL_TIMEOUT    = float(os.getenv("ROUTER_POOL_TIMEOUT", "180"))
 
+_JOSA_RE = re.compile(r'(에서|에게|으로써|으로서|으로부터|로부터|부터|까지|만큼|보다|처럼|부터|까지|은|는|이|가|을|를|에|에서|에게|와|과|도|로|으로|의)$')
+
+def _strip_josa(tok: str) -> str:
+    return _JOSA_RE.sub('', tok)
+
+
 def _httpx_timeout():
     import httpx
     return httpx.Timeout(
@@ -84,9 +90,8 @@ async def _auto_pick_spaces(q: str, client: httpx.AsyncClient) -> list[str] | No
         probe_q = q.strip()
         for sp in SPACES:
             # 프리뷰: LLM 생성 없이 검색만(k=3) 해서 '적합도' 점수 계산
-            r = await client.post(f"{RAG}/query", json={
-                "q": probe_q, "k": 3, "sticky": False, "spaces": [sp]
-            })
+            r = await client.post(f"{RAG}/query", json={ "q": probe_q, "k": 3, "sticky": "" , "spaces": [sp] })
+
             j = r.json()
             # 컨텍스트 텍스트를 조금 모아서 질문과의 토큰 겹침(relevance_ratio)로 스코어링
             ctx = "\n\n".join(extract_texts(j.get("items") or j.get("contexts") or []))[:1500]
@@ -106,7 +111,13 @@ async def _auto_pick_spaces(q: str, client: httpx.AsyncClient) -> list[str] | No
     return None
 
 def _tokens(s: str) -> list[str]:
-    return [t.lower() for t in _KO_EN_TOKEN.findall(s or "")]
+    toks = []
+    for t in _KO_EN_TOKEN.findall(s or ""):
+        t2 = _strip_josa(t).lower()
+        if t2:
+            toks.append(t2)
+    return toks
+
 
 def relevance_ratio(q: str, ctx: str, ctx_limit: int = 2000) -> float:
     qk = [t for t in _tokens(q) if t not in _STOPWORDS]
@@ -289,6 +300,15 @@ def build_system_with_context(ctx_text: str, mode: str) -> str:
         "[컨텍스트 끝]\n"
     )
 
+def _limit_urls(urls: List[str] | None, top_n: int = ROUTER_SOURCES_MAX) -> List[str]:
+    out, seen = [], set()
+    for u in urls or []:
+        nu = _normalize_url(u)
+        if nu and nu not in seen:
+            seen.add(nu); out.append(nu)
+        if len(out) >= top_n:
+            break
+    return out
 
 
 def extract_texts(items: List[dict]) -> List[str]:
@@ -433,7 +453,7 @@ async def chat(req: ChatReq):
         for v in variants:
             try:
                 # [CHANGE] spaces 전달 (있을 때만)
-                payload = {"q": v, "k": 5, "sticky": False}
+                payload = {"q": v, "k": 5, "sticky": ""}
                 if spaces_hint: payload["spaces"] = spaces_hint
                 qa = await client.post(f"{RAG}/qa", json=payload)
                 j = qa.json()
@@ -443,7 +463,8 @@ async def chat(req: ChatReq):
             if (j.get("hits") or 0) > 0:
                 qa_json = j
                 qa_items = j.get("items", [])
-                qa_urls = (j.get("source_urls") or _collect_urls_from_items(qa_items))
+                qa_urls = (_limit_urls(j.get("source_urls"))
+                    if j.get("source_urls") else _collect_urls_from_items(qa_items, top_n=ROUTER_SOURCES_MAX))
                 break
 
     # 2-A) QA 성공
@@ -495,13 +516,14 @@ async def chat(req: ChatReq):
 
     # ====== 2-B) QA 실패 → QUERY 경로 ======
     async with httpx.AsyncClient(timeout=timeout) as client:
-        best_ctx_good = ""; best_ctx_any = ""
-        best_urls_good = []; best_urls_any = []
+        best_ctx_good=""; best_ctx_any=""
+        best_urls_good=[]; best_urls_any=[]
+        used_q_good=None; used_q_any=None
 
         for v in variants:
             try:
                 # [CHANGE] spaces 전달 (있을 때만)
-                payload = {"q": v, "k": 5, "sticky": False}
+                payload = {"q": v, "k": 5, "sticky": ""}
                 if spaces_hint: payload["spaces"] = spaces_hint
                 qres = await client.post(f"{RAG}/query", json=payload)
                 qj = qres.json()
@@ -511,7 +533,8 @@ async def chat(req: ChatReq):
 
             # [추가] items/contexts 등에서 텍스트와 URL 모두 수집
             items = (qj.get("items") or qj.get("contexts") or [])
-            urls = (qj.get("source_urls") or _collect_urls_from_items(items))
+            urls = (_limit_urls(qj.get("source_urls"))
+                if qj.get("source_urls") else _collect_urls_from_items(items, top_n=ROUTER_SOURCES_MAX))
 
             ctx_list = (
                 qj.get("context_texts")
@@ -522,18 +545,23 @@ async def chat(req: ChatReq):
 
             if len(ctx) > len(best_ctx_any):
                 best_ctx_any = ctx
-                best_urls_any = urls[:]   # [추가]
+                best_urls_any = urls[:]
+                used_q_any = v
             if is_good_context_for_qa(ctx) and len(ctx) > len(best_ctx_good):
                 best_ctx_good = ctx
-                best_urls_good = urls[:]  # [추가]
+                best_urls_good = urls[:]
+                used_q_good = v
 
-    best_ctx = best_ctx_good or best_ctx_any
-    src_urls = best_urls_good or best_urls_any  # [추가]
+        best_ctx = best_ctx_good or best_ctx_any
+        src_urls = best_urls_good or best_urls_any
+        used_q_for_relevance = used_q_good if best_ctx_good else used_q_any
 
-    # [CHANGE] 길이(80자) 조건 삭제 → 관련도만
-    if best_ctx and not is_relevant(orig_user_msg, best_ctx):
-        best_ctx = ""
-        src_urls = []
+        # 게이트
+        if best_ctx and not (is_good_context_for_qa(best_ctx) or
+                            is_relevant(used_q_for_relevance or orig_user_msg, best_ctx)):
+            best_ctx = ""
+            src_urls = []
+
 
     if not best_ctx:
         # 일반 LLM 폴백
