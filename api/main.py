@@ -1781,7 +1781,7 @@ async def query(payload: dict = Body(...)):
                     async with index_lock:
                         added = _upsert_docs_no_dup(up_docs)
                         vectorstore.save_local(INDEX_DIR)
-                        _reload_retriever
+                        _reload_retriever()
 
 
     base_notes = {"missing_article": missing_article, "article_no": article_no}
