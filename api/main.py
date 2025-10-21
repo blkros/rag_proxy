@@ -476,6 +476,7 @@ CANON_MAP = {
     r"국가\s*정보화\s*진흥원": "한국지능정보사회진흥원",  # 옛 명칭
     r"지역\s*정보": "지역정보",
     r"아파트\s*누리": "아파트누리",
+    r"개발\s*서버\s*정보": "개발서버정보",
 }
 
 def _apply_canon_map(text: str) -> str:
@@ -1630,9 +1631,14 @@ async def query(payload: dict = Body(...)):
             NEED_FALLBACK = True
             reasons.append("pid_miss")
 
-    if "anchor_miss" in reasons and reasons == ["anchor_miss"] and (len(items) > 0 or len(pool_hits) > 0):
-        NEED_FALLBACK = False
-        log.info("MCP skipped: anchor_miss only, but candidates exist (items=%d, pool=%d)", len(items), len(pool_hits))
+        # 기존 블록 교체
+        if "anchor_miss" in reasons and reasons == ["anchor_miss"]:
+            NEED_FALLBACK = not local_ok
+            if not NEED_FALLBACK:
+                log.info("MCP skipped: anchor_miss only, but local hits exist")
+            else:
+                log.info("MCP allowed: anchor_miss only and no local hits")
+
 
 
     # [PATCH] '컨텍스트가 실제로 부족한' 이유일 때만 MCP 가동
