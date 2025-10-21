@@ -46,6 +46,10 @@ TITLE_BONUS      = float(getattr(settings, "TITLE_BONUS", 0.20))
 ENABLE_SPARSE    = bool(getattr(settings, "ENABLE_SPARSE", False))
 SPARSE_LIMIT     = int(getattr(settings, "SPARSE_LIMIT", 150))
 
+MAX_FALLBACK_SECS = int(os.getenv("MAX_FALLBACK_SECS", "7"))   # 폴백 전체 상한(초)
+MCP_TIMEOUT       = int(os.getenv("MCP_TIMEOUT", "5"))         # 각 MCP 콜 타임아웃(초)
+MCP_MAX_TASKS     = int(os.getenv("MCP_MAX_TASKS", "4"))       # 동시 질의 최대 개수
+
 TZ_NAME = getattr(settings, "TZ_NAME", "Asia/Seoul")
 
 LOCAL_FIRST = bool(getattr(settings, "LOCAL_FIRST", True))
@@ -82,6 +86,8 @@ _GENERIC = set("보고 보고서 리포트 정보 정리 페이지 자료 문서
 _PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
 
 
+
+
 # 1) '오늘/지금/현재' 같은 지시어가 필수
 _DEICTIC_RE = re.compile(r"(오늘|지금|현재)", re.I)
 
@@ -96,7 +102,17 @@ _DATE_TIME_NEED_RE = re.compile(r"(날짜|요일|시간|시각|몇\s*시|몇\s*�
 
 _DOMAIN_HINT_RE = re.compile(r"(회의|마감|일정|보고서|티켓|이슈|장애|배포|회의록|결재|승인|요청|문서)", re.I)
 
-# 맨 위 import들 아래 어딘가
+_COMPANY_HINT_RE = re.compile(r"(NURIFLEX|NURI|NIA|니아|컨플루언스|배포|현장점검|DR|CBL|설계|회의록|이슈)", re.I)
+
+def _should_use_mcp(q: str, allowed_spaces: list | None, space: str | None) -> bool:
+    """
+    space가 지정됐거나 허용공간이 있으면 사용.
+    그게 아니라면 회사/업무 키워드가 있을 때만 MCP 허용.
+    """
+    if allowed_spaces or space:
+        return True
+    return bool(_COMPANY_HINT_RE.search(q or ""))
+
 def _spaces_from_env():
     raw = os.getenv("CONFLUENCE_SPACE", "").strip()
     if not raw:
@@ -155,6 +171,59 @@ def _mcp_results_to_items(mcp_results: list[dict], k: int) -> tuple[list[dict], 
             up_docs.append(Document(page_content=c,
                                     metadata={"source": src, "title": title, "space": space, "kind": "chunk", "page": pid or None}))
     return items, contexts, up_docs
+
+
+# >>> [ADD] 빠른 MCP 폴백: 여러 후보 질의를 '동시에' 던지고 '첫 성공'만 사용
+async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_mcp: list[Optional[str]]) -> list[dict]:
+    import asyncio, time
+    start = time.monotonic()
+
+    # 1) 질의 후보 구성 (id → 원문 → 키워드화 → 한글 최장토큰)
+    cand: list[str] = []
+    if forced_page_id:
+        cand.append(f"id={forced_page_id}")
+    cand.append(q)
+    q2 = _to_mcp_keywords(q)
+    if q2 and q2 != q:
+        cand.append(q2)
+    ko = re.findall(r"[가-힣]{2,}", q)
+    if ko:
+        cand.append(_strip_josa(sorted(ko, key=len, reverse=True)[0]))
+
+    # 중복 제거 + 상한
+    seen = set()
+    qlist = [x for x in cand if x and not (x in seen or seen.add(x))][:MCP_MAX_TASKS]
+
+    spaces = spaces_for_mcp or [None]
+    tasks: list[asyncio.Task] = []
+    for sp in spaces:
+        for qq in qlist:
+            tasks.append(asyncio.create_task(
+                mcp_search(qq, limit=5, timeout=MCP_TIMEOUT, space=sp, langs=SEARCH_LANGS)
+            ))
+
+    # 2) 벽시계 제한 내에서 '첫 성공'만 받기
+    deadline = start + MAX_FALLBACK_SECS
+    while tasks and time.monotonic() < deadline:
+        done, pending = await asyncio.wait(tasks, timeout=deadline - time.monotonic(),
+                                           return_when=asyncio.FIRST_COMPLETED)
+        if not done:
+            break
+        for t in done:
+            try:
+                part = t.result() or []
+                if part:
+                    # 나머지 취소
+                    for p in pending: p.cancel()
+                    return part
+            except Exception:
+                pass
+        tasks = list(pending)
+
+    # 타임아웃/무응답 → 모두 취소
+    for t in tasks:
+        t.cancel()
+    return []
 
 
 def _anchor_tokens_from_query(q: str) -> list[str]:
@@ -1650,81 +1719,50 @@ async def query(payload: dict = Body(...)):
     allow_fallback = any(r in reasons for r in allow_reasons) or \
                     ("anchor_miss" in reasons and not local_ok)
 
+    # >>> [ADD] 회사/업무 맥락이 아니면 MCP 폴백 자체를 막음
+    if NEED_FALLBACK and not _should_use_mcp(q, allowed_spaces, space):
+        NEED_FALLBACK = False
+        log.info("MCP skipped by domain gate for %r", q)
 
     if NEED_FALLBACK and not DISABLE_INTERNAL_MCP and allow_fallback:
+        fallback_attempted = True
+        mcp_results = []  # 예외가 나도 안전하게 초기화
+
         try:
-            fallback_attempted = True
-            log.info("MCP fallback: calling Confluence MCP for query=%r", q)
-
-            mcp_results = []
+            log.info("MCP fallback (fast): q=%r", q)
             spaces_for_mcp = allowed_spaces or ([space] if space else [None])
+            mcp_results = await _mcp_search_fast(
+                q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
+            )
+        except Exception as e:
+            log.error("MCP fallback fast failed: %s", "".join(traceback.format_exception(e)))
 
-            # [FIX] pageId가 지정되면 먼저 id로 정확히 당겨오기
-            if forced_page_id:
-                for sp_hint in spaces_for_mcp:
-                    part = await mcp_search(f"id={forced_page_id}", limit=1, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
-                    mcp_results.extend(part or [])
-                    if mcp_results:
-                        break
+        # pageId 강제 필터
+        if forced_page_id and mcp_results:
+            mcp_results = [
+                r for r in mcp_results
+                if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id
+            ]
 
-            # id 조회 실패 시에만 일반 질의로 검색
-            if not mcp_results:
-                for sp_hint in spaces_for_mcp:
-                    part = await mcp_search(q,  limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
-                    mcp_results.extend(part or [])
-                    if mcp_results:
-                        break
+        # sticky 처리
+        if mcp_results and STICKY_AFTER_MCP:
+            first = mcp_results[0]
+            target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
+            if target:
+                _set_sticky(target)
 
-            if not mcp_results:
-                q2 = _to_mcp_keywords(q)
-                for sp_hint in spaces_for_mcp:
-                    part = await mcp_search(q2, limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
-                    mcp_results.extend(part or [])
-                    if mcp_results:
-                        break
+        # 화면 items/contexts 생성 + 업서트
+        if mcp_results:
+            items, contexts, up_docs = _mcp_results_to_items(
+                mcp_results, k=int(k) if isinstance(k, int) else 5
+            )
+            added = 0
+            if up_docs:
+                async with index_lock:
+                    added = _upsert_docs_no_dup(up_docs)
+                    vectorstore.save_local(INDEX_DIR)
+                    _reload_retriever()
 
-            if not mcp_results:
-                ko = re.findall(r"[가-힣]{2,}", q)
-                if ko:
-                    best = _strip_josa(sorted(ko, key=len, reverse=True)[0])
-                    for sp_hint in spaces_for_mcp:
-                        part = await mcp_search(best, limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
-                        mcp_results.extend(part or [])
-                        if mcp_results:
-                            break
-
-            if not mcp_results and allowed_spaces:
-                # 최후 시도: space 제한 없이 전역 검색
-                try:
-                    part = await mcp_search(q, limit=5, timeout=20, space=None, langs=SEARCH_LANGS)
-                    mcp_results.extend(part or [])
-                except Exception:
-                    pass
-
-            # q2(키워드 축약)·best 토큰 검색에도 동일 로직 반복
-            if not mcp_results and allowed_spaces:
-                try:
-                    q2 = _to_mcp_keywords(q)
-                    part = await mcp_search(q2, limit=5, timeout=20, space=None, langs=SEARCH_LANGS)
-                    mcp_results.extend(part or [])
-                except Exception:
-                    pass
-
-
-            # [FIX] pageId가 강제된 경우, 해당 pid만 남김(안전장치)
-            if forced_page_id and mcp_results:
-                mcp_results = [r for r in mcp_results
-                            if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id]
-
-
-            if mcp_results and STICKY_AFTER_MCP:
-                first = mcp_results[0]
-                target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
-                if target:
-                    _set_sticky(target)
-
-            if mcp_results:
-                log.info("MCP results top: %s", [(r.get("space"), r.get("title"), r.get("url")) for r in mcp_results[:5]])
 
 
             # === 결과 정규화/필터링 → items/contexts 로 변환 ===
@@ -1813,8 +1851,8 @@ async def query(payload: dict = Body(...)):
                 except Exception:
                     pass
 
-        except Exception as e:
-            log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
+        # except Exception as e:
+        #     log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
 
     # 장/조 질의면 필터 스킵
@@ -1836,34 +1874,22 @@ async def query(payload: dict = Body(...)):
 
 
         
-        # 필터로 비어버리면 지금이라도 MCP 폴백 시도
+        # >>> [REPLACE] 비었을 때의 보조 폴백도 fast 버전으로 통일
         if not items and not DISABLE_INTERNAL_MCP:
             fallback_attempted = True
-            mcp_results = []
             spaces_for_mcp = allowed_spaces or ([space] if space else [None])
-            # 4-1) pageId가 지정되었으면 id 먼저 정확히 당겨온다
-            if forced_page_id:
-                for sp_hint in spaces_for_mcp:
-                    part = await mcp_search(f"id={forced_page_id}", limit=1, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
-                    mcp_results.extend(part or [])
-                    if mcp_results:
-                        break
+            mcp_results = await _mcp_search_fast(
+                q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
+            )
 
-            # 4-2) 그래도 없으면 기존처럼 질의어/키워드로 검색
-            if not mcp_results:
-                for sp_hint in spaces_for_mcp:
-                    part = await mcp_search(q, limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
-                    mcp_results.extend(part or [])
-                    if mcp_results:
-                        break
-
-            # 결과를 실제 items/contexts로 만들어주기 + 인덱스 반영
             if forced_page_id and mcp_results:
                 mcp_results = [r for r in mcp_results
-                            if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id]
-                
+                            if _url_has_page_id(r.get("url"), forced_page_id)
+                            or str(r.get("id") or "") == forced_page_id]
+
             if mcp_results:
                 items, contexts, up_docs = _mcp_results_to_items(mcp_results, k=int(k) if isinstance(k, int) else 5)
+
                 added = 0
                 if up_docs:
                     async with index_lock:
@@ -1871,12 +1897,12 @@ async def query(payload: dict = Body(...)):
                         vectorstore.save_local(INDEX_DIR)
                         _reload_retriever()
 
-                # [옵션/권장] 여기서도 STICKY_AFTER_MCP 일관 적용
                 if STICKY_AFTER_MCP:
                     first = mcp_results[0]
                     target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
                     if target:
                         _set_sticky(target)
+
 
 
     base_notes = {"missing_article": missing_article, "article_no": article_no}
