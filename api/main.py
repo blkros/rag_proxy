@@ -117,6 +117,45 @@ def _resolve_allowed_spaces(client_spaces: list | None) -> list | None:
         return inter or ENV_SPACES
     return ENV_SPACES or (cs or None)
 
+def _mcp_results_to_items(mcp_results: list[dict], k: int) -> tuple[list[dict], list[dict], list[Document]]:
+    items, contexts, up_docs = [], [], []
+    for r in (mcp_results or [])[:k]:
+        title = (r.get("title") or "").strip()
+        body  = (r.get("body") or r.get("excerpt") or r.get("text") or "")
+        body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
+        if not (title or body.strip()):
+            continue
+
+        # pageId 보강
+        pid = (r.get("id") or "").strip()
+        if not pid:
+            m_pid = re.search(r"[?&]pageId=(\d+)", (r.get("url") or ""))
+            if m_pid: pid = m_pid.group(1)
+
+        src   = (r.get("url") or f"confluence:{pid}").strip()
+        space = (r.get("space") or "").strip()
+        text  = ((title + "\n\n") if title else "") + body
+
+        md = {
+            "source": src,
+            "url": src,
+            "kind": "confluence",
+            "page": pid or None,
+            "space": space,
+            "title": title,
+        }
+        items.append({"text": text, "metadata": md, "score": 0.5})
+        contexts.append({"text": text, "source": md["source"], "page": md["page"], "kind": md["kind"], "score": 0.5})
+
+        # 인덱스 업서트용
+        if title:
+            up_docs.append(Document(page_content=f"[TITLE] {title}",
+                                    metadata={"source": src, "title": title, "space": space, "kind": "title", "page": pid or None}))
+        for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
+            up_docs.append(Document(page_content=c,
+                                    metadata={"source": src, "title": title, "space": space, "kind": "chunk", "page": pid or None}))
+    return items, contexts, up_docs
+
 
 def _anchor_tokens_from_query(q: str) -> list[str]:
     # _tokenize_query는 파일에 이미 정의되어 있음
@@ -1710,15 +1749,15 @@ async def query(payload: dict = Body(...)):
             for h in items
         )
         core_final = [t for t in _query_tokens(q) if not ACRONYM_RE.match(t)]
-        if core_final:
-            blob_norm_final = _norm_kr(ctx_all_final + " " + titles_meta_final)
-            if not any(_norm_kr(t) in blob_norm_final for t in core_final):
-                items, contexts = [], []
+        blob_norm_final = _norm_kr(ctx_all_final + " " + titles_meta_final)
+        if core_final and not any(_norm_kr(t) in blob_norm_final for t in core_final):
+            items, contexts = [], []
+
         if items:
             anchors = _anchor_tokens_from_query(q) + re.findall(r"[A-Z]{2,5}", q)
-            blob_norm = _norm_kr(ctx_all_final + " " + titles_meta_final)
-            if anchors and not any(_norm_kr(a) in blob_norm for a in anchors):
+            if anchors and not any(_norm_kr(a) in blob_norm_final for a in anchors):
                 items, contexts = [], []
+
 
         
         # 필터로 비어버리면 지금이라도 MCP 폴백 시도
@@ -1733,6 +1772,17 @@ async def query(payload: dict = Body(...)):
                 async with mcp_lock:
                     mcp_results = await mcp_search(q, limit=5, timeout=20,
                                                 space=space, langs=SEARCH_LANGS)
+
+            # ▼▼▼ 여기가 핵심: 결과를 실제 items/contexts로 만들어주기 + 인덱스 반영
+            if mcp_results:
+                items, contexts, up_docs = _mcp_results_to_items(mcp_results, k=int(k) if isinstance(k, int) else 5)
+                added = 0
+                if up_docs:
+                    async with index_lock:
+                        added = _upsert_docs_no_dup(up_docs)
+                        vectorstore.save_local(INDEX_DIR)
+                        _reload_retriever
+
 
     base_notes = {"missing_article": missing_article, "article_no": article_no}
     if fallback_attempted:
