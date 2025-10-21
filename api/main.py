@@ -1538,7 +1538,7 @@ async def query(payload: dict = Body(...)):
     if (chapter_no or article_no) and items:
         NEED_FALLBACK = False
 
-    # [DEBUG] 왜 폴백인지 이유를 로그로 남기면 추적 쉬움
+    # [PATCH] anchor_miss 단독이면 MCP 폴백 금지 (후보가 있는 경우)
     reasons = []
     if len(items) == 0: reasons.append("no_items")
     if len(pool_hits) < max(10, k*2): reasons.append("small_pool")
@@ -1547,7 +1547,14 @@ async def query(payload: dict = Body(...)):
     if (anchors and not anchor_hit): reasons.append("anchor_miss")
     log.info("fallback_check reasons=%s local_hits=%s", reasons, local_ok)
 
-    if NEED_FALLBACK and not DISABLE_INTERNAL_MCP:
+    # ▲ 위 reasons 계산 바로 아래에 추가
+    if "anchor_miss" in reasons and reasons == ["anchor_miss"] and (len(items) > 0 or len(pool_hits) > 0):
+        NEED_FALLBACK = False
+        log.info("MCP skipped: anchor_miss only, but candidates exist (items=%d, pool=%d)", len(items), len(pool_hits))
+
+
+    # [PATCH] '컨텍스트가 실제로 부족한' 이유일 때만 MCP 가동
+    if NEED_FALLBACK and not DISABLE_INTERNAL_MCP and any(r in reasons for r in ("no_items", "small_pool", "missing_article")):
         try:
             fallback_attempted = True
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)

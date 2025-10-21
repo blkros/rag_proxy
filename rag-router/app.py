@@ -16,7 +16,7 @@ TZ = os.getenv("ROUTER_TZ", "Asia/Seoul")
 _NUM_ONLY_LINE = re.compile(r'(?m)^\s*(\d{1,3}(?:,\d{3})*|\d+)\s*$')
 
 ROUTER_STRICT_RAG = (os.getenv("ROUTER_STRICT_RAG", "1").lower() not in ("0","false","no"))
-ANSWER_MIN_OVERLAP = float(os.getenv("ROUTER_ANSWER_MIN_OVERLAP", "0.2"))
+ANSWER_MIN_OVERLAP = float(os.getenv("ROUTER_ANSWER_MIN_OVERLAP", "0.12"))
 
 
 ROUTER_MAX_TOKENS = int(os.getenv("ROUTER_MAX_TOKENS", "2048"))
@@ -50,6 +50,11 @@ SYNONYMS = {
 ALIASES = {
     "NIA": ["NIA", "한국지능정보사회진흥원", "지능정보사회진흥원", "국가정보화진흥원"]
 }
+
+# [PATCH] 쿼리 변형 제어용 플래그/상수 추가
+USE_SYNONYMS = (os.getenv("ROUTER_USE_SYNONYMS", "0").lower() not in ("0","false","no"))
+VARIANTS_MAX = int(os.getenv("ROUTER_VARIANTS_MAX", "4"))
+
 
 _STOPWORDS = set("은 는 이 가 을 를 에 의 와 과 도 로 으로 에서 에게 그리고 그러나 그래서 무엇 뭐야 뭐지 설명 해줘 대한 대해 정리 개요 소개 자세히".split())
 
@@ -146,7 +151,7 @@ def relevance_ratio(q: str, ctx: str, ctx_limit: int = 2000) -> float:
 
 
 # 환경변수로 문턱값 조정 가능 (기본 0.2)
-REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.08"))
+REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.06"))
 
 
 def supported_by_context(answer: str, ctx: str) -> bool:
@@ -254,19 +259,31 @@ def _expand_synonyms(s: str) -> list[str]:
     if ss != s: out.append(ss)
     return list(dict.fromkeys(out))
 
-def generate_query_variants(q: str, limit: int = 12) -> List[str]:
+# [PATCH] 변형 개수 제한 + 동의어 확장 ON/OFF
+def generate_query_variants(q: str, limit: int | None = None) -> List[str]:
+    limit = limit or VARIANTS_MAX  # ← 기본 4
     s = normalize_query(q)
-    cand = []
-    def add(x): 
-        x = re.sub(r'\s+',' ',x).strip()
-        if x and x not in cand: cand.append(x)
-    add(s); add(re.sub(r'\s+','',s))
-    add(re.sub(r'([가-힣])([A-Za-z0-9])', r'\1 \2', s))
+    cand: list[str] = []
+
+    def add(x: str):
+        x = re.sub(r'\s+', ' ', x).strip()
+        if x and x not in cand:
+            cand.append(x)
+
+    # 필수 최소 변형만
+    add(s)
+    add(re.sub(r'\s+', '', s))  # 공백 제거
+    add(re.sub(r'([가-힣])([A-Za-z0-9])', r'\1 \2', s))  # KR-EN 경계
     add(re.sub(r'([A-Za-z0-9])([가-힣])', r'\1 \2', s))
-    for v in _expand_synonyms(s):
-        add(v); add(re.sub(r'\s+','',v))
-    # 기존 pairs 유지
+
+    # 동의어 확장은 환경변수로 끄고 켤 수 있게
+    if USE_SYNONYMS:
+        for v in _expand_synonyms(s):
+            add(v)
+            add(re.sub(r'\s+', '', v))
+
     return cand[:limit]
+
 
 def sanitize(text: str) -> str:
     if not text: return ""
@@ -557,21 +574,27 @@ async def chat(req: ChatReq):
         best_urls_good=[]; best_urls_any=[]
         used_q_good=None; used_q_any=None
 
+        # [PATCH] /qa 호출 페이로드에 spaces 전달
         for v in variants:
             try:
-                payload = {"q": v, "k": 5, "sticky": False}
-                if spaces_hint: payload["spaces"] = spaces_hint
-                qj1 = (await client.post(f"{RAG}/query", json=payload)).json()
+                payload1 = {"q": v, "k": 5, "sticky": False}
+                if spaces_hint:                     # ← 추가
+                    payload1["spaces"] = spaces_hint
+                j1 = (await client.post(f"{RAG}/qa", json=payload1)).json()
             except Exception:
-                qj1 = {}
+                j1 = {}
 
             try:
-                qj2 = (await client.post(f"{RAG}/query", json={"q": v, "k": 5, "sticky": True})).json()
+                payload2 = {"q": v, "k": 5, "sticky": True}
+                if spaces_hint:                     # ← 추가
+                    payload2["spaces"] = spaces_hint
+                j2 = (await client.post(f"{RAG}/qa", json=payload2)).json()
             except Exception:
-                qj2 = {}
+                j2 = {}
+
 
             # ★ 여기서 바로 평가/갱신 (바깥에 동일 코드 두지 말기)
-            for qj in (qj1, qj2):
+            for qj in (j1, j2):
                 items = (qj.get("items") or qj.get("contexts") or [])
                 urls  = (_limit_urls(qj.get("source_urls"))
                         if qj.get("source_urls") else _collect_urls_from_items(items, top_n=ROUTER_SOURCES_MAX))
