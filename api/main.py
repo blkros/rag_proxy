@@ -102,7 +102,10 @@ _DATE_TIME_NEED_RE = re.compile(r"(날짜|요일|시간|시각|몇\s*시|몇\s*�
 
 _DOMAIN_HINT_RE = re.compile(r"(회의|마감|일정|보고서|티켓|이슈|장애|배포|회의록|결재|승인|요청|문서)", re.I)
 
-_COMPANY_HINT_RE = re.compile(r"(NURIFLEX|NURI|NIA|니아|컨플루언스|배포|현장점검|DR|CBL|설계|회의록|이슈)", re.I)
+_COMPANY_HINT_RE = re.compile(
+    r"(NURIFLEX|NURI|니아|NIA|아파트\s*누리|아파트누리|컨플루언스|배포|현장점검|DR|CBL|설계|회의|회의록|마감|일정|이슈|요청|문서)",
+    re.I
+)
 
 def _should_use_mcp(q: str, allowed_spaces: list | None, space: str | None) -> bool:
     """
