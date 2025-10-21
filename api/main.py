@@ -1773,7 +1773,7 @@ async def query(payload: dict = Body(...)):
                     mcp_results = await mcp_search(q, limit=5, timeout=20,
                                                 space=space, langs=SEARCH_LANGS)
 
-            # ▼▼▼ 여기가 핵심: 결과를 실제 items/contexts로 만들어주기 + 인덱스 반영
+            # 결과를 실제 items/contexts로 만들어주기 + 인덱스 반영
             if mcp_results:
                 items, contexts, up_docs = _mcp_results_to_items(mcp_results, k=int(k) if isinstance(k, int) else 5)
                 added = 0
