@@ -33,6 +33,8 @@ from langchain_community.docstore.in_memory import InMemoryDocstore
 
 logging.basicConfig(level=logging.INFO)
 DISABLE_INTERNAL_MCP = (os.getenv("DISABLE_INTERNAL_MCP", "0").lower() in ("1","true","yes"))
+MCP_WRITEBACK = (os.getenv("MCP_WRITEBACK", "off").lower() in ("1","true","yes","on","persist"))
+MCP_WRITEBACK_TITLES_ONLY = (os.getenv("MCP_WRITEBACK_TITLES_ONLY","off").lower() in ("1","true","yes","on"))
 
 PAGE_FILTER_MODE = getattr(settings, "PAGE_FILTER_MODE", "soft")   # "soft"|"hard"|"off"
 PAGE_HINT_BONUS = float(getattr(settings, "PAGE_HINT_BONUS", 0.35))
@@ -107,14 +109,15 @@ _COMPANY_HINT_RE = re.compile(
     re.I
 )
 
-def _should_use_mcp(q: str, allowed_spaces: list | None, space: str | None) -> bool:
-    """
-    space가 지정됐거나 허용공간이 있으면 사용.
-    그게 아니라면 회사/업무 키워드가 있을 때만 MCP 허용.
-    """
-    if allowed_spaces or space:
-        return True
-    return bool(_COMPANY_HINT_RE.search(q or ""))
+def _should_use_mcp(q: str, client_spaces: list | None, space: str | None) -> bool:
+     """
+     MCP는 '사용자가 명시한 space(s)나 space'가 있거나,
+     질문에 회사/업무 키워드가 있을 때만 허용한다.
+     (ENV_SPACES는 최대 허용치일 뿐, 게이트 열기 신호가 아니다)
+     """
+     if space or (client_spaces and len(client_spaces) > 0):
+         return True
+     return bool(_COMPANY_HINT_RE.search(q or ""))
 
 def _spaces_from_env():
     raw = os.getenv("CONFLUENCE_SPACE", "").strip()
@@ -1722,8 +1725,8 @@ async def query(payload: dict = Body(...)):
     allow_fallback = any(r in reasons for r in allow_reasons) or \
                     ("anchor_miss" in reasons and not local_ok)
 
-    # >>> [ADD] 회사/업무 맥락이 아니면 MCP 폴백 자체를 막음
-    if NEED_FALLBACK and not _should_use_mcp(q, allowed_spaces, space):
+    client_spaces = (payload or {}).get("spaces")
+    if NEED_FALLBACK and not _should_use_mcp(q, client_spaces, space):
         NEED_FALLBACK = False
         log.info("MCP skipped by domain gate for %r", q)
 
@@ -1760,83 +1763,14 @@ async def query(payload: dict = Body(...)):
                 mcp_results, k=int(k) if isinstance(k, int) else 5
             )
             added = 0
-            if up_docs:
+
+            if MCP_WRITEBACK and up_docs:
+                if MCP_WRITEBACK_TITLES_ONLY:
+                    up_docs = [d for d in up_docs if (d.metadata or {}).get("kind") == "title"]
                 async with index_lock:
                     added = _upsert_docs_no_dup(up_docs)
                     vectorstore.save_local(INDEX_DIR)
                     _reload_retriever()
-
-
-
-            # === 결과 정규화/필터링 → items/contexts 로 변환 ===
-            if mcp_results:
-                items, contexts = [], []
-                for r in mcp_results[:k]:
-                    title = (r.get("title") or "").strip()
-                    body  = (r.get("body") or r.get("excerpt") or r.get("text") or "")
-                    body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
-                    text  = ((title + "\n\n") if title else "") + (body or "")
-
-                    # 로그인 화면/빈 본문 제외
-                    if not text.strip() or LOGIN_PAT.search(text):
-                        continue
-
-                    # pageId 보강
-                    pid = (r.get("id") or "").strip()
-                    if not pid:
-                        m_pid = re.search(r"[?&]pageId=(\d+)", (r.get("url") or ""))
-                        if m_pid:
-                            pid = m_pid.group(1)
-
-                    md = {
-                        "source": r.get("url"),
-                        "kind": "confluence",
-                        "page": pid or None,
-                        "space": r.get("space"),
-                        "title": title,
-                        "url": r.get("url"),
-                    }
-
-                    items.append({"text": text, "metadata": md, "score": 0.5})
-                    contexts.append({
-                        "text": text,
-                        "source": md["source"],
-                        "page": md["page"],
-                        "kind": md["kind"],
-                        "score": 0.5,
-                    })
-
-            if mcp_results:
-                # 폴백 결과를 인덱스로 영구 업서트
-                up_docs = []
-                for r in mcp_results[:k]:
-                    text_body = (r.get("body") or r.get("text") or r.get("excerpt") or "").strip()
-                    if not text_body:
-                        continue
-                    src   = (r.get("url") or f"confluence:{r.get('id') or ''}").strip()
-                    title = (r.get("title") or "").strip()
-                    space = (r.get("space") or "").strip()
-
-                    # [NEW] 제목 청크를 별도로 1개 추가 → build_openai_messages의 'title' 가중과도 맞물림
-                    if title:
-                        up_docs.append(Document(
-                            page_content=f"[TITLE] {title}",
-                            metadata={"source": src, "title": title, "space": space, "kind": "title"}
-                        ))
-
-                    text_full = ((title + "\n\n") if title else "") + text_body
-                    for c in _chunk_text(text_full, CHUNK_SIZE, CHUNK_OVERLAP):
-                        up_docs.append(Document(
-                            page_content=c,
-                            metadata={"source": src, "title": title, "space": space, "kind": "chunk"}
-                        ))
-
-                added = 0
-                if up_docs:
-                    async with index_lock:
-                        added = _upsert_docs_no_dup(up_docs)
-                        vectorstore.save_local(INDEX_DIR)
-                        _reload_retriever()
 
                 # 첫 결과를 최근 소스로 스티키 처리하면 연속 후속질문 안정적
                 try:
@@ -1853,9 +1787,6 @@ async def query(payload: dict = Body(...)):
                                 pass
                 except Exception:
                     pass
-
-        # except Exception as e:
-        #     log.error("MCP fallback failed: %s", "".join(traceback.format_exception(e)))
 
 
     # 장/조 질의면 필터 스킵
@@ -1878,7 +1809,7 @@ async def query(payload: dict = Body(...)):
 
         
         # >>> [REPLACE] 비었을 때의 보조 폴백도 fast 버전으로 통일
-        if not items and not DISABLE_INTERNAL_MCP:
+        if not items and not DISABLE_INTERNAL_MCP and _should_use_mcp(q, client_spaces, space):
             fallback_attempted = True
             spaces_for_mcp = allowed_spaces or ([space] if space else [None])
             mcp_results = await _mcp_search_fast(
@@ -1894,7 +1825,9 @@ async def query(payload: dict = Body(...)):
                 items, contexts, up_docs = _mcp_results_to_items(mcp_results, k=int(k) if isinstance(k, int) else 5)
 
                 added = 0
-                if up_docs:
+                if MCP_WRITEBACK and up_docs:
+                    if MCP_WRITEBACK_TITLES_ONLY:
+                        up_docs = [d for d in up_docs if (d.metadata or {}).get("kind") == "title"]
                     async with index_lock:
                         added = _upsert_docs_no_dup(up_docs)
                         vectorstore.save_local(INDEX_DIR)
