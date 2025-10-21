@@ -1546,17 +1546,17 @@ async def query(payload: dict = Body(...)):
 
 
     def _query_tokens(q: str) -> List[str]:
+        q = _preseg_stop_phrases(_basic_normalize(q))  # ← 추가: 붙여쓴 꼬리 미리 떼기
         raw = re.findall(r"[가-힣A-Za-z0-9]{2,}", q)
         toks = []
         for t in raw:
-            t = _strip_josa(t)              # ← 추가: 조사 제거 (예: 아파트누리에 → 아파트누리)
-            t = _apply_canon_map(t)         # ← 권장: 도메인 치환 일관화
+            t = _STOP_SUFFIX_RE.sub("", t)   # ← 추가: 토큰 끝 꼬리 제거
+            t = _strip_josa(t)
+            t = _apply_canon_map(t)
             t = _collapse_korean_compounds(t)
             if t and t not in _K_STOP:
                 toks.append(t)
-        # 중복 제거
         return list(dict.fromkeys(toks))[:8]
-
 
     ctx_all = "\n".join(c["text"] for c in contexts)
     tokens = _query_tokens(q)
