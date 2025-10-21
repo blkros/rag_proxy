@@ -109,6 +109,26 @@ _COMPANY_HINT_RE = re.compile(
     re.I
 )
 
+# === PATCH START: v1_chat 출처 호스트 화이트리스트(환경변수) ===
+SOURCE_HOST_WHITELIST = [h.strip().lower() for h in os.getenv("ALLOWED_SOURCE_HOSTS","").split(",") if h.strip()]
+_URL_HOST_RE = re.compile(r"^https?://([^/]+)")
+
+def _host_of(u: str) -> str:
+    m = _URL_HOST_RE.match(str(u or ""))
+    return (m.group(1) or "").lower() if m else ""
+
+def _filter_urls_by_host(urls: list[str]) -> list[str]:
+    if not SOURCE_HOST_WHITELIST:
+        return urls
+    out = []
+    for u in urls or []:
+        h = _host_of(u)
+        if h and any(h == w or h.endswith("." + w) for w in SOURCE_HOST_WHITELIST):
+            out.append(u)
+    return out
+# === PATCH END ===
+
+
 def _should_use_mcp(q: str, client_spaces: list | None, space: str | None) -> bool:
      """
      MCP는 '사용자가 명시한 space(s)나 space'가 있거나,
@@ -2072,7 +2092,8 @@ async def v1_chat(payload: dict = Body(...)):
         else:
             content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
 
-    allowed_list = r.get("source_urls", []) or []
+    # === PATCH START: 출처 목록을 허용 호스트로 필터 ===
+    allowed_list = _filter_urls_by_host(r.get("source_urls", []) or [])
     allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://","https://"))]
 
     if content and allowed_http:
@@ -2081,10 +2102,11 @@ async def v1_chat(payload: dict = Body(...)):
             return url if any(url.startswith(a) for a in allowed_http) else ""
         content = re.sub(r'https?://[^\s\)\]]+', _keep_allowed, content)
 
-
     if allowed_list:
         src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_list)
         content = (content or "") + src_block
+    # === PATCH END ===
+
 
     # 4) OpenAI 호환 스키마로 감싸서 반환
     return {

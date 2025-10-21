@@ -66,6 +66,23 @@ ROUTER_POOL_TIMEOUT    = float(os.getenv("ROUTER_POOL_TIMEOUT", "180"))
 
 _JOSA_RE = re.compile(r'(에서|에게|으로써|으로서|으로부터|로부터|부터|까지|만큼|보다|처럼|부터|까지|은|는|이|가|을|를|에|에서|에게|와|과|도|로|으로|의)$')
 
+ALLOWED_SOURCE_HOSTS = [h.strip().lower() for h in os.getenv("ALLOWED_SOURCE_HOSTS","").split(",") if h.strip()]
+
+def _host_of(u: str) -> str:
+    m = re.match(r"https?://([^/]+)", str(u or ""))
+    return m.group(1).lower() if m else ""
+
+def _filter_urls_by_host(urls: list[str]) -> list[str]:
+    if not ALLOWED_SOURCE_HOSTS:
+        return urls
+    out = []
+    for u in urls or []:
+        h = _host_of(u)
+        if h and any(h == w or h.endswith("." + w) for w in ALLOWED_SOURCE_HOSTS):
+            out.append(u)
+    return out
+
+
 def _strip_josa(tok: str) -> str:
     return _JOSA_RE.sub('', tok)
 
@@ -485,14 +502,23 @@ async def chat(req: ChatReq):
 
         # === QA 경로 ===
         qa_json = None; qa_items = []; qa_urls = []
-
         for v in variants:
+            #  QA 호출에도 spaces_hint 전달(기존 기능 유지, 정확도 ↑) 
             try:
-                j1 = (await client.post(f"{RAG}/qa", json={"q": v, "k": 5, "sticky": False})).json()
-            except Exception: j1 = {}
+                p1 = {"q": v, "k": 5, "sticky": False}
+                if spaces_hint:
+                    p1["spaces"] = spaces_hint
+                j1 = (await client.post(f"{RAG}/qa", json=p1)).json()
+            except Exception:
+                j1 = {}
             try:
-                j2 = (await client.post(f"{RAG}/qa", json={"q": v, "k": 5, "sticky": True})).json()
-            except Exception: j2 = {}
+                p2 = {"q": v, "k": 5, "sticky": True}
+                if spaces_hint:
+                    p2["spaces"] = spaces_hint
+                j2 = (await client.post(f"{RAG}/qa", json=p2)).json()
+            except Exception:
+                j2 = {}
+
 
             # 더 나은 쪽 선택
             best = max([j1, j2], key=_qa_score)
@@ -504,15 +530,14 @@ async def chat(req: ChatReq):
             ctx_text = mark_lonely_numbers_as_total(ctx_text)
 
             if not (ctx_text.strip() and (is_good_context_for_qa(ctx_text) or is_relevant(orig_user_msg, ctx_text))):
-                # 이 변형(v)은 패스하고 다음 변형으로 계속
                 continue
 
-            # 확정
             qa_json  = best
             qa_items = items
             qa_urls  = (_limit_urls(best.get("source_urls"))
                         if best.get("source_urls") else _collect_urls_from_items(items, top_n=ROUTER_SOURCES_MAX))
             break
+
 
 
 
@@ -547,18 +572,17 @@ async def chat(req: ChatReq):
                 raw = ""
 
         content = sanitize(strip_reasoning(raw).strip()) or "인덱스에 근거 없음"
-        # [변경] 폴백 시 제목 접두어 제거
-        # if content == "인덱스에 근거 없음" and ctx_text.strip():
-        #     content = sanitize(ctx_text)[:600]
 
-        # ▶ 컨텍스트 근거성 확인: 낮으면 답변 버리고 ‘인덱스에 근거 없음’
-        if ROUTER_STRICT_RAG and not supported_by_context(content, ctx_for_prompt):
+
+        strict = bool(spaces_hint) and ROUTER_STRICT_RAG
+        if strict and not supported_by_context(content, ctx_for_prompt):
             content = "인덱스에 근거 없음"
-            qa_urls = []  # 근거 없는 답에 출처 붙이지 않기
-
-        # [추가] 출처 붙이기 (MCP/Confluence 경로일 때)
-        if ROUTER_SHOW_SOURCES and qa_urls:
-            content += "\n\n출처:\n" + "\n".join(f"- {u}" for u in qa_urls)
+            qa_urls = []
+        # 출처는 허용 호스트만(환경변수로 제어)
+        if ROUTER_SHOW_SOURCES:
+            urls = _filter_urls_by_host(qa_urls)
+            if urls:
+                content += "\n\n출처:\n" + "\n".join(f"- {u}" for u in urls)
 
         return {
             "id": f"cmpl-{uuid.uuid4()}",
@@ -622,8 +646,8 @@ async def chat(req: ChatReq):
 
 
     if not best_ctx:
-        # STRICT 모드면: 인덱스 근거 없음을 즉시 반환
-        if ROUTER_STRICT_RAG:
+        # 스페이스 힌트 있으면 기존 STRICT 응답, 없으면 일반 LLM 직답
+        if spaces_hint:
             return {
                 "id": f"cmpl-{uuid.uuid4()}",
                 "object": "chat.completion",
@@ -636,7 +660,7 @@ async def chat(req: ChatReq):
                 }],
             }
 
-        # 비-STRICT: 일반 LLM 폴백을 호출하고 **바로 return**
+        # 스페이스 힌트가 없으면(=일반 상식 질의일 가능성) → LLM 직답
         now_kst = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d (%a) %H:%M:%S %Z")
         sysmsg = {
             "role": "system",
@@ -699,17 +723,16 @@ async def chat(req: ChatReq):
 
     content = sanitize(strip_reasoning(raw).strip()) or "인덱스에 근거 없음"
 
-    # [변경] 폴백 시 제목 접두어 제거
-    # if content == "인덱스에 근거 없음" and ctx_text.strip():
-    #     content = sanitize(ctx_text)[:600]
-
-    if ROUTER_STRICT_RAG and not supported_by_context(content, ctx_for_prompt):
+    #  STRICT는 스페이스 힌트 있을 때만, 출처 필터 적용
+    strict = bool(spaces_hint) and ROUTER_STRICT_RAG
+    if strict and not supported_by_context(content, ctx_for_prompt):
         content = "인덱스에 근거 없음"
         src_urls = []
 
-    # [추가] 출처 붙이기
-    if ROUTER_SHOW_SOURCES and src_urls:
-        content += "\n\n출처:\n" + "\n".join(f"- {u}" for u in src_urls)
+    if ROUTER_SHOW_SOURCES:
+        urls = _filter_urls_by_host(src_urls)
+        if urls:
+            content += "\n\n출처:\n" + "\n".join(f"- {u}" for u in urls)
 
     return {
         "id": f"cmpl-{uuid.uuid4()}",
