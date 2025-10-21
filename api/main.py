@@ -227,6 +227,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _norm_kr(s: str) -> str:
+    # 공백 제거 + 도메인 동의어/정규화 적용 + 소문자
+    t = _basic_normalize(s)
+    t = _apply_canon_map(t)
+    t = re.sub(r"\s+", "", t)        # 공백 제거 (아파트 누리 -> 아파트누리)
+    return t.lower()
+
 def _match_pageid(md: dict, pid: str) -> bool:
     if not pid:
         return True
@@ -1506,7 +1513,9 @@ async def query(payload: dict = Body(...)):
     
     acronym_hit = True if not acr else any(a in ctx_all or a in titles_meta for a in acr)
     anchors = _anchor_tokens_from_query(q)
-    anchor_hit = (not anchors) or any(a.lower() in (ctx_all + " " + titles_meta).lower() for a in anchors)
+    blob_norm = _norm_kr(ctx_all + " " + titles_meta)
+    anchor_hit = (not anchors) or any(_norm_kr(a) in blob_norm for a in anchors)
+
 
     # NEED_FALLBACK = (
     #     (len(items) == 0) or
@@ -1693,9 +1702,10 @@ async def query(payload: dict = Body(...)):
             items, contexts = [], []
         if items:
             anchors = _anchor_tokens_from_query(q) + re.findall(r"[A-Z]{2,5}", q)
-            blob = (ctx_all_final + " " + titles_meta_final).lower()
-            if anchors and not any(a.lower() in blob for a in anchors):
+            blob_norm = _norm_kr(ctx_all_final + " " + titles_meta_final)
+            if anchors and not any(_norm_kr(a) in blob_norm for a in anchors):
                 items, contexts = [], []
+
         
         # 필터로 비어버리면 지금이라도 MCP 폴백 시도
         if not items and not DISABLE_INTERNAL_MCP:
@@ -1782,6 +1792,7 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
         if i < 0:
             i = 0
     return out
+
 
 # [ADD] ------- helper: collect source urls -------
 def _collect_source_urls(items: list[dict]) -> list[str]:
