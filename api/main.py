@@ -1638,18 +1638,20 @@ async def query(payload: dict = Body(...)):
             NEED_FALLBACK = True
             reasons.append("pid_miss")
 
-        # 기존 블록 교체
-        if "anchor_miss" in reasons and reasons == ["anchor_miss"]:
-            NEED_FALLBACK = not local_ok
-            if not NEED_FALLBACK:
-                log.info("MCP skipped: anchor_miss only, but local hits exist")
-            else:
-                log.info("MCP allowed: anchor_miss only and no local hits")
+
+    if "anchor_miss" in reasons and reasons == ["anchor_miss"]:
+        NEED_FALLBACK = not local_ok
+        if not NEED_FALLBACK:
+            log.info("MCP skipped: anchor_miss only, but local hits exist")
+        else:
+            log.info("MCP allowed: anchor_miss only and no local hits")
+
+    allow_reasons = ("no_items", "small_pool", "missing_article", "pid_miss")
+    allow_fallback = any(r in reasons for r in allow_reasons) or \
+                    ("anchor_miss" in reasons and not local_ok)
 
 
-
-    # [PATCH] '컨텍스트가 실제로 부족한' 이유일 때만 MCP 가동
-    if NEED_FALLBACK and not DISABLE_INTERNAL_MCP and any(r in reasons for r in ("no_items", "small_pool", "missing_article", "pid_miss")):
+    if NEED_FALLBACK and not DISABLE_INTERNAL_MCP and allow_fallback:
         try:
             fallback_attempted = True
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
