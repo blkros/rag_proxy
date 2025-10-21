@@ -335,14 +335,25 @@ def _split_core_and_acronyms(tokens: List[str]) -> Tuple[List[str], List[str]]:
 
 _TOK_RE = re.compile(r"[A-Za-z0-9가-힣]{2,}")
 
+# 불용구/공손표현 꼬리 자르기 + 분절
+_STOP_SUFFIX_RE = re.compile(
+    r"(에\s*대하여|에\s*대해|에\s*대한|대하여|대해|"
+    r"설명해\s*주세요|설명해주세요|설명해줘|알려줘|해줘요?|주세요)$"
+)
+
+def _preseg_stop_phrases(q: str) -> str:
+    # 붙여쓰기일 때도 뭉친 꼬리를 띄우거나 제거
+    return _STOP_SUFFIX_RE.sub(" ", q)
+
 def _tokenize_query(q: str) -> List[str]:
+    q = _preseg_stop_phrases(_basic_normalize(q))
     raw = _TOK_RE.findall(q or "")
     toks = []
     for t in raw:
+        t = _STOP_SUFFIX_RE.sub("", t)  # 토큰 끝 꼬리 날리기
         t = _strip_josa(t)
         if t and t not in _K_STOP:
             toks.append(t)
-    # 중복 제거, 너무 많은 토큰 방지
     return list(dict.fromkeys(toks))[:12]
 
 def _keyword_overlap_score(q_tokens: List[str], text: str, title: str = "") -> float:
@@ -425,6 +436,7 @@ CANON_MAP = {
     r"한국\s*지능\s*정보\s*사회\s*진흥원": "한국지능정보사회진흥원",
     r"국가\s*정보화\s*진흥원": "한국지능정보사회진흥원",  # 옛 명칭
     r"지역\s*정보": "지역정보",
+    r"아파트\s*누리": "아파트누리",
 }
 
 def _apply_canon_map(text: str) -> str:
@@ -1698,8 +1710,10 @@ async def query(payload: dict = Body(...)):
             for h in items
         )
         core_final = [t for t in _query_tokens(q) if not ACRONYM_RE.match(t)]
-        if core_final and not any(t in ctx_all_final for t in core_final):
-            items, contexts = [], []
+        if core_final:
+            blob_norm_final = _norm_kr(ctx_all_final + " " + titles_meta_final)
+            if not any(_norm_kr(t) in blob_norm_final for t in core_final):
+                items, contexts = [], []
         if items:
             anchors = _anchor_tokens_from_query(q) + re.findall(r"[A-Z]{2,5}", q)
             blob_norm = _norm_kr(ctx_all_final + " " + titles_meta_final)
