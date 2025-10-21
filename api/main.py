@@ -73,7 +73,7 @@ STICKY_SECS = int(getattr(settings, "STICKY_SECS", 180))
 
 STICKY_STRICT = bool(getattr(settings, "STICKY_STRICT", True))
 STICKY_FROM_COALESCE = bool(getattr(settings, "STICKY_FROM_COALESCE", False))  # 기본 False
-STICKY_AFTER_MCP = bool(getattr(settings, "STICKY_AFTER_MCP", False))          # 기본 False
+STICKY_AFTER_MCP = bool(getattr(settings, "STICKY_AFTER_MCP", True))          # 기본 False
 
 # ← [ADD] 앵커 추출(질문 핵심어) + sticky 유효성 검사
 _GENERIC = set("보고 보고서 리포트 정보 정리 페이지 자료 문서 요약 정책 통계 항목 사이트 url 링크 출처".split())
@@ -478,6 +478,13 @@ CANON_MAP = {
     r"아파트\s*누리": "아파트누리",
     r"개발\s*서버\s*정보": "개발서버정보",
 }
+
+# CANON_MAP 보강
+CANON_MAP.update({
+    r"개발\s*서버\s*정보": "개발서버정보",
+    r"\bDEV\b": "개발",   # 내부 문서에 DEV만 있는 경우 대비 (선택)
+})
+
 
 def _apply_canon_map(text: str) -> str:
     t = text
@@ -1684,6 +1691,24 @@ async def query(payload: dict = Body(...)):
                         if mcp_results:
                             break
 
+            if not mcp_results and allowed_spaces:
+                # 최후 시도: space 제한 없이 전역 검색
+                try:
+                    part = await mcp_search(q, limit=5, timeout=20, space=None, langs=SEARCH_LANGS)
+                    mcp_results.extend(part or [])
+                except Exception:
+                    pass
+
+            # q2(키워드 축약)·best 토큰 검색에도 동일 로직 반복
+            if not mcp_results and allowed_spaces:
+                try:
+                    q2 = _to_mcp_keywords(q)
+                    part = await mcp_search(q2, limit=5, timeout=20, space=None, langs=SEARCH_LANGS)
+                    mcp_results.extend(part or [])
+                except Exception:
+                    pass
+
+
             # [FIX] pageId가 강제된 경우, 해당 pid만 남김(안전장치)
             if forced_page_id and mcp_results:
                 mcp_results = [r for r in mcp_results
@@ -1695,6 +1720,9 @@ async def query(payload: dict = Body(...)):
                 target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
                 if target:
                     _set_sticky(target)
+
+            if mcp_results:
+                log.info("MCP results top: %s", [(r.get("space"), r.get("title"), r.get("url")) for r in mcp_results[:5]])
 
 
             # === 결과 정규화/필터링 → items/contexts 로 변환 ===
