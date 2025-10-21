@@ -1614,25 +1614,51 @@ async def query(payload: dict = Body(...)):
     if (anchors and not anchor_hit): reasons.append("anchor_miss")
     log.info("fallback_check reasons=%s local_hits=%s", reasons, local_ok)
 
-    # ▲ 위 reasons 계산 바로 아래에 추가
+    # === pageId 강제 핀: 요청에 pageId가 있는데 현재 후보에 그 pid가 하나도 없으면 폴백 강제 ===
+    pid_miss = False
+    if forced_page_id:
+        def _hit_has_pid(h, pid):
+            md  = (h.get("metadata") or {})
+            pid_md = str(md.get("page") or md.get("pageId") or "")
+            url = str(md.get("url") or md.get("source") or "")
+            return (pid_md == pid) or (f"pageId={pid}" in url)
+
+        pid_miss = (not any(_hit_has_pid(h, forced_page_id) for h in (items or []))) \
+                and (not any(_hit_has_pid(h, forced_page_id) for h in (pool_hits or [])))
+
+        if pid_miss:
+            NEED_FALLBACK = True
+            reasons.append("pid_miss")
+
     if "anchor_miss" in reasons and reasons == ["anchor_miss"] and (len(items) > 0 or len(pool_hits) > 0):
         NEED_FALLBACK = False
         log.info("MCP skipped: anchor_miss only, but candidates exist (items=%d, pool=%d)", len(items), len(pool_hits))
 
 
     # [PATCH] '컨텍스트가 실제로 부족한' 이유일 때만 MCP 가동
-    if NEED_FALLBACK and not DISABLE_INTERNAL_MCP and any(r in reasons for r in ("no_items", "small_pool", "missing_article")):
+    if NEED_FALLBACK and not DISABLE_INTERNAL_MCP and any(r in reasons for r in ("no_items", "small_pool", "missing_article", "pid_miss")):
         try:
             fallback_attempted = True
             log.info("MCP fallback: calling Confluence MCP for query=%r", q)
 
             mcp_results = []
             spaces_for_mcp = allowed_spaces or ([space] if space else [None])
-            for sp_hint in spaces_for_mcp:
-                part = await mcp_search(q,  limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
-                mcp_results.extend(part or [])
-                if mcp_results:  # 첫 space에서라도 결과가 나오면 멈춰도 OK (원하면 이어서 더 합쳐도 됨)
-                    break
+
+            # [FIX] pageId가 지정되면 먼저 id로 정확히 당겨오기
+            if forced_page_id:
+                for sp_hint in spaces_for_mcp:
+                    part = await mcp_search(f"id={forced_page_id}", limit=1, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
+                    mcp_results.extend(part or [])
+                    if mcp_results:
+                        break
+
+            # id 조회 실패 시에만 일반 질의로 검색
+            if not mcp_results:
+                for sp_hint in spaces_for_mcp:
+                    part = await mcp_search(q,  limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
+                    mcp_results.extend(part or [])
+                    if mcp_results:
+                        break
 
             if not mcp_results:
                 q2 = _to_mcp_keywords(q)
@@ -1652,10 +1678,17 @@ async def query(payload: dict = Body(...)):
                         if mcp_results:
                             break
 
-
-            # >>> [ADD] pageId가 강제되었으면 결과에서 해당 pageId만 남긴다.
+            # [FIX] pageId가 강제된 경우, 해당 pid만 남김(안전장치)
             if forced_page_id and mcp_results:
-                mcp_results = [r for r in mcp_results if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id]
+                mcp_results = [r for r in mcp_results
+                            if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id]
+
+
+            if mcp_results and STICKY_AFTER_MCP:
+                first = mcp_results[0]
+                target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
+                if target:
+                    _set_sticky(target)
 
 
             # === 결과 정규화/필터링 → items/contexts 로 변환 ===
@@ -1771,16 +1804,28 @@ async def query(payload: dict = Body(...)):
         if not items and not DISABLE_INTERNAL_MCP:
             fallback_attempted = True
             mcp_results = []
+            spaces_for_mcp = allowed_spaces or ([space] if space else [None])
+            # 4-1) pageId가 지정되었으면 id 먼저 정확히 당겨온다
             if forced_page_id:
-                async with mcp_lock:
-                    mcp_results = await mcp_search(f"id={forced_page_id}", limit=1, timeout=20,
-                                                space=space, langs=SEARCH_LANGS)
+                for sp_hint in spaces_for_mcp:
+                    part = await mcp_search(f"id={forced_page_id}", limit=1, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
+                    mcp_results.extend(part or [])
+                    if mcp_results:
+                        break
+
+            # 4-2) 그래도 없으면 기존처럼 질의어/키워드로 검색
             if not mcp_results:
-                async with mcp_lock:
-                    mcp_results = await mcp_search(q, limit=5, timeout=20,
-                                                space=space, langs=SEARCH_LANGS)
+                for sp_hint in spaces_for_mcp:
+                    part = await mcp_search(q, limit=5, timeout=20, space=sp_hint, langs=SEARCH_LANGS)
+                    mcp_results.extend(part or [])
+                    if mcp_results:
+                        break
 
             # 결과를 실제 items/contexts로 만들어주기 + 인덱스 반영
+            if forced_page_id and mcp_results:
+                mcp_results = [r for r in mcp_results
+                            if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id]
+                
             if mcp_results:
                 items, contexts, up_docs = _mcp_results_to_items(mcp_results, k=int(k) if isinstance(k, int) else 5)
                 added = 0
@@ -1789,6 +1834,13 @@ async def query(payload: dict = Body(...)):
                         added = _upsert_docs_no_dup(up_docs)
                         vectorstore.save_local(INDEX_DIR)
                         _reload_retriever()
+
+                # [옵션/권장] 여기서도 STICKY_AFTER_MCP 일관 적용
+                if STICKY_AFTER_MCP:
+                    first = mcp_results[0]
+                    target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
+                    if target:
+                        _set_sticky(target)
 
 
     base_notes = {"missing_article": missing_article, "article_no": article_no}
