@@ -129,15 +129,39 @@ def _filter_urls_by_host(urls: list[str]) -> list[str]:
 # === PATCH END ===
 
 
-def _should_use_mcp(q: str, client_spaces: list | None, space: str | None) -> bool:
-     """
-     MCP는 '사용자가 명시한 space(s)나 space'가 있거나,
-     질문에 회사/업무 키워드가 있을 때만 허용한다.
-     (ENV_SPACES는 최대 허용치일 뿐, 게이트 열기 신호가 아니다)
-     """
-     if space or (client_spaces and len(client_spaces) > 0):
-         return True
-     return bool(_COMPANY_HINT_RE.search(q or ""))
+# 기존 시그니처: def _should_use_mcp(q: str, client_spaces: list | None, space: str | None) -> bool:
+def _should_use_mcp(
+    q: str,
+    client_spaces: list | None,
+    space: str | None,
+    reasons: list[str] | None = None,
+    local_ok: bool | None = None,
+) -> bool:
+    """
+    MCP 허용 판단 (하드코딩 키워드 제거)
+    - space/클라이언트 spaces가 있으면 항상 허용
+    - 폴백 사유(reasons)에 품질 저하 신호가 있으면 허용
+    - 대문자 약어가 있으면 허용(HES, POC, DR, CBL 등)
+    - 마지막에만 레거시 키워드 정규식으로 후순위 판단
+    """
+    # 1) 사용자가 space를 명시했거나 클라에서 spaces를 준 경우
+    if space or (client_spaces and len(client_spaces) > 0):
+        return True
+
+    # 2) /query 내부 판단 사유에 품질 저하 신호가 있으면 허용
+    rs = set([r.strip().lower() for r in (reasons or [])])
+    if rs & {"no_items", "small_pool", "missing_article", "pid_miss"}:
+        return True
+    # '약어/앵커 미스'는 로컬에 히트가 있어도 MCP가 더 유리하므로 허용
+    if "acronym_miss" in rs or "anchor_miss" in rs:
+        return True
+
+    # 3) 대문자 약어가 하나라도 있으면 허용 (HES/POC/DR/CBL…)
+    if re.search(r"\b[A-Z]{2,10}\b", q or ""):
+        return True
+
+    # 4) (호환) 레거시 키워드 정규식은 '마지막'에만 사용
+    return bool(_COMPANY_HINT_RE.search(q or ""))
 
 def _spaces_from_env():
     raw = os.getenv("CONFLUENCE_SPACE", "").strip()
@@ -1746,7 +1770,7 @@ async def query(payload: dict = Body(...)):
                     ("anchor_miss" in reasons and not local_ok)
 
     client_spaces = (payload or {}).get("spaces")
-    if NEED_FALLBACK and not _should_use_mcp(q, client_spaces, space):
+    if NEED_FALLBACK and not _should_use_mcp(q, client_spaces, space, reasons, local_ok):
         NEED_FALLBACK = False
         log.info("MCP skipped by domain gate for %r", q)
 
@@ -1829,7 +1853,7 @@ async def query(payload: dict = Body(...)):
 
         
         # >>> [REPLACE] 비었을 때의 보조 폴백도 fast 버전으로 통일
-        if not items and not DISABLE_INTERNAL_MCP and _should_use_mcp(q, client_spaces, space):
+        if not items and not DISABLE_INTERNAL_MCP and _should_use_mcp(q, client_spaces, space, reasons, local_ok):
             fallback_attempted = True
             spaces_for_mcp = allowed_spaces or ([space] if space else [None])
             mcp_results = await _mcp_search_fast(
