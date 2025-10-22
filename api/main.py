@@ -54,6 +54,8 @@ MCP_MAX_TASKS     = int(os.getenv("MCP_MAX_TASKS", "4"))       # 동시 질의 �
 
 TZ_NAME = getattr(settings, "TZ_NAME", "Asia/Seoul")
 
+ACRONYM_RE2 = re.compile(r"\b[A-Z]{2,6}\b")
+
 LOCAL_FIRST = bool(getattr(settings, "LOCAL_FIRST", True))
 LOCAL_BONUS = float(getattr(settings, "LOCAL_BONUS", 0.25))
 
@@ -1766,9 +1768,11 @@ async def query(payload: dict = Body(...)):
             log.info("MCP allowed: anchor_miss only and no local hits")
 
     allow_reasons = ("no_items", "small_pool", "missing_article", "pid_miss")
-    allow_fallback = any(r in reasons for r in allow_reasons) or \
-                    ("anchor_miss" in reasons and not local_ok)
-
+    allow_fallback = (
+        any(r in reasons for r in allow_reasons) or
+        ("anchor_miss" in reasons and not local_ok) or
+        ("acronym_miss" in reasons)       
+    )
     client_spaces = (payload or {}).get("spaces")
     if NEED_FALLBACK and not _should_use_mcp(q, client_spaces, space, reasons, local_ok):
         NEED_FALLBACK = False
