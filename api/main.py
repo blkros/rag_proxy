@@ -55,6 +55,10 @@ MCP_MAX_TASKS     = int(os.getenv("MCP_MAX_TASKS", "4"))       # 동시 질의 �
 TZ_NAME = getattr(settings, "TZ_NAME", "Asia/Seoul")
 
 ACRONYM_RE2 = re.compile(r"\b[A-Z]{2,6}\b")
+CONFL_HINT_RE = re.compile(
+    r"(?<![가-힣A-Za-z0-9])(컨플루언스|컨플|confluence)(?=(?:\s*(?:에서|문서|페이지))|[^가-힣A-Za-z0-9]|$)",
+    re.I
+)
 
 LOCAL_FIRST = bool(getattr(settings, "LOCAL_FIRST", True))
 LOCAL_BONUS = float(getattr(settings, "LOCAL_BONUS", 0.25))
@@ -1288,7 +1292,7 @@ async def query(payload: dict = Body(...)):
                 q = m["content"]; break
     if not q.strip():
         raise HTTPException(400, "question/query/q/messages is required")
-    
+
     # [ADD] pageId 힌트만 추출(잠금 아님)
     page_id = (payload or {}).get("pageId")
     if not page_id:
@@ -1297,7 +1301,10 @@ async def query(payload: dict = Body(...)):
             page_id = m_pid.group(1)
     page_id = str(page_id) if page_id is not None else None
 
-    if re.match(r"(?is)^\s*#{3}\s*task\s*:", q):  # ← 메타태스크는 RAG/MCP 건너뜀
+    confl_hint = bool(CONFL_HINT_RE.search(q))
+
+    # 메타태스크는 RAG/MCP 건너뜀 (맨 앞 유지)
+    if re.match(r"(?is)^\s*#{3}\s*task\s*:", q):
         return {
             "hits": 0,
             "items": [],
@@ -1307,8 +1314,8 @@ async def query(payload: dict = Body(...)):
             "chunks": [],
             "notes": {"meta_task": True}
         }
-        
-    # === Direct-Answer 라우팅: 날짜/시간 등 상식형은 RAG/MCP를 건너뛰고 LLM이 바로 답 ===
+
+    # === Direct-Answer 라우팅: 날짜/시간 등 상식형은 RAG/MCP 없이 즉답 (맨 앞 유지)
     if _is_datetime_question(q):
         date_str, dow_str, time_str = _now_str_kst()
         sys = (
@@ -1324,7 +1331,6 @@ async def query(payload: dict = Body(...)):
         try:
             direct = await _call_llm(messages=msgs)
         except Exception:
-            # LLM 호출 실패 시 서버 시계 기반으로 최소 응답 보장
             direct = f"오늘은 {date_str} {dow_str}요일입니다."
 
         return {
@@ -1339,19 +1345,107 @@ async def query(payload: dict = Body(...)):
             "notes": {"routed": "no_rag", "reason": "datetime"}
         }
 
-    if vectorstore is None:
-        raise HTTPException(500, "vectorstore is not ready.")
-    
-    # 2) k / source
+    # 2) k / source (여기서 k와 early source를 먼저 파악)
     k = (payload or {}).get("k") or (payload or {}).get("top_k") or 5
-    try: k = int(k)
-    except: k = 5
+    try:
+        k = int(k)
+    except Exception:
+        k = 5
     src_filter = (payload or {}).get("source")
     src_list   = (payload or {}).get("sources")
-    forced_page_id = _extract_page_id(src_filter)
+    src_set    = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
+
+    # early forced_page_id (source에 pageId가 있으면 우선, 없으면 위에서 뽑은 page_id)
+    forced_page_id = _extract_page_id(src_filter) if src_filter else None
     if not forced_page_id and page_id:
         forced_page_id = page_id
-    src_set    = set(map(str, src_list)) if isinstance(src_list, list) and src_list else None
+
+    # 3) space 힌트/allowed_spaces (→ 강제 Confluence 분기 전에 계산)
+    space = (payload or {}).get("space") or (payload or {}).get("spaceKey")
+    allowed_spaces = _resolve_allowed_spaces((payload or {}).get("spaces"))
+
+    # 단일 allowed_spaces만 있으면 그걸 단일 힌트로 사용
+    if not space and allowed_spaces and len(allowed_spaces) == 1:
+        space = allowed_spaces[0]
+    if isinstance(space, str):
+        space = space.strip() or None
+
+    # 4) 강제 Confluence 분기: 질문에 '컨플/컨플루언스' 있으면 retriever 호출 전에 바로 처리
+    if confl_hint and not DISABLE_INTERNAL_MCP:
+        fallback_attempted = True
+        try:
+            spaces_for_mcp = allowed_spaces or ([space] if space else [None])
+            mcp_results = await _mcp_search_fast(
+                q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
+            )
+        except Exception as e:
+            mcp_results = []
+            log.error("forced MCP (confluence hint) failed: %s", "".join(traceback.format_exception(e)))
+
+        # pageId 강제 필터
+        if forced_page_id and mcp_results:
+            mcp_results = [
+                r for r in mcp_results
+                if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id
+            ]
+
+        # sticky 처리
+        if mcp_results and STICKY_AFTER_MCP:
+            first = mcp_results[0]
+            target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
+            if target:
+                _set_sticky(target)
+
+        # 화면 items/contexts 생성 + (옵션) 인덱스 업서트
+        if mcp_results:
+            items, contexts, up_docs = _mcp_results_to_items(
+                mcp_results, k=int(k) if isinstance(k, int) else 5
+            )
+            added = 0
+            if MCP_WRITEBACK and up_docs:
+                if MCP_WRITEBACK_TITLES_ONLY:
+                    up_docs = [d for d in up_docs if (d.metadata or {}).get("kind") == "title"]
+                async with index_lock:
+                    added = _upsert_docs_no_dup(up_docs)
+                    vectorstore.save_local(INDEX_DIR)
+                    _reload_retriever()
+
+            src_urls = _collect_source_urls(items)
+            return {
+                "hits": len(items),
+                "items": items,
+                "contexts": contexts,
+                "context_texts": [it["text"] for it in items],
+                "documents": items,
+                "chunks": items,
+                "source_urls": src_urls,
+                "notes": {
+                    "forced_confluence": True,
+                    "fallback_used": True,
+                    "indexed": (added > 0),
+                    **({"added": added} if added > 0 else {}),
+                },
+            }
+        else:
+            # Confluence에서 아무것도 못 찾았으면 '정보 없음'으로 종료 (로컬로 되돌리지 않음)
+            return {
+                "hits": 0,
+                "items": [],
+                "contexts": [],
+                "context_texts": [],
+                "documents": [],
+                "chunks": [],
+                "source_urls": [],
+                "direct_answer": "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다",
+                "notes": {
+                    "forced_confluence": True,
+                    "no_results": True
+                },
+            }
+
+    # === 여기부터 로컬 RAG 경로 ===
+    if vectorstore is None:
+        raise HTTPException(500, "vectorstore is not ready.")
 
     # 요청 단위 sticky 비활성화 옵션
     sticky_flag = (payload or {}).get("sticky")
@@ -1366,16 +1460,13 @@ async def query(payload: dict = Body(...)):
             current_source = None
             current_source_until = 0.0
 
-
     # "이 파일/첨부한 파일" 지시어면 최근 업로드 파일로 고정
     global last_source
-    # 최근 업로드 파일 지시어(이 파일/첨부/해당 문서 등) → last_source 고정
     if not src_filter and not src_set and last_source and THIS_FILE_PAT.search(q):
         src_filter = last_source
-        _set_sticky(last_source)  # 연속 질문 안정화
+        _set_sticky(last_source)
 
-
-    # 3-A) 후보 선택은 MMR로(기존 그대로)
+    # 3-A) 후보 선택은 MMR로
     try:
         docs = retriever.invoke(q)
     except Exception:
@@ -1387,13 +1478,10 @@ async def query(payload: dict = Body(...)):
             docs = [d for d, _ in vectorstore.similarity_search_with_score(q, k=max(k*2, 10))]
         except Exception:
             docs = []
-    # ... docs를 뽑은 직후, src 필터 적용 전에 추가
-    # q_lc = q.lower()
 
-    # 1) "xxx.pdf"가 질문에 포함되면 동일 소스만 우선
+    # 파일명 힌트 → 동일 소스 우선
     m = re.search(r'([^\s"\'()]+\.pdf)', q, re.I)
     fname = m.group(1).lower() if m else None
-    # >>> [ADD] 질문에 파일명이 있으면 동일 basename 소스로 바로 고정
     if fname:
         bn = Path(fname).name.lower()
         try:
@@ -1410,7 +1498,7 @@ async def query(payload: dict = Body(...)):
         except Exception:
             pass
 
-    # 2) 확장자 없이도 매칭(질문에 포함된 토큰이 소스 파일명에 들어가면)
+    # 확장자 없이도 basename 매칭
     if not fname:
         def _canon_file(s: str) -> str:
             bn = Path(s).name.lower()
@@ -1418,16 +1506,13 @@ async def query(payload: dict = Body(...)):
                 if bn.endswith(ext): bn = bn[:-len(ext)]
             return bn
 
-        # 토큰 정규화: 조사/불용 접미 제거
         raw_tokens = re.findall(r'[\w\.\-\(\)가-힣]+', q.lower())
         norm_tokens = []
         for t in raw_tokens:
             if t.endswith("의"): t = t[:-1]
-            # 필요한 경우 더 추가: t = t.replace("관련","").replace("에","")
             t = t.strip()
             if t: norm_tokens.append(t)
 
-        # 후보 소스 basename 사전
         cand_sources = [str(d.metadata.get("source","")) for d in docs]
         bn_map = {_canon_file(s): s for s in cand_sources if s}
 
@@ -1442,18 +1527,7 @@ async def query(payload: dict = Body(...)):
             wanted = _norm_source(bn_map[hit_bn])
             docs = [d for d in docs if _norm_source(str(d.metadata.get("source",""))) == wanted]
 
-    # [ADD] space 힌트 (Confluence space 키)
-    space = (payload or {}).get("space") or (payload or {}).get("spaceKey")
-    allowed_spaces = _resolve_allowed_spaces((payload or {}).get("spaces"))
-
-    # 단일 space 힌트가 없다면, ENV나 클라의 allowed_spaces가 1개일 때 그걸 단일 힌트로 활용
-    if not space and allowed_spaces and len(allowed_spaces) == 1:
-        space = allowed_spaces[0]
-
-    if isinstance(space, str):
-        space = space.strip() or None
-
-    # 3) 소스 필터 후 상위 k (4-C: 정규화 비교로 교체)
+    # 3) 소스 필터 후 상위 k
     if src_set:
         wanted = {_norm_source(str(s)) for s in src_set}
         docs = [d for d in docs if _norm_source(str((d.metadata or {}).get("source",""))) in wanted]
@@ -1470,40 +1544,38 @@ async def query(payload: dict = Body(...)):
         docs = [d for d in docs if _doc_has_pid(d, forced_page_id)]
     docs = docs[:k]
 
-    # 3-B) 넉넉한 후보 풀을 구성하고 점수/메타를 붙인다
+    # 3-B) 넉넉한 후보 풀 구성
     def key_of(d):
         md = d.metadata or {}
         return (str(md.get("source","")), md.get("page"), md.get("kind","chunk"), md.get("chunk"))
 
-    pool_hits = []   # ← rerank/pick_for_injection가 먹는 풀
+    pool_hits = []
     try:
         pairs = vectorstore.similarity_search_with_score(q, k=max(k*8, 80))
     except Exception:
         pairs = []
 
-    # (선택) retriever 결과도 풀에 합치기
     base_docs = []
     try:
         base_docs = retriever.invoke(q) or []
     except Exception:
         base_docs = []
 
-    # [ADD] --- 경량 스파스(키워드) 후보 융합 ---
+    # --- 경량 스파스(키워드) 후보 융합 ---
     if ENABLE_SPARSE:
         sparse_hits = _sparse_keyword_hits(q, limit=SPARSE_LIMIT, space=space)
         _apply_space_hint(sparse_hits, space)
-        _apply_page_hint(sparse_hits, page_id)   # ← sparse 후보들에 pageId 가산점
+        _apply_page_hint(sparse_hits, page_id)
         pool_hits.extend(sparse_hits)
 
-    # 유사도 점수 변환 (FAISS L2 → cos 유사도 근사)
+    # L2 → 유사도 근사
     def _sim_from_dist(dist):
         try:
             s = 1.0 - float(dist)/2.0
             return max(0.0, min(1.0, s))
         except Exception:
             return 0.0
-        
-    # [DEBUG] pool 상위 몇 개 소스 찍기
+
     try:
         if pool_hits:
             _peek = []
@@ -1514,7 +1586,6 @@ async def query(payload: dict = Body(...)):
     except Exception:
         pass
 
-    # 3-B-1) similarity_search_with_score 풀
     for d, dist in pairs:
         sim = _sim_from_dist(dist)
         md = dict(d.metadata or {})
@@ -1525,7 +1596,6 @@ async def query(payload: dict = Body(...)):
             "score": sim,
         })
 
-    # 3-B-2) retriever 풀(점수 없으면 0.5 기본 가중)
     for d in base_docs:
         md = dict(d.metadata or {})
         md["source"] = str(md.get("source",""))
@@ -1535,11 +1605,11 @@ async def query(payload: dict = Body(...)):
             "score": 0.5,
         })
 
-    # [ADD] dense 풀에도 space soft 보너스 적용
+    # dense 풀에도 space/page 보너스
     _apply_space_hint(pool_hits, space)
     _apply_page_hint(pool_hits, page_id)
     _apply_local_bonus(pool_hits)
-    # [OPTION] dense 후보에도 제목 매치 보너스(약하게)
+
     q_tokens = _tokenize_query(q)
     if q_tokens:
         for h in pool_hits:
@@ -1548,36 +1618,29 @@ async def query(payload: dict = Body(...)):
             if title and any(t in title for t in q_tokens):
                 h["score"] = float(h.get("score") or 0.0) + (TITLE_BONUS * 0.5)
 
-    # --- space 제한 적용 ---
+    # allowed_spaces 강제/보너스
     if allowed_spaces:
         mode = SPACE_FILTER_MODE.lower()
         allowed_set = {s.lower() for s in allowed_spaces}
-
         if mode == "hard":
-            # 허용된 space만 남김
             pool_hits = [
                 h for h in pool_hits
                 if ((h.get("metadata") or {}).get("space","") or "").lower() in allowed_set
             ]
         else:
-            # soft: 허용된 space에 가산점 부여
             for sp in allowed_spaces:
                 _apply_space_hint(pool_hits, sp)
 
     # === 3-D) 의도 파악
     intent = parse_query_intent(q)
-
     m_art = _ARTICLE_RE.search(q)
     article_no = intent.get("article_no") if m_art else None
     m_ch = _CHAPTER_RE.search(q)
     chapter_no = int(m_ch.group(1)) if m_ch else None
 
-    # 조문 질의여도, 사용자가 source를 명시한 경우에만 그 값으로 고정
-    # (명시 안 했으면 sticky/last_source 그대로 유지)
     if intent.get("article_no") and ("source" in (payload or {})):
         src_filter = (payload or {}).get("source")
 
-    # 여기에서 pool_hits에 최종 소스 필터 적용
     if src_set:
         wanted = {_norm_source(str(s)) for s in src_set}
         pool_hits = [h for h in pool_hits if _norm_source(h["metadata"].get("source","")) in wanted]
@@ -1585,35 +1648,26 @@ async def query(payload: dict = Body(...)):
         wanted = _norm_source(str(src_filter))
         pool_hits = [h for h in pool_hits if _norm_source(h["metadata"].get("source","")) == wanted]
 
-    # --- 조문 텍스트 가산점/누락 플래그 ---
     def _bonus_for_article_text(h, artno: int) -> float:
         t = re.sub(r"[ \t\r\n│|¦┃┆┇┊┋丨ㅣ]", "", h.get("text") or "")
         return 0.15 if re.search(fr"제{artno}조", t) else 0.0
 
-    # [추가] 장 보너스
     def _bonus_for_chapter_text(h, chapno: int) -> float:
         t = re.sub(r"[ \t\r\n│|¦┃┆┇┊┋丨ㅣ]", "", h.get("text") or "")
         return 0.20 if re.search(fr"제{chapno}장", t) else 0.0
-    
-    # --- 조문/장 보너스 적용
+
     if article_no:
         for h in pool_hits:
             h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, article_no)
-
     if chapter_no:
         for h in pool_hits:
             h["score"] = float(h.get("score") or 0.0) + _bonus_for_chapter_text(h, chapter_no)
-    
-    # --- 누락 플래그는 '조'일 때만
+
     missing_article = False
     if article_no:
         have_meta = any((h.get("metadata") or {}).get("article_no") == article_no for h in pool_hits)
         have_text = any(_bonus_for_article_text(h, article_no) > 0 for h in pool_hits)
         missing_article = not (have_meta or have_text)
-
-        # 조문 질의면 관련 히트에 가산점 부여
-        # for h in pool_hits:
-        #     h["score"] = float(h.get("score") or 0.0) + _bonus_for_article_text(h, article_no)
 
     if forced_page_id and PAGE_FILTER_MODE.lower() == "hard":
         def _hit_has_pid(h, pid):
@@ -1645,7 +1699,7 @@ async def query(payload: dict = Body(...)):
         except Exception:
             pass
 
-    # 4) 응답 생성 (기존 포맷 유지)
+    # 4) 응답 생성
     items, contexts = [], []
     for h in chosen:
         md = dict(h["metadata"])
@@ -1673,13 +1727,12 @@ async def query(payload: dict = Body(...)):
     except Exception:
         pass
 
-
     def _query_tokens(q: str) -> List[str]:
-        q = _preseg_stop_phrases(_basic_normalize(q))  # ← 추가: 붙여쓴 꼬리 미리 떼기
+        q = _preseg_stop_phrases(_basic_normalize(q))
         raw = re.findall(r"[가-힣A-Za-z0-9]{2,}", q)
         toks = []
         for t in raw:
-            t = _STOP_SUFFIX_RE.sub("", t)   # ← 추가: 토큰 끝 꼬리 제거
+            t = _STOP_SUFFIX_RE.sub("", t)
             t = _strip_josa(t)
             t = _apply_canon_map(t)
             t = _collapse_korean_compounds(t)
@@ -1691,35 +1744,23 @@ async def query(payload: dict = Body(...)):
     tokens = _query_tokens(q)
     core, acr = _split_core_and_acronyms(tokens)
 
-    # 컨텍스트 본문에서 '핵심 토큰' 일부라도 맞는지
     core_hit = any(t in ctx_all for t in core)
     titles_meta = " ".join(
          f"{(h.get('metadata') or {}).get('title','')} {(h.get('metadata') or {}).get('source','')}"
          for h in items
      )
-    
+
     acronym_hit = True if not acr else any(a in ctx_all or a in titles_meta for a in acr)
     anchors = _anchor_tokens_from_query(q)
     blob_norm = _norm_kr(ctx_all + " " + titles_meta)
     anchor_hit = (not anchors) or any(_norm_kr(a) in blob_norm for a in anchors)
 
-
-    # NEED_FALLBACK = (
-    #     (len(items) == 0) or
-    #     (len(pool_hits) < max(10, k*2)) or
-    #     missing_article or
-    #     (acr and not acronym_hit) or
-    #     (anchors and not anchor_hit)
-    # )
-
-    # tokens / acr / anchors / acronym_hit / anchor_hit 등이 계산된 상태
     anchor_miss = bool(anchors) and not anchor_hit
     acronym_miss = bool(acr) and not acronym_hit
 
     local_ok = _has_local_hits(items) or _has_local_hits(pool_hits)
 
     if local_ok:
-        # 로컬 히트가 있어도 앵커/약어가 안 맞으면 폴백
         NEED_FALLBACK = (len(items) == 0) or missing_article or anchor_miss or acronym_miss
     else:
         NEED_FALLBACK = (
@@ -1730,11 +1771,9 @@ async def query(payload: dict = Body(...)):
             anchor_miss
         )
 
-    ### [ADD] '제 N장/조' 질의는 아이템이 이미 있으면 앵커 미스만으로 폴백 금지
     if (chapter_no or article_no) and items:
         NEED_FALLBACK = False
 
-    # [PATCH] anchor_miss 단독이면 MCP 폴백 금지 (후보가 있는 경우)
     reasons = []
     if len(items) == 0: reasons.append("no_items")
     if len(pool_hits) < max(10, k*2): reasons.append("small_pool")
@@ -1743,7 +1782,6 @@ async def query(payload: dict = Body(...)):
     if (anchors and not anchor_hit): reasons.append("anchor_miss")
     log.info("fallback_check reasons=%s local_hits=%s", reasons, local_ok)
 
-    # === pageId 강제 핀: 요청에 pageId가 있는데 현재 후보에 그 pid가 하나도 없으면 폴백 강제 ===
     pid_miss = False
     if forced_page_id:
         def _hit_has_pid(h, pid):
@@ -1759,7 +1797,6 @@ async def query(payload: dict = Body(...)):
             NEED_FALLBACK = True
             reasons.append("pid_miss")
 
-
     if "anchor_miss" in reasons and reasons == ["anchor_miss"]:
         NEED_FALLBACK = not local_ok
         if not NEED_FALLBACK:
@@ -1771,7 +1808,7 @@ async def query(payload: dict = Body(...)):
     allow_fallback = (
         any(r in reasons for r in allow_reasons) or
         ("anchor_miss" in reasons and not local_ok) or
-        ("acronym_miss" in reasons)       
+        ("acronym_miss" in reasons)
     )
     client_spaces = (payload or {}).get("spaces")
     if NEED_FALLBACK and not _should_use_mcp(q, client_spaces, space, reasons, local_ok):
@@ -1780,8 +1817,7 @@ async def query(payload: dict = Body(...)):
 
     if NEED_FALLBACK and not DISABLE_INTERNAL_MCP and allow_fallback:
         fallback_attempted = True
-        mcp_results = []  # 예외가 나도 안전하게 초기화
-
+        mcp_results = []
         try:
             log.info("MCP fallback (fast): q=%r", q)
             spaces_for_mcp = allowed_spaces or ([space] if space else [None])
@@ -1791,27 +1827,23 @@ async def query(payload: dict = Body(...)):
         except Exception as e:
             log.error("MCP fallback fast failed: %s", "".join(traceback.format_exception(e)))
 
-        # pageId 강제 필터
         if forced_page_id and mcp_results:
             mcp_results = [
                 r for r in mcp_results
                 if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id
             ]
 
-        # sticky 처리
         if mcp_results and STICKY_AFTER_MCP:
             first = mcp_results[0]
             target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
             if target:
                 _set_sticky(target)
 
-        # 화면 items/contexts 생성 + 업서트
         if mcp_results:
             items, contexts, up_docs = _mcp_results_to_items(
                 mcp_results, k=int(k) if isinstance(k, int) else 5
             )
             added = 0
-
             if MCP_WRITEBACK and up_docs:
                 if MCP_WRITEBACK_TITLES_ONLY:
                     up_docs = [d for d in up_docs if (d.metadata or {}).get("kind") == "title"]
@@ -1820,22 +1852,19 @@ async def query(payload: dict = Body(...)):
                     vectorstore.save_local(INDEX_DIR)
                     _reload_retriever()
 
-                # 첫 결과를 최근 소스로 스티키 처리하면 연속 후속질문 안정적
-                try:
-                    if mcp_results and (mcp_results[0].get("url") or mcp_results[0].get("id")):
-                        # _set_sticky(mcp_results[0].get("url") or f"confluence:{mcp_results[0].get('id')}")
-                        want_sticky = False
-                        if forced_page_id or THIS_FILE_PAT.search(q) or re.search(r'([^\s"\'()]+\.pdf)', q, re.I):
-                            want_sticky = True
-                        if STICKY_AFTER_MCP and want_sticky:
-                            try:
-                                first = mcp_results[0]
-                                _set_sticky(first.get("url") or f"confluence:{first.get('id')}")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
+            try:
+                if mcp_results and (mcp_results[0].get("url") or mcp_results[0].get("id")):
+                    want_sticky = False
+                    if forced_page_id or THIS_FILE_PAT.search(q) or re.search(r'([^\s"\'()]+\.pdf)', q, re.I):
+                        want_sticky = True
+                    if STICKY_AFTER_MCP and want_sticky:
+                        try:
+                            first = mcp_results[0]
+                            _set_sticky(first.get("url") or f"confluence:{first.get('id')}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     # 장/조 질의면 필터 스킵
     if items and not (chapter_no or article_no):
@@ -1854,9 +1883,7 @@ async def query(payload: dict = Body(...)):
             if anchors and not any(_norm_kr(a) in blob_norm_final for a in anchors):
                 items, contexts = [], []
 
-
-        
-        # >>> [REPLACE] 비었을 때의 보조 폴백도 fast 버전으로 통일
+        # 비었을 때의 보조 폴백도 fast 버전으로
         if not items and not DISABLE_INTERNAL_MCP and _should_use_mcp(q, client_spaces, space, reasons, local_ok):
             fallback_attempted = True
             spaces_for_mcp = allowed_spaces or ([space] if space else [None])
@@ -1887,11 +1914,8 @@ async def query(payload: dict = Body(...)):
                     if target:
                         _set_sticky(target)
 
-
-
     base_notes = {"missing_article": missing_article, "article_no": article_no}
     if fallback_attempted:
-        # indexed/added는 MCP 업서트가 실제로 있었는지에 따라 값 세팅(위에서 added=0으로 시작)
         base_notes["fallback_used"] = True
         base_notes["indexed"] = (added > 0)
         if added > 0:
@@ -1910,7 +1934,6 @@ async def query(payload: dict = Body(...)):
             "notes": base_notes | {"low_relevance": True},
         }
 
-    # [OPT-ADD] items가 비면 contexts에서도 수집(방어 코팅)
     def _collect_source_urls_from_contexts(ctxs: list[dict]) -> list[str]:
         urls = []
         for c in ctxs or []:
@@ -1919,7 +1942,6 @@ async def query(payload: dict = Body(...)):
                 urls.append(u)
         return urls
 
-    # (교체)
     src_urls = _collect_source_urls(items)
     if not src_urls:
         src_urls = _collect_source_urls_from_contexts(contexts)
@@ -1931,19 +1953,9 @@ async def query(payload: dict = Body(...)):
         "context_texts": [it["text"] for it in items],
         "documents": items,
         "chunks": items,
-        "source_urls": src_urls,  # ← 보강된 리스트
+        "source_urls": src_urls,
         "notes": base_notes,
     }
-    # return {
-    #     "hits": len(items),
-    #     "items": items,
-    #     "contexts": contexts,
-    #     "context_texts": [it["text"] for it in items],
-    #     "documents": items,
-    #     "chunks": items,
-    #     "source_urls": _collect_source_urls(items),
-    #     "notes": base_notes,
-    # }
 
 
 # ------- helper: chunk text -------
