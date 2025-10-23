@@ -336,6 +336,20 @@ def _is_datetime_question(q: str) -> bool:
     # 실제로 날짜/시간을 묻는지 확인
     return bool(_DATE_TIME_NEED_RE.search(q))
 
+
+def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16) -> list[str]:
+    """최종 컨텍스트에서 URL만 뽑아 pageId 기준 정규화/중복 제거."""
+    seen, out = set(), []
+    for c in ctxs or []:
+        u = c.get("url") or c.get("source")
+        cu = _canon_url(u)
+        if cu and cu not in seen:
+            seen.add(cu)
+            out.append(cu)
+            if len(out) >= top_n:
+                break
+    return out
+
 def _now_str_kst() -> tuple[str, str, str]:
     try:
         now = datetime.now(ZoneInfo(TZ_NAME))
@@ -1410,7 +1424,7 @@ async def query(payload: dict = Body(...)):
                     vectorstore.save_local(INDEX_DIR)
                     _reload_retriever()
 
-            src_urls = _collect_source_urls(items)
+            src_urls = _collect_source_urls_from_contexts(contexts)
             return {
                 "hits": len(items),
                 "items": items,
@@ -1934,17 +1948,8 @@ async def query(payload: dict = Body(...)):
             "notes": base_notes | {"low_relevance": True},
         }
 
-    def _collect_source_urls_from_contexts(ctxs: list[dict]) -> list[str]:
-        urls = []
-        for c in ctxs or []:
-            u = c.get("source") or c.get("url")
-            if u and u not in urls:
-                urls.append(u)
-        return urls
 
-    src_urls = _collect_source_urls(items)
-    if not src_urls:
-        src_urls = _collect_source_urls_from_contexts(contexts)
+    src_urls = _collect_source_urls_from_contexts(contexts)
 
     return {
         "hits": len(items),
@@ -1973,6 +1978,19 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
         if i < 0:
             i = 0
     return out
+
+_URL_CANON_RE = re.compile(r"(pageId=\d+)")
+
+def _canon_url(u: Optional[str]) -> str:
+    if not u:
+        return ""
+    s = str(u).split("#")[0].strip().rstrip("/")
+    m = _URL_CANON_RE.search(s)
+    if m:  # https://.../viewpage.action?pageId=123456 형태로 통일
+        base = s.split("?", 1)[0]
+        return f"{base}?{m.group(1)}"
+    return s
+
 
 
 # [ADD] ------- helper: collect source urls -------

@@ -86,6 +86,17 @@ def _filter_urls_by_host(urls: list[str]) -> list[str]:
 def _strip_josa(tok: str) -> str:
     return _JOSA_RE.sub('', tok)
 
+def _urls_from_contexts(ctxs: list[dict], top_n: int | None = None) -> list[str]:
+    top_n = top_n or ROUTER_SOURCES_MAX
+    out, seen = [], set()
+    for c in ctxs or []:
+        u = c.get("url") or c.get("source")
+        nu = _normalize_url(str(u)) if u else ""
+        if nu and nu not in seen:
+            seen.add(nu); out.append(nu)
+            if len(out) >= top_n:
+                break
+    return out
 
 def _httpx_timeout():
     import httpx
@@ -534,8 +545,8 @@ async def chat(req: ChatReq):
 
             qa_json  = best
             qa_items = items
-            qa_urls  = (_limit_urls(best.get("source_urls"))
-                        if best.get("source_urls") else _collect_urls_from_items(items, top_n=ROUTER_SOURCES_MAX))
+            qa_urls = _limit_urls(best.get("source_urls")) if best.get("source_urls") \
+                      else _urls_from_contexts(best.get("contexts"))
             break
 
 
@@ -617,11 +628,11 @@ async def chat(req: ChatReq):
                 j2 = {}
 
 
-            # ★ 여기서 바로 평가/갱신 (바깥에 동일 코드 두지 말기)
+            # 여기서 바로 평가/갱신 (바깥에 동일 코드 두지 말기)
             for qj in (j1, j2):
                 items = (qj.get("items") or qj.get("contexts") or [])
-                urls  = (_limit_urls(qj.get("source_urls"))
-                        if qj.get("source_urls") else _collect_urls_from_items(items, top_n=ROUTER_SOURCES_MAX))
+                urls = _limit_urls(qj.get("source_urls")) if qj.get("source_urls") \
+                       else _urls_from_contexts(qj.get("contexts"))
                 ctx_list = (qj.get("context_texts")
                             or [c.get("text","") for c in (qj.get("contexts") or [])]
                             or [it.get("text","") for it in (qj.get("items") or [])])
