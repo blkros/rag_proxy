@@ -698,11 +698,14 @@ def _norm_ko_text(s: str) -> str:
     return _collapse_korean_compounds(_apply_canon_map(_basic_normalize(s))).lower()
 
 def _longest_ko_phrase(q: str) -> str:
-    # 쿼리에서 가장 긴 한글 연속구절(복합명사 포함)을 뽑아 제목 정합성 판단에 사용
+    q = _preseg_stop_phrases(_basic_normalize(q)) 
     cands = re.findall(r"[가-힣]{2,}(?:\s+[가-힣]{2,})*", q or "")
     if not cands:
         return ""
-    return _norm_ko_text(max(cands, key=lambda x: len(x)))
+    # 조사도 한 번 더 걷어내고 정규화
+    norm = [_norm_ko_text(_strip_josa(c)) for c in cands]
+    norm = [c for c in norm if c]
+    return max(norm, key=len) if norm else ""
 
 def _dedup_by_title(results: list[dict]) -> list[dict]:
     seen, out = set(), []
@@ -715,46 +718,49 @@ def _dedup_by_title(results: list[dict]) -> list[dict]:
     return out
 
 def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
-    """제목 정확/부분 일치와 토큰 커버리지 기반 가중치로 결과 재정렬"""
     if not results:
         return []
-    keyphrase = _longest_ko_phrase(q)
-    q_tokens  = _tokenize_query(q)
+    keyphrase = _longest_ko_phrase(q)       # 이제 ‘상가정보’
+    q_tokens  = _tokenize_query(q)          # ['NIA','상가정보'] 등
     acrs      = re.findall(r"\b[A-Z]{2,10}\b", q)
+
+    # 추가: 약어+키프레이즈 결합(예: 'NIA상가정보')
+    combo = _norm_ko_text((acrs[0] + keyphrase) if (acrs and keyphrase) else "")
 
     scored = []
     for r in results:
         title = r.get("title") or ""
         body  = r.get("body") or r.get("excerpt") or r.get("text") or ""
         ntitle = _norm_ko_text(title)
-
         s = float(r.get("score") or 0.0)
 
-        # 제목 정확 일치/부분 일치 가산점
+        # ① 제목 정확/부분 일치
         if keyphrase and ntitle:
-            if ntitle == keyphrase:
-                s += 2.0     # 강한 보정: '최대수요추출 방법' 같은 정확 제목
-            elif keyphrase in ntitle:
-                s += 1.0
+            if ntitle == keyphrase:      s += 2.0
+            elif keyphrase in ntitle:    s += 1.0
 
-        # 토큰 커버리지(제목/본문)
+        # ② 약어+키프레이즈 결합 타이틀 매치(강한 보정)
+        if combo and ntitle:
+            if ntitle == combo:          s += 2.2
+            elif combo in ntitle:        s += 1.4
+
+        # ③ 토큰 커버리지
         if q_tokens:
             s += 0.12 * sum(1 for t in q_tokens if t in title)
             s += 0.05 * sum(1 for t in q_tokens if t in (body[:800] or ""))
 
-        # 약어(예: NIA/DR/POC 등) 제목 히트 보너스
+        # ④ 약어가 제목에 있으면 약간 보너스
         if acrs and any(a in title for a in acrs):
             s += 0.2
 
-        # 로그인/빈본문 같은 저품질 패널티
         if LOGIN_PAT.search(body or ""):
             s -= 0.5
-
         r["_rank"] = s
         scored.append(r)
 
     scored.sort(key=lambda x: x.get("_rank", 0.0), reverse=True)
     return _dedup_by_title(scored)
+
 
 # 1) 기본 정규화: 호환성 정규화 + 공백 축약
 def _basic_normalize(text: str) -> str:
