@@ -613,7 +613,7 @@ async def chat(req: ChatReq):
         for v in variants:
             try:
                 payload1 = {"q": v, "k": 5, "sticky": False}
-                if spaces_hint:                     # ← 추가
+                if spaces_hint:                     
                     payload1["spaces"] = spaces_hint
                 j1 = (await client.post(f"{RAG}/qa", json=payload1)).json()
             except Exception:
@@ -621,7 +621,7 @@ async def chat(req: ChatReq):
 
             try:
                 payload2 = {"q": v, "k": 5, "sticky": True}
-                if spaces_hint:                     # ← 추가
+                if spaces_hint:                     
                     payload2["spaces"] = spaces_hint
                 j2 = (await client.post(f"{RAG}/qa", json=payload2)).json()
             except Exception:

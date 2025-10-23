@@ -86,16 +86,20 @@ current_source_until: float = 0.0
 STICKY_SECS = int(getattr(settings, "STICKY_SECS", 180))
 
 STICKY_STRICT = bool(getattr(settings, "STICKY_STRICT", True))
-STICKY_FROM_COALESCE = bool(getattr(settings, "STICKY_FROM_COALESCE", False))  # 기본 False
-STICKY_AFTER_MCP = bool(getattr(settings, "STICKY_AFTER_MCP", True))          # 기본 False
+STICKY_FROM_COALESCE = bool(getattr(settings, "STICKY_FROM_COALESCE", False))
+STICKY_AFTER_MCP = bool(getattr(settings, "STICKY_AFTER_MCP", True))         
+
+# Sticky 동작 모드/가중치/소스 쏠림 상한 (기본: 기존과 동일)
+STICKY_MODE   = str(getattr(settings, "STICKY_MODE", "bonus")).lower()   # filter = pdf에 집착, bonus = 발란스 형
+STICKY_BONUS  = float(getattr(settings, "STICKY_BONUS", 0.18))           # bonus 모드에서 가산점
+PER_SOURCE_CAP = int(getattr(settings, "PER_SOURCE_CAP", 0))             # 0=off, >0이면 소스당 최대 N개
+
 
 # ← [ADD] 앵커 추출(질문 핵심어) + sticky 유효성 검사
 _GENERIC = set("보고 보고서 리포트 정보 정리 페이지 자료 문서 요약 정책 통계 항목 사이트 url 링크 출처".split())
 
 # >>> [ADD] pageId 추출/URL 정규화 유틸
 _PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
-
-
 
 
 # 1) '오늘/지금/현재' 같은 지시어가 필수
@@ -476,6 +480,59 @@ def _apply_local_bonus(hits: list[dict]):
         ### [FIX] 경로 표준화 기반의 로컬 판별 사용
         if _is_local_source(src):
             h["score"] = float(h.get("score") or 0.0) + LOCAL_BONUS
+
+def _apply_sticky_bonus(hits: list[dict], sticky_src: str | None):
+    """sticky를 강제 필터 대신 '가산점'으로만 반영"""
+    if not sticky_src:
+        return
+    want = _norm_source(sticky_src)
+    for h in hits or []:
+        md = (h.get("metadata") or {})
+        src = _norm_source(str(md.get("source") or md.get("url") or ""))
+        if src == want:
+            h["score"] = float(h.get("score") or 0.0) + STICKY_BONUS
+
+def _rebalance_by_source(hits: list[dict], k: int, per_source_cap: int) -> list[dict]:
+    """소스 다양성 보장: 소스당 최대 per_source_cap개, 라운드로빈으로 k개 선택"""
+    if per_source_cap <= 0:
+        return hits[:k]
+    # 점수순 그룹화
+    groups: dict[str, list[dict]] = {}
+    for h in sorted(hits, key=lambda x: float(x.get("score") or 0.0), reverse=True):
+        key = _norm_source(str((h.get("metadata") or {}).get("source") or ""))
+        groups.setdefault(key, []).append(h)
+
+    out: list[dict] = []
+    # 1차: 라운드로빈
+    while len(out) < k and any(groups.values()):
+        for key in list(groups.keys()):
+            lst = groups.get(key) or []
+            if not lst:
+                groups.pop(key, None); continue
+            used = sum(1 for x in out
+                       if _norm_source(str((x.get("metadata") or {}).get("source") or "")) == key)
+            if used < per_source_cap:
+                out.append(lst.pop(0))
+                if len(out) >= k:
+                    break
+            else:
+                groups[key] = []  # 이 소스는 상한 도달
+
+    # 2차: 아직 모자라면 남은 후보로 채우되 상한을 넘기지 않음
+    if len(out) < k:
+        leftovers: list[dict] = []
+        for lst in groups.values():
+            leftovers.extend(lst)
+        leftovers.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+        for h in leftovers:
+            key = _norm_source(str((h.get("metadata") or {}).get("source") or ""))
+            used = sum(1 for x in out
+                       if _norm_source(str((x.get("metadata") or {}).get("source") or "")) == key)
+            if used < per_source_cap:
+                out.append(h)
+                if len(out) >= k:
+                    break
+    return out[:k]
 
 def _apply_page_hint(hits: List[dict], page_id: str | None):
     """pageId가 오면 '가산점'만 (soft). 잠그지 않음."""
@@ -1504,10 +1561,14 @@ async def query(payload: dict = Body(...)):
     ignore_sticky = (sticky_flag is False) or (isinstance(sticky_flag, str) and str(sticky_flag).lower() in ("0","false","no"))
 
     # sticky 적용 (유효기간 + 관련성 체크)
+    sticky_source = None
     now = time.time()
     if (not ignore_sticky) and not src_filter and not src_set and current_source and now < current_source_until:
         if (not STICKY_STRICT) or _sticky_is_relevant(q, current_source):
-            src_filter = current_source
+            if STICKY_MODE == "filter":
+                src_filter = current_source
+            else:  # "bonus"
+                sticky_source = current_source
         else:
             current_source = None
             current_source_until = 0.0
@@ -1664,6 +1725,10 @@ async def query(payload: dict = Body(...)):
     _apply_local_bonus(pool_hits)
     _apply_acronym_bonus(pool_hits, q)
 
+    # sticky가 '보너스 모드'면 가산점만 반영
+    if sticky_source and STICKY_MODE == "bonus":
+        _apply_sticky_bonus(pool_hits, sticky_source)
+
     q_tokens = _tokenize_query(q)
     if q_tokens:
         for h in pool_hits:
@@ -1734,6 +1799,10 @@ async def query(payload: dict = Body(...)):
     # 3-E) rerank + 의도기반 주입선택
     chosen = pick_for_injection(q, pool_hits, k_default=int(k) if isinstance(k, int) else 5)
     chosen = _coalesce_single_source(chosen, q)
+    # 소스 한쪽 쏠림 방지 기본은 0(비활성) 운영에서 켜고 싶을 때만 설정으로 조정
+    if PER_SOURCE_CAP > 0:
+        chosen = _rebalance_by_source(chosen, k=int(k) if isinstance(k, int) else 5, per_source_cap=PER_SOURCE_CAP)
+        
     if intent.get("article_no") and src_filter and not any(
         (h.get("metadata") or {}).get("article_no") == intent["article_no"] for h in chosen
     ):
@@ -2199,20 +2268,22 @@ async def v1_chat(payload: dict = Body(...)):
         else:
             content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
 
-    # === PATCH START: 출처 목록을 허용 호스트로 필터 ===
+    # 출처 목록을 허용 호스트로 필터
     allowed_list = _filter_urls_by_host(r.get("source_urls", []) or [])
     allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://","https://"))]
 
-    if content and allowed_http:
-        def _keep_allowed(m):
-            url = m.group(0)
-            return url if any(url.startswith(a) for a in allowed_http) else ""
-        content = re.sub(r'https?://[^\s\)\]]+', _keep_allowed, content)
+    allowed_hosts = set(SOURCE_HOST_WHITELIST or [])
+    
+    def _keep_allowed(m):
+        url = m.group(0)
+        h = _host_of(url)
+        return url if (not allowed_hosts or any(h == w or h.endswith("." + w) for w in allowed_hosts)) else ""
+    content = re.sub(r'https?://[^\s\)\]]+', _keep_allowed, content)
 
     if allowed_list:
         src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_list)
         content = (content or "") + src_block
-    # === PATCH END ===
+
 
 
     # 4) OpenAI 호환 스키마로 감싸서 반환
