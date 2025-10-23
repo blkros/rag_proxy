@@ -234,38 +234,44 @@ def _mcp_results_to_items(mcp_results: list[dict], k: int) -> tuple[list[dict], 
         title = (r.get("title") or "").strip()
         body  = (r.get("body") or r.get("excerpt") or r.get("text") or "")
         body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
-        if not (title or body.strip()):
-            continue
 
-        # pageId 보강
         pid = (r.get("id") or "").strip()
         if not pid:
             m_pid = re.search(r"[?&]pageId=(\d+)", (r.get("url") or ""))
             if m_pid: pid = m_pid.group(1)
 
-        src   = (r.get("url") or f"confluence:{pid}").strip()
-        space = (r.get("space") or "").strip()
-        text  = ((title + "\n\n") if title else "") + body
+        raw_url = (r.get("url") or f"confluence:{pid}").strip()
+        src_url = _canon_url(raw_url, pid if pid else None)   
+        space   = (r.get("space") or "").strip()
+        text    = ((title + "\n\n") if title else "") + (body or "")
 
         md = {
-            "source": src,
-            "url": src,
+            "source": src_url,     # ← 표준화된 URL을 source/url 모두에
+            "url": src_url,
             "kind": "confluence",
             "page": pid or None,
+            "pageId": pid or None, 
             "space": space,
             "title": title,
         }
-        items.append({"text": text, "metadata": md, "score": 0.5})
-        contexts.append({"text": text, "source": md["source"], "page": md["page"], "kind": md["kind"], "score": 0.5})
 
-        # 인덱스 업서트용
+        score = float(r.get("_rank") or r.get("score") or 0.5)  # ← 재랭킹 점수 반영
+
+        items.append({"text": text, "metadata": md, "score": score})
+        contexts.append({"text": text, "source": md["source"], "page": md["page"], "kind": md["kind"], "score": score})
+
         if title:
-            up_docs.append(Document(page_content=f"[TITLE] {title}",
-                                    metadata={"source": src, "title": title, "space": space, "kind": "title", "page": pid or None}))
+            up_docs.append(Document(
+                page_content=f"[TITLE] {title}",
+                metadata={"source": src_url, "title": title, "space": space, "kind": "title", "page": pid or None, "pageId": pid or None}
+            ))
         for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
-            up_docs.append(Document(page_content=c,
-                                    metadata={"source": src, "title": title, "space": space, "kind": "chunk", "page": pid or None}))
+            up_docs.append(Document(
+                page_content=c,
+                metadata={"source": src_url, "title": title, "space": space, "kind": "chunk", "page": pid or None, "pageId": pid or None}
+            ))
     return items, contexts, up_docs
+
 
 
 # 빠른 MCP 폴백: 여러 후보 질의를 '동시에' 던지고 '첫 성공'만 사용
@@ -686,6 +692,70 @@ def _sparse_keyword_hits(q: str, limit: int = 150, space: Optional[str] = None) 
     out.sort(key=lambda h: h["score"], reverse=True)
     return out[:int(limit)]
 
+# ===== 제목/한글구절 정규화 유틸 =====
+def _norm_ko_text(s: str) -> str:
+    # 이미 있는 _basic_normalize / _apply_canon_map / _collapse_korean_compounds 활용
+    return _collapse_korean_compounds(_apply_canon_map(_basic_normalize(s))).lower()
+
+def _longest_ko_phrase(q: str) -> str:
+    # 쿼리에서 가장 긴 한글 연속구절(복합명사 포함)을 뽑아 제목 정합성 판단에 사용
+    cands = re.findall(r"[가-힣]{2,}(?:\s+[가-힣]{2,})*", q or "")
+    if not cands:
+        return ""
+    return _norm_ko_text(max(cands, key=lambda x: len(x)))
+
+def _dedup_by_title(results: list[dict]) -> list[dict]:
+    seen, out = set(), []
+    for r in results or []:
+        t = _norm_ko_text(r.get("title") or "")
+        if t and t not in seen:
+            seen.add(t); out.append(r)
+        elif not t:
+            out.append(r)
+    return out
+
+def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
+    """제목 정확/부분 일치와 토큰 커버리지 기반 가중치로 결과 재정렬"""
+    if not results:
+        return []
+    keyphrase = _longest_ko_phrase(q)
+    q_tokens  = _tokenize_query(q)
+    acrs      = re.findall(r"\b[A-Z]{2,10}\b", q)
+
+    scored = []
+    for r in results:
+        title = r.get("title") or ""
+        body  = r.get("body") or r.get("excerpt") or r.get("text") or ""
+        ntitle = _norm_ko_text(title)
+
+        s = float(r.get("score") or 0.0)
+
+        # 제목 정확 일치/부분 일치 가산점
+        if keyphrase and ntitle:
+            if ntitle == keyphrase:
+                s += 2.0     # 강한 보정: '최대수요추출 방법' 같은 정확 제목
+            elif keyphrase in ntitle:
+                s += 1.0
+
+        # 토큰 커버리지(제목/본문)
+        if q_tokens:
+            s += 0.12 * sum(1 for t in q_tokens if t in title)
+            s += 0.05 * sum(1 for t in q_tokens if t in (body[:800] or ""))
+
+        # 약어(예: NIA/DR/POC 등) 제목 히트 보너스
+        if acrs and any(a in title for a in acrs):
+            s += 0.2
+
+        # 로그인/빈본문 같은 저품질 패널티
+        if LOGIN_PAT.search(body or ""):
+            s -= 0.5
+
+        r["_rank"] = s
+        scored.append(r)
+
+    scored.sort(key=lambda x: x.get("_rank", 0.0), reverse=True)
+    return _dedup_by_title(scored)
+
 # 1) 기본 정규화: 호환성 정규화 + 공백 축약
 def _basic_normalize(text: str) -> str:
     # NFC로 정규화 (한글 결합형 안정화)
@@ -702,10 +772,18 @@ def _collapse_korean_compounds(text: str) -> str:
     return re.sub(fr"(?<={_HANGUL_BLOCK})\s+(?={_HANGUL_BLOCK})", "", text)
 
 # 3) 도메인 동의어/약어 매핑 (좌변 패턴 → 우변 표준형)
+# CANON_MAP = {
+#     r"\bNIA\b": "한국지능정보사회진흥원",
+#     r"한국\s*지능\s*정보\s*사회\s*진흥원": "한국지능정보사회진흥원",
+#     r"국가\s*정보화\s*진흥원": "한국지능정보사회진흥원",  # 옛 명칭
+#     r"지역\s*정보": "지역정보",
+#     r"아파트\s*누리": "아파트누리",
+#     r"개발\s*서버\s*정보": "개발서버정보",
+# }
+
 CANON_MAP = {
-    r"\bNIA\b": "한국지능정보사회진흥원",
-    r"한국\s*지능\s*정보\s*사회\s*진흥원": "한국지능정보사회진흥원",
-    r"국가\s*정보화\s*진흥원": "한국지능정보사회진흥원",  # 옛 명칭
+    r"한국\s*지능\s*정보\s*사회\s*진흥원": "NIA",   # ← 길->짧
+    r"국가\s*정보화\s*진흥원": "NIA",              # 옛 명칭도 NIA로
     r"지역\s*정보": "지역정보",
     r"아파트\s*누리": "아파트누리",
     r"개발\s*서버\s*정보": "개발서버정보",
@@ -1486,6 +1564,7 @@ async def query(payload: dict = Body(...)):
                 q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
             )
             mcp_results = _filter_mcp_by_strong_tokens(mcp_results, q)
+            mcp_results = _rerank_mcp_results(q, mcp_results)
         except Exception as e:
             mcp_results = []
             log.error("forced MCP (confluence hint) failed: %s", "".join(traceback.format_exception(e)))
@@ -1948,6 +2027,7 @@ async def query(payload: dict = Body(...)):
                 q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
             )
             mcp_results = _filter_mcp_by_strong_tokens(mcp_results, q)
+            mcp_results = _rerank_mcp_results(q, mcp_results)
         except Exception as e:
             log.error("MCP fallback fast failed: %s", "".join(traceback.format_exception(e)))
 
@@ -2015,6 +2095,7 @@ async def query(payload: dict = Body(...)):
                 q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
             )
             mcp_results = _filter_mcp_by_strong_tokens(mcp_results, q)
+            mcp_results = _rerank_mcp_results(q, mcp_results)
             if forced_page_id and mcp_results:
                 mcp_results = [r for r in mcp_results
                             if _url_has_page_id(r.get("url"), forced_page_id)
@@ -2273,7 +2354,7 @@ async def v1_chat(payload: dict = Body(...)):
     allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://","https://"))]
 
     allowed_hosts = set(SOURCE_HOST_WHITELIST or [])
-    
+
     def _keep_allowed(m):
         url = m.group(0)
         h = _host_of(url)
