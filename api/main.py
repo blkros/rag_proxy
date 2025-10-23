@@ -866,17 +866,11 @@ def _make_embedder() -> HuggingFaceEmbeddings:
         model_kwargs={"device": EMBEDDING_DEVICE},
         encode_kwargs={"normalize_embeddings": True}
     )
-    # [ADD] e5 instruct 프리픽스 주입 (LangChain 메서드를 래핑)
-    if settings.E5_USE_PREFIX and "e5" in EMBEDDING_MODEL.lower():
+    if getattr(settings, "E5_USE_PREFIX", False) and "e5" in EMBEDDING_MODEL.lower():
         _orig_eq = emb.embed_query
         _orig_ed = emb.embed_documents
-
-        def _eq(text: str):
-            return _orig_eq(f"query: {text}")
-
-        def _ed(texts: List[str]):
-            return _orig_ed([f"passage: {t}" for t in texts])
-
+        def _eq(text: str): return _orig_eq(f"query: {text}")
+        def _ed(texts: List[str]): return _orig_ed([f"passage: {t}" for t in texts])
         emb.embed_query = _eq        # type: ignore
         emb.embed_documents = _ed    # type: ignore
     return emb
@@ -1278,84 +1272,47 @@ async def update_index(payload: dict):
         raise HTTPException(500, f"update failed: {detail}")
 
 
-
-# api/main.py 의 delete_index 전체를 아래로 교체
-
 @app.delete("/delete")
 async def delete_index(payload: Optional[dict] = None):
-    """
-    인덱스 삭제:
-      - {"mode":"all"} → 인덱스 폴더 삭제 후 '빈 인덱스'로 재초기화
-      - {"source":"uploads/파일.pdf"} → 해당 source만 제거
-    """
-    global vectorstore 
-    global current_source, current_source_until, last_source 
-
+    global vectorstore, current_source, current_source_until, last_source
     if vectorstore is None:
         raise HTTPException(500, "vectorstore is not ready.")
-
     payload = payload or {}
-    mode = payload.get("mode")
-    source = payload.get("source")
+    mode = payload.get("mode"); source = payload.get("source")
 
     if mode == "all":
         try:
-            root = Path(INDEX_DIR)
-            if root.exists():
-                for child in root.iterdir():
-                    if child.is_dir():
-                        shutil.rmtree(child, ignore_errors=True)
-                    else:
-                        try:
-                            child.unlink()
-                        except Exception:
-                            pass
-
-            # 빈 인덱스로 재초기화
-            vectorstore = _empty_faiss()
-            vectorstore.save_local(INDEX_DIR)
-            _reload_retriever()
-            VS.vectorstore = vectorstore
-            VS.retriever  = retriever
-
-            # sticky 상태도 초기화
-            current_source = None
-            current_source_until = 0.0
-            last_source = None
-
-            return {
-                "deleted": "all",
-                "doc_count": len(vectorstore.docstore._dict)
-            }
+            async with index_lock:
+                root = Path(INDEX_DIR)
+                if root.exists():
+                    for child in root.iterdir():
+                        shutil.rmtree(child, ignore_errors=True) if child.is_dir() else child.unlink(missing_ok=True)
+                vectorstore = _empty_faiss()
+                vectorstore.save_local(INDEX_DIR)
+                _reload_retriever()
+                VS.vectorstore = vectorstore; VS.retriever = retriever
+                current_source = None; current_source_until = 0.0; last_source = None
+            return {"deleted": "all", "doc_count": len(vectorstore.docstore._dict)}
         except Exception as e:
             raise HTTPException(500, f"delete all failed: {e}")
 
-
     if source:
         try:
-            docstore = vectorstore.docstore._dict
-            norm = _norm_source
-            target = [doc_id for doc_id, doc in docstore.items()
-                    if norm(str(doc.metadata.get("source",""))) == norm(source)]
-            if not target:
-                return {"deleted": 0, "reason": f"no documents with source={source}"}
-
-            vectorstore.delete(target)
-            vectorstore.save_local(INDEX_DIR)
-            _reload_retriever()
-
-            # ←←← (유지) 삭제한 소스가 sticky/last였다면 해제
+            async with index_lock:
+                docstore = vectorstore.docstore._dict
+                norm = _norm_source
+                target = [doc_id for doc_id, doc in docstore.items()
+                          if norm(str(doc.metadata.get("source",""))) == norm(source)]
+                if not target:
+                    return {"deleted": 0, "reason": f"no documents with source={source}"}
+                vectorstore.delete(target)
+                vectorstore.save_local(INDEX_DIR)
+                _reload_retriever()
             if _norm_source(source) == (current_source or ""):
-                current_source = None
-                current_source_until = 0.0
+                current_source = None; current_source_until = 0.0
             if _norm_source(source) == (last_source or ""):
                 last_source = None
-
-            return {
-                "deleted": len(target),
-                "source": source,
-                "doc_count": len(vectorstore.docstore._dict)
-            }
+            return {"deleted": len(target), "source": source, "doc_count": len(vectorstore.docstore._dict)}
         except Exception as e:
             raise HTTPException(500, f"delete by source failed: {e}")
 
@@ -1770,7 +1727,8 @@ async def query(payload: dict = Body(...)):
     # L2 → 유사도 근사
     def _sim_from_dist(dist):
         try:
-            s = 1.0 - float(dist)/2.0
+            d = float(dist)
+            s = 1.0 - 0.5 * d
             return max(0.0, min(1.0, s))
         except Exception:
             return 0.0
@@ -2133,6 +2091,9 @@ async def query(payload: dict = Body(...)):
             base_notes["added"] = added
 
     if not items:
+        base_notes["low_relevance"] = True  # ← 컨텍스트 사용 부적합 신호를 명시
+
+    if not items:
         return {
             "hits": 0,
             "items": [],
@@ -2328,62 +2289,56 @@ async def v1_chat(payload: dict = Body(...)):
     # 2) direct_answer가 있으면 그대로 사용
     content = r.get("direct_answer")
 
-    # 3) 없으면 contexts를 컨텍스트로 하여 한 번 요약 생성
+    # 3) 이 응답에서 컨텍스트를 '실제로' 쓸지 결정
+    notes = r.get("notes", {}) or {}
+    use_contexts = bool(r.get("contexts")) and not notes.get("low_relevance", False)
+
+    # RAG가 부적합(low_relevance)하면 stock direct_answer는 버리고 일반지식 모드로 넘어가도록 content를 비움
+    if content and notes.get("low_relevance") and not notes.get("forced_confluence") and notes.get("routed") != "no_rag":
+        content = None
+
     if not content:
-        ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()
-        if ctx:
-            # 길이 가드 추가 (문자 기준 8천자 정도면 vLLM 쾌적)
+        if use_contexts:
+            # (현행) 컨텍스트 요약 경로 유지
+            ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()
             ctx = ctx[:8000]
-
-            sys = (
-                "사고과정을 출력하지 말고, 아래 컨텍스트에 **근거한 사실만** 한국어로 답하라. "
-                "질문에 '제 N장' 또는 '제 N조'가 있으면, 컨텍스트에서 해당 장/조를 먼저 **그대로 인용(>)**하고, "
-                "다음 줄에 한 문장 요약을 붙여라. "
-                "컨텍스트에 없는 내용은 절대 추측하지 말고, 부족하면 '컨텍스트에 해당 정보가 없습니다'라고 말하라.\n\n"
-                "컨텍스트:\n" + ctx
-            )
-            msgs = [
-                {"role": "system", "content": sys},
-                {"role": "user", "content": q},
-            ]
-            try:
-                # 토큰/온도 명시(안정화)
+            if ctx:
+                sys = (
+                    "사고과정을 출력하지 말고, 아래 컨텍스트에 **근거한 사실만** 한국어로 답하라. "
+                    "질문에 '제 N장' 또는 '제 N조'가 있으면, 컨텍스트에서 해당 장/조를 먼저 **그대로 인용(>)**하고, "
+                    "다음 줄에 한 문장 요약을 붙여라. "
+                    "컨텍스트에 없는 내용은 절대 추측하지 말고, 부족하면 '컨텍스트에 해당 정보가 없습니다'라고 말하라.\n\n"
+                    "컨텍스트:\n" + ctx
+                )
+                msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
                 content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
-            except Exception as e:
-                log.warning("summarize failed: %s", e)
-                content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
-        else:
-            content = "주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
+            else:
+                # 컨텍스트가 비정상적으로 비었으면 일반지식 모드로 폴백
+                use_contexts = False
 
-    # 출처 목록을 허용 호스트로 필터
-    allowed_list = _filter_urls_by_host(r.get("source_urls", []) or [])
-    allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://","https://"))]
+        if not use_contexts:
+            # 4) 일반지식/비도메인 질문 → RAG 없이 모델 지식으로 답변 (출처 금지)
+            sys = (
+                "너는 내부 문서를 인용하지 않고도 답할 수 있는 일반 지식 질문에 답하는 어시스턴트다. "
+                "사고과정은 출력하지 말고, 한국어로 간결하고 정확하게 답하라. "
+                "출처나 링크는 붙이지 마라."
+            )
+            msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
+            content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
 
-    allowed_hosts = set(SOURCE_HOST_WHITELIST or [])
+    # 5) (중요) 출처는 '컨텍스트를 실제로 사용한 경우'에만, 그리고 http(s)만 붙이기
+    if use_contexts:
+        allowed_list = _filter_urls_by_host(r.get("source_urls", []) or [])
+        allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://", "https://"))]
+        if allowed_http:
+            src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_http)
+            content = (content or "") + src_block
 
-    def _keep_allowed(m):
-        url = m.group(0)
-        h = _host_of(url)
-        return url if (not allowed_hosts or any(h == w or h.endswith("." + w) for w in allowed_hosts)) else ""
-    content = re.sub(r'https?://[^\s\)\]]+', _keep_allowed, content)
-
-    if allowed_list:
-        src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_list)
-        content = (content or "") + src_block
-
-
-
-    # 4) OpenAI 호환 스키마로 감싸서 반환
+    # 6) OpenAI 호환 응답은 그대로 유지
     return {
         "object": "chat.completion",
         "model": "qwen3-30b-a3b-fp8-router",
         "created": int(_time.time()),
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }
-        ],
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         "notes": r.get("notes", {}),
     }
