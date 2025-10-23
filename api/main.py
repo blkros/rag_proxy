@@ -44,7 +44,7 @@ _COALESCE_TRIGGER = re.compile(r"(최근|이슈|목록|정리|요약|top\s*\d+|\
 
 SPACE_FILTER_MODE = getattr(settings, "SPACE_FILTER_MODE", "hard")
 SPACE_HINT_BONUS = float(getattr(settings, "SPACE_HINT_BONUS", 0.25))
-TITLE_BONUS      = float(getattr(settings, "TITLE_BONUS", 0.20))
+TITLE_BONUS      = float(getattr(settings, "TITLE_BONUS", 0.30))
 ENABLE_SPARSE    = bool(getattr(settings, "ENABLE_SPARSE", False))
 SPARSE_LIMIT     = int(getattr(settings, "SPARSE_LIMIT", 150))
 
@@ -59,6 +59,8 @@ CONFL_HINT_RE = re.compile(
     r"(?<![가-힣A-Za-z0-9])(컨플루언스|컨플|confluence)(?=(?:\s*(?:에서|문서|페이지))|[^가-힣A-Za-z0-9]|$)",
     re.I
 )
+
+CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL", "").rstrip("/")
 
 LOCAL_FIRST = bool(getattr(settings, "LOCAL_FIRST", True))
 LOCAL_BONUS = float(getattr(settings, "LOCAL_BONUS", 0.25))
@@ -115,9 +117,29 @@ _COMPANY_HINT_RE = re.compile(
     re.I
 )
 
-# === PATCH START: v1_chat 출처 호스트 화이트리스트(환경변수) ===
+# === v1_chat 출처 호스트 화이트리스트(환경변수) ===
 SOURCE_HOST_WHITELIST = [h.strip().lower() for h in os.getenv("ALLOWED_SOURCE_HOSTS","").split(",") if h.strip()]
-_URL_HOST_RE = re.compile(r"^https?://([^/]+)")
+_URL_HOST_RE  = re.compile(r"^https?://([^/]+)")
+
+ACRONYM_TITLE_BONUS = float(getattr(settings, "ACRONYM_TITLE_BONUS", 0.45))
+ACRONYM_BODY_BONUS  = float(getattr(settings, "ACRONYM_BODY_BONUS", 0.25))
+
+def _apply_acronym_bonus(hits: list[dict], q: str):
+    """제목/본문에 대문자 약어(SFTP, DR 등) 매치 시 가산점."""
+    acrs = re.findall(r"\b[A-Z]{2,10}\b", q or "")
+    if not acrs:
+        return
+    for h in hits:
+        md    = (h.get("metadata") or {})
+        title = md.get("title") or ""
+        text  = h.get("text")  or ""
+        bonus = 0.0
+        if any(a in title for a in acrs):
+            bonus += ACRONYM_TITLE_BONUS
+        if any(a in text[:1200] for a in acrs):
+            bonus += ACRONYM_BODY_BONUS
+        if bonus:
+            h["score"] = float(h.get("score") or 0.0) + bonus
 
 def _host_of(u: str) -> str:
     m = _URL_HOST_RE.match(str(u or ""))
@@ -132,7 +154,20 @@ def _filter_urls_by_host(urls: list[str]) -> list[str]:
         if h and any(h == w or h.endswith("." + w) for w in SOURCE_HOST_WHITELIST):
             out.append(u)
     return out
-# === PATCH END ===
+
+def _filter_mcp_by_strong_tokens(results: list[dict], q: str) -> list[dict]:
+    toks  = re.findall(r"[A-Za-z0-9가-힣]{3,}", _to_mcp_keywords(q))
+    acrs  = re.findall(r"\b[A-Z]{2,10}\b", q)
+    strong = acrs + toks
+    if not strong:
+        return results
+    out = []
+    for r in results or []:
+        blob = " ".join([(r.get("title") or ""),
+                         (r.get("body") or r.get("excerpt") or r.get("text") or "")])
+        if any(t in blob for t in strong):
+            out.append(r)
+    return out or results
 
 
 # 기존 시그니처: def _should_use_mcp(q: str, client_spaces: list | None, space: str | None) -> bool:
@@ -229,7 +264,7 @@ def _mcp_results_to_items(mcp_results: list[dict], k: int) -> tuple[list[dict], 
     return items, contexts, up_docs
 
 
-# >>> [ADD] 빠른 MCP 폴백: 여러 후보 질의를 '동시에' 던지고 '첫 성공'만 사용
+# 빠른 MCP 폴백: 여러 후보 질의를 '동시에' 던지고 '첫 성공'만 사용
 async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_mcp: list[Optional[str]]) -> list[dict]:
     import asyncio, time
     start = time.monotonic()
@@ -341,8 +376,9 @@ def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16) -> lis
     """최종 컨텍스트에서 URL만 뽑아 pageId 기준 정규화/중복 제거."""
     seen, out = set(), []
     for c in ctxs or []:
-        u = c.get("url") or c.get("source")
-        cu = _canon_url(u)
+        u   = c.get("url") or c.get("source")
+        pid = str(c.get("page") or "")
+        cu  = _canon_url(u, pid if pid else None)
         if cu and cu not in seen:
             seen.add(cu)
             out.append(cu)
@@ -738,9 +774,9 @@ def _empty_faiss() -> FAISSStore:
 def _reload_retriever():
     global retriever
     retriever = vectorstore.as_retriever(
-        search_type=settings.SEARCH_TYPE,                       # [MOD]
-        search_kwargs={"k": settings.RETRIEVER_K,               # [MOD]
-                       "fetch_k": settings.RETRIEVER_FETCH_K}   # [MOD]
+        search_type=settings.SEARCH_TYPE,                       
+        search_kwargs={"k": settings.RETRIEVER_K,               
+                       "fetch_k": settings.RETRIEVER_FETCH_K}   
     )
     VS.retriever = retriever
 
@@ -1392,9 +1428,11 @@ async def query(payload: dict = Body(...)):
             mcp_results = await _mcp_search_fast(
                 q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
             )
+            mcp_results = _filter_mcp_by_strong_tokens(mcp_results, q)
         except Exception as e:
             mcp_results = []
             log.error("forced MCP (confluence hint) failed: %s", "".join(traceback.format_exception(e)))
+
 
         # pageId 강제 필터
         if forced_page_id and mcp_results:
@@ -1576,7 +1614,8 @@ async def query(payload: dict = Body(...)):
         base_docs = []
 
     # --- 경량 스파스(키워드) 후보 융합 ---
-    if ENABLE_SPARSE:
+    want_sparse = ENABLE_SPARSE or bool(re.search(r"\b[A-Z]{2,10}\b", q)) or (len(_tokenize_query(q)) <= 3)
+    if want_sparse:
         sparse_hits = _sparse_keyword_hits(q, limit=SPARSE_LIMIT, space=space)
         _apply_space_hint(sparse_hits, space)
         _apply_page_hint(sparse_hits, page_id)
@@ -1623,6 +1662,7 @@ async def query(payload: dict = Body(...)):
     _apply_space_hint(pool_hits, space)
     _apply_page_hint(pool_hits, page_id)
     _apply_local_bonus(pool_hits)
+    _apply_acronym_bonus(pool_hits, q)
 
     q_tokens = _tokenize_query(q)
     if q_tokens:
@@ -1838,6 +1878,7 @@ async def query(payload: dict = Body(...)):
             mcp_results = await _mcp_search_fast(
                 q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
             )
+            mcp_results = _filter_mcp_by_strong_tokens(mcp_results, q)
         except Exception as e:
             log.error("MCP fallback fast failed: %s", "".join(traceback.format_exception(e)))
 
@@ -1904,7 +1945,7 @@ async def query(payload: dict = Body(...)):
             mcp_results = await _mcp_search_fast(
                 q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
             )
-
+            mcp_results = _filter_mcp_by_strong_tokens(mcp_results, q)
             if forced_page_id and mcp_results:
                 mcp_results = [r for r in mcp_results
                             if _url_has_page_id(r.get("url"), forced_page_id)
@@ -1981,19 +2022,27 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
 
 _URL_CANON_RE = re.compile(r"(pageId=\d+)")
 
-def _canon_url(u: Optional[str]) -> str:
-    if not u:
+def _canon_url(u: Optional[str], pid: Optional[str] = None) -> str:
+    if not u and not pid:
         return ""
-    s = str(u).split("#")[0].strip().rstrip("/")
+    s = (u or "").split("#")[0].strip().rstrip("/")
     m = _URL_CANON_RE.search(s)
-    if m:  # https://.../viewpage.action?pageId=123456 형태로 통일
+    if m:
         base = s.split("?", 1)[0]
         return f"{base}?{m.group(1)}"
+    if pid:
+        mhost = _URL_HOST_RE.match(s)
+        host  = mhost.group(1) if mhost else None
+        if host:
+            base = f"https://{host}/pages/viewpage.action"
+        elif CONFLUENCE_BASE_URL:
+            base = f"{CONFLUENCE_BASE_URL}/pages/viewpage.action"
+        else:
+            base = "/pages/viewpage.action"
+        return f"{base}?pageId={pid}"
     return s
 
-
-
-# [ADD] ------- helper: collect source urls -------
+# ------- helper: collect source urls -------
 def _collect_source_urls(items: list[dict]) -> list[str]:
     """items[*].metadata.url or metadata.source에서 고유 URL만 추출"""
     urls: list[str] = []
