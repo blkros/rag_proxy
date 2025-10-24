@@ -151,19 +151,15 @@ def _extract_confluence_links(html_or_text: str) -> list[dict]:
     return out
 
 def _apply_acronym_bonus(hits: list[dict], q: str):
-    """제목/본문에 대문자 약어(SFTP, DR 등) 매치 시 가산점."""
-    acrs = re.findall(r"\b[A-Z]{2,10}\b", q or "")
-    if not acrs:
-        return
+    acrs = [a.upper() for a in re.findall(r"\b[A-Za-z]{2,10}\b", q or "")]
+    if not acrs: return
     for h in hits:
         md    = (h.get("metadata") or {})
-        title = md.get("title") or ""
+        title = (md.get("title") or "")
         text  = h.get("text")  or ""
         bonus = 0.0
-        if any(a in title for a in acrs):
-            bonus += ACRONYM_TITLE_BONUS
-        if any(a in text[:1200] for a in acrs):
-            bonus += ACRONYM_BODY_BONUS
+        if any(a in title.upper() for a in acrs): bonus += ACRONYM_TITLE_BONUS
+        if any(a in (text[:1200].upper()) for a in acrs): bonus += ACRONYM_BODY_BONUS
         if bonus:
             h["score"] = float(h.get("score") or 0.0) + bonus
 
@@ -224,7 +220,7 @@ def _should_use_mcp(
         return True
 
     # 3) 대문자 약어가 하나라도 있으면 허용 (HES/POC/DR/CBL…)
-    if re.search(r"\b[A-Z]{2,10}\b", q or ""):
+    if re.search(r"\b[A-Za-z]{2,10}\b", q or ""):
         return True
 
     # 4) (호환) 레거시 키워드 정규식은 '마지막'에만 사용
@@ -239,11 +235,6 @@ def _spaces_from_env():
 ENV_SPACES = _spaces_from_env()
 
 def _resolve_allowed_spaces(client_spaces: list | None) -> list | None:
-    """
-    ENV_SPACES가 있으면 그게 '최대 허용치'.
-    클라이언트가 spaces를 보냈으면 교집합만 허용.
-    둘 다 없으면 제한 없음(None).
-    """
     cs = [s.strip().upper() for s in (client_spaces or []) if isinstance(s, str) and s.strip()]
     if ENV_SPACES and cs:
         inter = [s for s in cs if s in ENV_SPACES]
@@ -280,7 +271,7 @@ def _mcp_results_to_items(mcp_results: list[dict], k: int) -> tuple[list[dict], 
         score = float(r.get("_rank") or r.get("score") or 0.5)  # ← 재랭킹 점수 반영
 
         items.append({"text": text, "metadata": md, "score": score})
-        contexts.append({"text": text, "source": md["source"], "page": md["page"], "kind": md["kind"], "score": score})
+        contexts.append({"text": text, "source": md["source"], "page": md["page"], "kind": md["kind"], "score": score, "title": title,})
 
         if title:
             up_docs.append(Document(
@@ -404,19 +395,30 @@ def _is_datetime_question(q: str) -> bool:
     return bool(_DATE_TIME_NEED_RE.search(q))
 
 
+_BAD_TITLE_RE = re.compile(r"(scrum|스크럼|회의록|daily|stand\s*up|스탠드업)", re.I)
+
 def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16) -> list[str]:
-    """최종 컨텍스트에서 URL만 뽑아 pageId 기준 정규화/중복 제거."""
-    seen, out = set(), []
+    rows, seen, out = [], set(), []
     for c in ctxs or []:
-        u   = c.get("url") or c.get("source")
+        u   = c.get("source") or ""
         pid = str(c.get("page") or "")
         cu  = _canon_url(u, pid if pid else None)
-        if cu and cu not in seen:
-            seen.add(cu)
-            out.append(cu)
-            if len(out) >= top_n:
-                break
+        if not cu: continue
+        title = c.get("title") or ""
+        score = float(c.get("score") or 0.0)
+        is_conf = (("pageId=" in cu) or (c.get("kind") == "confluence"))
+        is_bad  = bool(_BAD_TITLE_RE.search(title))
+        rows.append((cu, score, is_conf, is_bad))
+
+    # Confluence 우선, 회의록/스크럼 후순위, 점수 내림차순
+    rows.sort(key=lambda r: (r[2], not r[3], r[1]), reverse=True)
+
+    for cu, *_ in rows:
+        if cu not in seen:
+            seen.add(cu); out.append(cu)
+            if len(out) >= top_n: break
     return out
+
 
 def _now_str_kst() -> tuple[str, str, str]:
     try:
@@ -626,15 +628,16 @@ _JOSA_RE = re.compile(
     r"으로|로서|로써|로부터|께서|와는|과는|에서는|에는|에서|에게|한테|와|과|을|를|은|는|이|가|의|에|도|만|랑|하고)$"
 )
 
-ACRONYM_RE = re.compile(r'^[A-Z]{2,5}$')
+ACRONYM_RE = re.compile(r'^[A-Za-z]{2,5}$')
 
 def _split_core_and_acronyms(tokens: List[str]) -> Tuple[List[str], List[str]]:
     core, acr = [], []
     for t in tokens:
-        (acr if ACRONYM_RE.match(t) else core).append(t)
+        if ACRONYM_RE.match(t):
+            acr.append(t.upper())     # ← 약어는 모두 대문자로 통일
+        else:
+            core.append(t)
     return core, acr
-
-# [ADD] ===== Sparse(키워드) 후보용 토크나이저/스코어러 =====
 
 _TOK_RE = re.compile(r"[A-Za-z0-9가-힣]{2,}")
 
@@ -748,7 +751,7 @@ def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
         return []
     keyphrase = _longest_ko_phrase(q)       # 이제 ‘상가정보’
     q_tokens  = _tokenize_query(q)          # ['NIA','상가정보'] 등
-    acrs      = re.findall(r"\b[A-Z]{2,10}\b", q)
+    acrs      = [a.upper() for a in re.findall(r"\b[A-Za-z]{2,10}\b", q)]
 
     # 추가: 약어+키프레이즈 결합(예: 'NIA상가정보')
     combo = _norm_ko_text((acrs[0] + keyphrase) if (acrs and keyphrase) else "")
@@ -758,6 +761,7 @@ def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
         title = r.get("title") or ""
         body  = r.get("body") or r.get("excerpt") or r.get("text") or ""
         ntitle = _norm_ko_text(title)
+        title_u = title.upper()
         s = float(r.get("score") or 0.0)
 
         # ① 제목 정확/부분 일치
@@ -772,11 +776,11 @@ def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
 
         # ③ 토큰 커버리지
         if q_tokens:
-            s += 0.12 * sum(1 for t in q_tokens if t in title)
-            s += 0.05 * sum(1 for t in q_tokens if t in (body[:800] or ""))
+            tl = title.lower()
+            s += 0.12 * sum(1 for t in q_tokens if t.lower() in tl)
 
         # ④ 약어가 제목에 있으면 약간 보너스
-        if acrs and any(a in title for a in acrs):
+        if acrs and any(a in title_u for a in acrs):
             s += 0.2
 
         if LOGIN_PAT.search(body or ""):
@@ -1825,7 +1829,8 @@ async def query(payload: dict = Body(...)):
     _apply_space_hint(pool_hits, space)
     _apply_page_hint(pool_hits, page_id)
     if not _is_title_like(q):
-        _apply_local_bonus(pool_hits)
+        if not (_COMPANY_HINT_RE.search(q) or allowed_spaces):
+            _apply_local_bonus(pool_hits)
     _apply_acronym_bonus(pool_hits, q)
 
     # sticky가 '보너스 모드'면 가산점만 반영
@@ -1942,6 +1947,7 @@ async def query(payload: dict = Body(...)):
             "page": md.get("page"),
             "kind": md.get("kind", "chunk"),
             "score": round(sc, 4),
+            "title": md.get("title", ""),
         })
 
     try:
@@ -2000,6 +2006,9 @@ async def query(payload: dict = Body(...)):
     if (chapter_no or article_no) and items:
         NEED_FALLBACK = False
 
+    client_spaces = (payload or {}).get("spaces")
+    allowed_spaces = _resolve_allowed_spaces(client_spaces)
+
     reasons = []
     if len(items) == 0: reasons.append("no_items")
     if len(pool_hits) < max(10, k*2): reasons.append("small_pool")
@@ -2024,11 +2033,10 @@ async def query(payload: dict = Body(...)):
             reasons.append("pid_miss")
 
     if "anchor_miss" in reasons and reasons == ["anchor_miss"]:
-        NEED_FALLBACK = not local_ok
-        if not NEED_FALLBACK:
-            log.info("MCP skipped: anchor_miss only, but local hits exist")
-        else:
-            log.info("MCP allowed: anchor_miss only and no local hits")
+        NEED_FALLBACK = (not local_ok) or _should_use_mcp(q, allowed_spaces, space, reasons, local_ok)
+        log.info("MCP %s: anchor_miss only (local_ok=%s, domain_gate=%s)",
+                "allowed" if NEED_FALLBACK else "skipped", local_ok,
+                _should_use_mcp(q, client_spaces, space, reasons, local_ok))
 
     allow_reasons = ("no_items", "small_pool", "missing_article", "pid_miss")
     allow_fallback = (
@@ -2036,8 +2044,8 @@ async def query(payload: dict = Body(...)):
         ("anchor_miss" in reasons and not local_ok) or
         ("acronym_miss" in reasons)
     )
-    client_spaces = (payload or {}).get("spaces")
-    if NEED_FALLBACK and not _should_use_mcp(q, client_spaces, space, reasons, local_ok):
+    
+    if NEED_FALLBACK and not _should_use_mcp(q, allowed_spaces, space, reasons, local_ok):
         NEED_FALLBACK = False
         log.info("MCP skipped by domain gate for %r", q)
 
