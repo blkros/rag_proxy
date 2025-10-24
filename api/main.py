@@ -128,6 +128,28 @@ _URL_HOST_RE  = re.compile(r"^https?://([^/]+)")
 ACRONYM_TITLE_BONUS = float(getattr(settings, "ACRONYM_TITLE_BONUS", 0.45))
 ACRONYM_BODY_BONUS  = float(getattr(settings, "ACRONYM_BODY_BONUS", 0.25))
 
+# 상단 유틸/정규식 근처
+_A_HREF_RE = re.compile(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I|re.S)
+_RAW_URL_RE = re.compile(r'https?://[^\s"\']+pageId=\d+[^\s"\']*', re.I)
+
+def _extract_confluence_links(html_or_text: str) -> list[dict]:
+    out, seen = [], set()
+    for m in _A_HREF_RE.finditer(html_or_text or ""):
+        url = m.group(1) or ""
+        pidm = _PAGEID_RE.search(url)
+        if not pidm: continue
+        anchor = re.sub(r"<[^>]+>", "", m.group(2) or "").strip()
+        key = (pidm.group(1), url, anchor)
+        if key in seen: continue
+        seen.add(key); out.append({"url": url, "pageId": pidm.group(1), "anchor": anchor})
+    for m in _RAW_URL_RE.finditer(html_or_text or ""):
+        url = m.group(0); pidm = _PAGEID_RE.search(url)
+        if not pidm: continue
+        key = (pidm.group(1), url, "")
+        if key in seen: continue
+        seen.add(key); out.append({"url": url, "pageId": pidm.group(1), "anchor": ""})
+    return out
+
 def _apply_acronym_bonus(hits: list[dict], q: str):
     """제목/본문에 대문자 약어(SFTP, DR 등) 매치 시 가산점."""
     acrs = re.findall(r"\b[A-Z]{2,10}\b", q or "")
@@ -498,6 +520,10 @@ def _apply_sticky_bonus(hits: list[dict], sticky_src: str | None):
         if src == want:
             h["score"] = float(h.get("score") or 0.0) + STICKY_BONUS
 
+def _is_title_like(q: str) -> bool:
+    # 긴 한글 구절이 있고, 전체 토큰이 과하지 않으면 '제목형'으로 판단
+    return bool(_longest_ko_phrase(q)) and (len(_tokenize_query(q)) <= 4)
+
 def _rebalance_by_source(hits: list[dict], k: int, per_source_cap: int) -> list[dict]:
     """소스 다양성 보장: 소스당 최대 per_source_cap개, 라운드로빈으로 k개 선택"""
     if per_source_cap <= 0:
@@ -757,6 +783,35 @@ def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
             s -= 0.5
         r["_rank"] = s
         scored.append(r)
+
+    # 집계 페이지 본문에 있는 하이퍼링크의 앵커 텍스트가 질문의 핵심 구절(keyphrase)과 '정확히' 일치하면 타겟 pageId 점수 크게 올리기
+    def _pid_of(res: dict) -> str | None:
+        pid = (res.get("id") or "") or ""
+        if not pid:
+            m = _PAGEID_RE.search(res.get("url") or "")
+            pid = m.group(1) if m else ""
+        return pid or None
+
+    by_pid = {}
+    for res in scored:
+        pid = _pid_of(res)
+        if pid: by_pid[pid] = res
+
+    exact_title_norm = _norm_ko_text(keyphrase or "")
+    targets = [exact_title_norm]
+    if combo:
+        targets.append(_norm_ko_text(combo))  # NIA+제목 형태도 허용
+
+    if exact_title_norm:
+        for res in scored:
+            body = res.get("body") or res.get("excerpt") or res.get("text") or ""
+            for ln in _extract_confluence_links(body):
+                anchor_norm = _norm_ko_text(ln.get("anchor") or "")
+                if anchor_norm and any(t and (anchor_norm == t or t in anchor_norm) for t in targets):
+                    tgt = by_pid.get(ln["pageId"])
+                    if tgt and tgt is not res:
+                        tgt["_rank"] = float(tgt.get("_rank") or 0.0) + 90.0
+                        res["_rank"] = float(res.get("_rank") or 0.0) - 0.3
 
     scored.sort(key=lambda x: x.get("_rank", 0.0), reverse=True)
     return _dedup_by_title(scored)
@@ -1602,8 +1657,12 @@ async def query(payload: dict = Body(...)):
     sticky_flag = (payload or {}).get("sticky")
     ignore_sticky = (sticky_flag is False) or (isinstance(sticky_flag, str) and str(sticky_flag).lower() in ("0","false","no"))
 
+    sticky_source: Optional[str] = None
+
     # sticky 적용 (유효기간 + 관련성 체크)
-    sticky_source = None
+    if _is_title_like(q):
+        sticky_source = None  # '제목형'은 특정 파일에 고정하지 않음
+
     now = time.time()
     if (not ignore_sticky) and not src_filter and not src_set and current_source and now < current_source_until:
         if (not STICKY_STRICT) or _sticky_is_relevant(q, current_source):
@@ -1765,7 +1824,8 @@ async def query(payload: dict = Body(...)):
     # dense 풀에도 space/page 보너스
     _apply_space_hint(pool_hits, space)
     _apply_page_hint(pool_hits, page_id)
-    _apply_local_bonus(pool_hits)
+    if not _is_title_like(q):
+        _apply_local_bonus(pool_hits)
     _apply_acronym_bonus(pool_hits, q)
 
     # sticky가 '보너스 모드'면 가산점만 반영
