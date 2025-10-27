@@ -362,11 +362,38 @@ async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_
                 pass
         tasks = list(pending)
 
-    # 타임아웃/무응답 → 모두 취소
-    for t in tasks:
-        t.cancel()
-    return []
+    deadline = start + MAX_FALLBACK_SECS
+    pending = set(tasks)  # 바깥에서 초기화
 
+    try:
+        while pending and time.monotonic() < deadline:
+            done, pending = await asyncio.wait(
+                pending, timeout=deadline - time.monotonic(),
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                break
+            for t in done:
+                try:
+                    part = t.result() or []
+                except Exception:
+                    part = []
+                if part:
+                    # 나머지 취소 + 수거  ← 추가
+                    for p in pending: p.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    return part
+
+        # 타임아웃/무응답 → 모두 취소 후 수거  ← 정리
+        for p in pending: p.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        return []
+
+    finally:
+        # 혹시 남아있으면 한 번 더 안전 정리
+        if pending:
+            for p in pending: p.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
 def _anchor_tokens_from_query(q: str) -> list[str]:
     # _tokenize_query는 파일에 이미 정의되어 있음
@@ -427,7 +454,6 @@ _BAD_TITLE_RE = re.compile(r"(scrum|스크럼|회의록|daily|stand\s*up|스탠�
 
 def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16, prefer_page_id: Optional[str] = None) -> list[str]:
     if prefer_page_id:
-        # 우선 해당 pageId의 컨텍스트만 남겨 출처를 고른다
         ctxs = [c for c in (ctxs or []) if str(c.get("page") or c.get("pageId") or "") == str(prefer_page_id)]
 
     rows, seen, out = [], set(), []
@@ -435,7 +461,8 @@ def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16, prefer
         u   = c.get("source") or ""
         pid = str(c.get("page") or "")
         cu  = _canon_url(u, pid if pid else None)
-        if not cu: continue
+        if not cu: 
+            continue
         title = c.get("title") or ""
         score = float(c.get("score") or 0.0)
         is_conf = (("pageId=" in cu) or (c.get("kind") == "confluence"))
@@ -447,7 +474,26 @@ def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16, prefer
         if cu not in seen:
             seen.add(cu); out.append(cu)
             if len(out) >= top_n: break
+
+    # prefer_page_id가 있는데 매칭 컨텍스트가 없으면 캐논 URL을 생성해 한 줄이라도 반환
+    if prefer_page_id and not out:
+        out.append(_canon_url(None, prefer_page_id))
+
     return out
+
+def _page_id_from_messages(msgs: list[dict]) -> Optional[str]:
+    for m in reversed(msgs or []):
+        text = (m.get("content") or "")
+        if not text:
+            continue
+        m_pid = _PAGEID_RE.search(text)
+        if m_pid:
+            return m_pid.group(1)
+        links = _extract_confluence_links(text)
+        if links:
+            return links[-1]["pageId"]
+    return None
+
 
 def _pid_from_meta(md: dict) -> Optional[str]:
     if not isinstance(md, dict): 
@@ -1608,12 +1654,17 @@ async def query(payload: dict = Body(...)):
     if not q.strip():
         raise HTTPException(400, "question/query/q/messages is required")
 
-    # pageId 힌트만 추출(잠금 아님)
+    # page_id 결정 로직 보강
     page_id = (payload or {}).get("pageId")
     if not page_id:
         m_pid = re.search(r"pageId\s*=\s*(\d+)", q)
         if m_pid:
             page_id = m_pid.group(1)
+
+    # 대화 메시지 배열에서도 보조로 탐색
+    if not page_id and isinstance((payload or {}).get("messages"), list):
+        page_id = _page_id_from_messages(payload["messages"])
+
     page_id = str(page_id) if page_id is not None else None
 
     confl_hint = bool(CONFL_HINT_RE.search(q))
@@ -2159,6 +2210,18 @@ async def query(payload: dict = Body(...)):
             NEED_FALLBACK = True
             reasons.append("pid_miss")
 
+    # # pid_miss 계산 이후, 폴백 허용 플래그 강화
+    # if forced_page_id:
+    #     allow_fallback = True   # 사용자가 pageId를 줬다면 폴백은 항상 허용
+    #     if pid_miss:
+    #         NEED_FALLBACK = True
+
+    allow_fallback_forced = False
+    if forced_page_id:
+        allow_fallback_forced = True
+        if pid_miss:
+            NEED_FALLBACK = True
+
     if "anchor_miss" in reasons and reasons == ["anchor_miss"]:
         NEED_FALLBACK = (not local_ok) or _should_use_mcp(q, allowed_spaces, space, reasons, local_ok)
         log.info("MCP %s: anchor_miss only (local_ok=%s, domain_gate=%s)",
@@ -2166,11 +2229,12 @@ async def query(payload: dict = Body(...)):
                 _should_use_mcp(q, client_spaces, space, reasons, local_ok))
 
     allow_reasons = ("no_items", "small_pool", "missing_article", "pid_miss")
-    allow_fallback = (
+    allow_fallback_calc = (
         any(r in reasons for r in allow_reasons) or
         ("anchor_miss" in reasons and not local_ok) or
         ("acronym_miss" in reasons)
     )
+    allow_fallback = allow_fallback_forced or allow_fallback_calc
     
     if NEED_FALLBACK and not _should_use_mcp(q, allowed_spaces, space, reasons, local_ok):
         NEED_FALLBACK = False
@@ -2483,7 +2547,8 @@ async def v1_chat(payload: dict = Body(...)):
         "source": source,
         "sources": sources,
         "spaces": spaces,
-        "sticky": False,  # 대화형 라우팅은 매질의 전환이 잦으므로 sticky 비활성
+        # "sticky": False,  # 대화형 라우팅은 매질의 전환이 잦으므로 sticky 비활성
+        "messages": payload.get("messages"),
     })
 
     # 2) direct_answer가 있으면 그대로 사용
@@ -2532,6 +2597,12 @@ async def v1_chat(payload: dict = Body(...)):
     if use_contexts:
         allowed_list = _filter_urls_by_host(r.get("source_urls", []) or [])
         allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://", "https://"))]
+
+        if not allowed_http:
+            rel = [u for u in allowed_list if isinstance(u, str) and u.startswith("/pages/viewpage.action")]
+            if rel and CONFLUENCE_BASE_URL:
+                allowed_http = [CONFLUENCE_BASE_URL.rstrip("/") + u for u in rel]
+
         if allowed_http:
             src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_http)
             content = (content or "") + src_block
