@@ -120,11 +120,6 @@ _DATE_TIME_NEED_RE = re.compile(r"(날짜|요일|시간|시각|몇\s*시|몇\s*�
 
 _DOMAIN_HINT_RE = re.compile(r"(회의|마감|일정|보고서|티켓|이슈|장애|배포|회의록|결재|승인|요청|문서)", re.I)
 
-_COMPANY_HINT_RE = re.compile(
-    r"(NURIFLEX|NURI|니아|NIA|아파트\s*누리|아파트누리|컨플루언스|배포|현장점검|DR|CBL|설계|회의|회의록|마감|일정|이슈|요청|문서)",
-    re.I
-)
-
 # v1_chat 출처 호스트 화이트리스트(환경변수)
 SOURCE_HOST_WHITELIST = [h.strip().lower() for h in os.getenv("ALLOWED_SOURCE_HOSTS","").split(",") if h.strip()]
 _URL_HOST_RE  = re.compile(r"^https?://([^/]+)")
@@ -203,30 +198,32 @@ def _should_use_mcp(
     reasons: list[str] | None = None,
     local_ok: bool | None = None,
 ) -> bool:
-    # 1) 명시 space/클라이언트 spaces 있으면 허용
-    if space or (client_spaces and len(client_spaces) > 0):
+    rs = set((reasons or []))
+    has_acronym = bool(re.search(r"\b[A-Z]{2,10}\b", q or ""))      # NIA, DR, CBL 등
+    title_like  = _is_title_like(q)                                 # 긴 한글 구절 + 토큰 적음
+    confl_hint  = bool(CONFL_HINT_RE.search(q or ""))
+
+    # 0) 명시적 힌트 있으면 바로 허용
+    if space or (client_spaces and len(client_spaces) > 0) or confl_hint:
         return True
 
-    rs = set([ (reasons or []) and r.strip().lower() for r in (reasons or []) ])
-    # 도메인/약어 힌트
-    has_acronym = bool(re.search(r"\b[A-Z]{2,10}\b", q or ""))
-    domainish   = bool(_COMPANY_HINT_RE.search(q or ""))
-
-    def domain_gate() -> bool:
-        # 도메인 키워드 있거나, 강한 대문자 약어가 있을 때만 MCP 허용
-        return domainish or has_acronym
-
-    # 품질 저하 사유(풀 작음/미싱 등)는 '도메인 게이트' 아래에서만 허용
+    # 1) 로컬 검색이 약하면(구조적 실패) 키워드 없이도 허용
     if rs & {"no_items", "small_pool", "missing_article", "pid_miss"}:
-        return domain_gate()
+        return True
 
-    # 약어/앵커 미스도 도메인 게이트 아래에서만 허용
-    if ("acronym_miss" in rs) or ("anchor_miss" in rs):
-        return domain_gate()
+    # 2) 제목형/약어면 허용 (고유명사/페이지명 질의)
+    if title_like or has_acronym:
+        return True
 
-    # 최종 기본: 도메인 힌트가 있을 때만
-    return domainish
+    # 3) 앵커/약어 미스가 났고, 로컬 신뢰가 낮거나(또는 제목형)면 허용
+    if (("anchor_miss" in rs) or ("acronym_miss" in rs)) and (not local_ok or title_like):
+        return True
 
+    # 4) 운영에서 MCP를 연결해둔 상태라면 보수적으로 허용
+    if ENV_SPACES:
+        return True
+
+    return False
 
 def _spaces_from_env():
     raw = os.getenv("CONFLUENCE_SPACE", "").strip()
@@ -341,7 +338,7 @@ async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_
     for sp in spaces:
         for qq in qlist:
             tasks.append(asyncio.create_task(
-                mcp_search(qq, limit=5, timeout=MCP_TIMEOUT, space=sp, langs=SEARCH_LANGS)
+                mcp_search(qq, limit=10, timeout=MCP_TIMEOUT, space=sp, langs=SEARCH_LANGS)
             ))
 
     # 2) 벽시계 제한 내에서 '첫 성공'만 받기
@@ -450,7 +447,7 @@ def _is_datetime_question(q: str) -> bool:
     return bool(_DATE_TIME_NEED_RE.search(q))
 
 
-_BAD_TITLE_RE = re.compile(r"(scrum|스크럼|회의록|daily|stand\s*up|스탠드업)", re.I)
+_BAD_TITLE_RE = re.compile(r"(scrum|스크럼|회의록|daily|stand\s*up|스탠드업|업무보고|일일\s*업무|주간\s*보고)", re.I)
 
 def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16, prefer_page_id: Optional[str] = None) -> list[str]:
     if prefer_page_id:
@@ -1996,7 +1993,7 @@ async def query(payload: dict = Body(...)):
     _apply_space_hint(pool_hits, space)
     _apply_page_hint(pool_hits, page_id)
     if not _is_title_like(q):
-        if not (_COMPANY_HINT_RE.search(q) or allowed_spaces):
+        if not (_DOMAIN_HINT_RE.search(q) or allowed_spaces):
             _apply_local_bonus(pool_hits)
     _apply_acronym_bonus(pool_hits, q)
 
@@ -2007,10 +2004,9 @@ async def query(payload: dict = Body(...)):
     q_tokens = _tokenize_query(q)
     if q_tokens:
         for h in pool_hits:
-            md = h.get("metadata") or {}
-            title = (md.get("title") or "")
-            if title and any(t in title for t in q_tokens):
-                h["score"] = float(h.get("score") or 0.0) + (TITLE_BONUS * 0.5)
+            title = (h.get("metadata") or {}).get("title","")
+            if _BAD_TITLE_RE.search(title or ""):
+                h["score"] = float(h.get("score") or 0.0) - 0.25
 
     # allowed_spaces 강제/보너스
     if allowed_spaces:
@@ -2117,6 +2113,9 @@ async def query(payload: dict = Body(...)):
             "title": md.get("title", ""),
         })
 
+    guess_pid = _guess_main_pid_from_contexts(contexts, q) if not forced_page_id else forced_page_id
+    items, contexts, main_pid = _enforce_single_page(items, contexts, prefer_pid=guess_pid)
+
     main_pid_eff = None
     if not forced_page_id and _is_title_like(q) and items:
         pid_guess = _guess_main_pid_from_contexts(contexts, q)
@@ -2210,12 +2209,6 @@ async def query(payload: dict = Body(...)):
             NEED_FALLBACK = True
             reasons.append("pid_miss")
 
-    # # pid_miss 계산 이후, 폴백 허용 플래그 강화
-    # if forced_page_id:
-    #     allow_fallback = True   # 사용자가 pageId를 줬다면 폴백은 항상 허용
-    #     if pid_miss:
-    #         NEED_FALLBACK = True
-
     allow_fallback_forced = False
     if forced_page_id:
         allow_fallback_forced = True
@@ -2223,10 +2216,10 @@ async def query(payload: dict = Body(...)):
             NEED_FALLBACK = True
 
     if "anchor_miss" in reasons and reasons == ["anchor_miss"]:
-        NEED_FALLBACK = (not local_ok) or _should_use_mcp(q, allowed_spaces, space, reasons, local_ok)
+        NEED_FALLBACK = (not local_ok) or _is_title_like(q) or _should_use_mcp(q, allowed_spaces, space, reasons, local_ok)
         log.info("MCP %s: anchor_miss only (local_ok=%s, domain_gate=%s)",
                 "allowed" if NEED_FALLBACK else "skipped", local_ok,
-                _should_use_mcp(q, client_spaces, space, reasons, local_ok))
+                _should_use_mcp(q, allowed_spaces, space, reasons, local_ok))
 
     allow_reasons = ("no_items", "small_pool", "missing_article", "pid_miss")
     allow_fallback_calc = (
@@ -2404,16 +2397,25 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
 _URL_CANON_RE = re.compile(r"(pageId=\d+)")
 
 def _canon_url(u: Optional[str], pid: Optional[str] = None) -> str:
+    """
+    Confluence URL을 표준화한다.
+    - 이미 pageId=가 있으면 쿼리만 정리해 반환
+    - pid만 주어진 경우: 주어진 host나 환경변수를 이용해 표준 viewpage URL 생성
+    """
     if not u and not pid:
         return ""
     s = (u or "").split("#")[0].strip().rstrip("/")
+
+    # 이미 pageId가 있으면 ?pageId=만 남긴 canonical 형태로
     m = _URL_CANON_RE.search(s)
     if m:
         base = s.split("?", 1)[0]
         return f"{base}?{m.group(1)}"
+
+    # pid가 주어진 경우 호스트를 추출해 canonical URL 생성
     if pid:
         mhost = _URL_HOST_RE.match(s)
-        host  = mhost.group(1) if mhost else None
+        host = mhost.group(1) if mhost else None
         if host:
             base = f"https://{host}/pages/viewpage.action"
         elif CONFLUENCE_BASE_URL:
@@ -2421,9 +2423,10 @@ def _canon_url(u: Optional[str], pid: Optional[str] = None) -> str:
         else:
             base = "/pages/viewpage.action"
         return f"{base}?pageId={pid}"
+
+    # 그 외는 원본 반환
     return s
 
-# ------- helper: collect source urls -------
 def _collect_source_urls(items: list[dict]) -> list[str]:
     """items[*].metadata.url or metadata.source에서 고유 URL만 추출"""
     urls: list[str] = []
@@ -2554,13 +2557,10 @@ async def v1_chat(payload: dict = Body(...)):
     # 2) direct_answer가 있으면 그대로 사용
     content = r.get("direct_answer")
 
-    # 3) 이 응답에서 컨텍스트를 '실제로' 쓸지 결정
+    # 3) 컨텍스트가 있으면 우선 사용(단, 'no_rag'처럼 의도적으로 비-RAG 라우팅한 경우 제외)
     notes = r.get("notes", {}) or {}
     use_contexts = bool(r.get("contexts")) and not notes.get("low_relevance", False)
-
-    # RAG가 부적합(low_relevance)하면 stock direct_answer는 버리고 일반지식 모드로 넘어가도록 content를 비움
-    if content and notes.get("low_relevance") and not notes.get("forced_confluence") and notes.get("routed") != "no_rag":
-        content = None
+    prefer_contexts = use_contexts and notes.get("routed") != "no_rag"
 
     if not content:
         if use_contexts:
@@ -2593,19 +2593,22 @@ async def v1_chat(payload: dict = Body(...)):
             content = await _call_llm(messages=msgs, max_tokens=1200, temperature=0.2)
             content = await _ensure_finished(content)
 
-    # 5) (중요) 출처는 '컨텍스트를 실제로 사용한 경우'에만, 그리고 http(s)만 붙이기
-    if use_contexts:
-        allowed_list = _filter_urls_by_host(r.get("source_urls", []) or [])
-        allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://", "https://"))]
 
-        if not allowed_http:
-            rel = [u for u in allowed_list if isinstance(u, str) and u.startswith("/pages/viewpage.action")]
-            if rel and CONFLUENCE_BASE_URL:
-                allowed_http = [CONFLUENCE_BASE_URL.rstrip("/") + u for u in rel]
+    # 5) 출처는 '컨텍스트를 실제로 사용한 경우'에만
+    raw_urls = r.get("source_urls", []) or []
+    abs_urls = []
+    for u in raw_urls:
+        if isinstance(u, str) and u.startswith(("/pages/viewpage.action", "/plugins/")):
+            abs_urls.append(CONFLUENCE_BASE_URL.rstrip("/") + u if CONFLUENCE_BASE_URL else u)
+        else:
+            abs_urls.append(u)
 
-        if allowed_http:
-            src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_http)
-            content = (content or "") + src_block
+    allowed_list = _filter_urls_by_host(abs_urls)
+    allowed_http = [u for u in allowed_list if isinstance(u, str) and (u.startswith(("http://", "https://")) or u.startswith("/"))]
+
+    if prefer_contexts and allowed_http:
+        src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_http)
+        content = (content or "") + src_block
 
     # 6) OpenAI 호환 응답은 그대로 유지
     return {
