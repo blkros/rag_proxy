@@ -140,6 +140,76 @@ _sticky_lock = threading.Lock()
 _sticky_map: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
 _STICKY_CAP = 512  # LRU 상한
 
+# 'YYYY.MM' 또는 'MM월'만 있어도 현재 연도로 보정
+_YM1 = re.compile(r"(20\d{2})[.\-/\s]?(1?\d)\s*월?")
+_YM2 = re.compile(r"(20\d{2})\s*년\s*(1?\d)\s*월")
+_YM3 = re.compile(r"\b(1?\d)\s*월\b")  # 연도 없는 '10월' 등
+
+def _extract_year_month(q: str) -> str | None:
+    if not q: 
+        return None
+    m = _YM1.search(q) or _YM2.search(q)
+    if m:
+        y, mon = m.group(1), m.group(2).zfill(2)
+        return f"{y}.{mon}"
+    m = _YM3.search(q)
+    if m:
+        # 연도 미언급이면 '현재 연도' 채움 (KST 기준)
+        try:
+            now = datetime.now(ZoneInfo(TZ_NAME))
+        except Exception:
+            now = datetime.now()
+        y = now.strftime("%Y")
+        mon = m.group(1).zfill(2)
+        return f"{y}.{mon}"
+    return None
+
+def _is_reportish(q: str) -> bool:
+    return bool(re.search(r"(주간|월간)\s*(업무|보고)", q or ""))
+
+def _pick_best_pid_by_title(q: str, results: list[dict]) -> str | None:
+    """
+    MCP 결과의 title/본문을 가볍게 재랭킹해 '가장 그럴듯한 pageId' 하나를 고른다.
+    - 제목에 'YYYY.MM' 있으면 강한 보너스
+    - '주간/월간' 키워드 보너스
+    - 질문의 가장 긴 한글 구절(팀명 등)이 제목에 있으면 보너스
+    """
+    if not results:
+        return None
+    ym = _extract_year_month(q)            # 예: '2025.10' 또는 None
+    keyphrase = _norm_ko_text(_longest_ko_phrase(q) or "")
+    reportish = _is_reportish(q)
+
+    scored: dict[str, float] = {}
+    for r in results:
+        title = (r.get("title") or "")
+        ntitle = _norm_ko_text(title)
+        body  = r.get("body") or r.get("excerpt") or r.get("text") or ""
+        # pageId 추출
+        pid = (r.get("id") or "").strip()
+        if not pid:
+            m = _PAGEID_RE.search(r.get("url") or "")
+            pid = m.group(1) if m else ""
+        if not pid:
+            continue
+
+        s = float(r.get("_rank") or r.get("score") or 0.0)
+        if ym and ym in ntitle:               s += 1.6
+        if reportish and re.search(r"(주간|월간)", title): s += 0.6
+        if keyphrase and keyphrase in ntitle: s += 0.4
+        # 제목이 너무 일반적인 '스크럼/회의록'이면 약간 감점 (이미 상단에 동일 정규식 존재)
+        if _BAD_TITLE_RE.search(title or ""): s -= 0.3
+        scored[pid] = max(scored.get(pid, 0.0), s)
+
+        # 본문 하이퍼링크 앵커가 질문 핵심과 맞으면 타깃 페이지에 큰 보너스
+        for ln in _extract_confluence_links(body):
+            anc = _norm_ko_text(ln.get("anchor") or "")
+            if keyphrase and (anc == keyphrase or keyphrase in anc):
+                scored[ln["pageId"]] = max(scored.get(ln["pageId"], 0.0), s + 1.2)
+
+    return max(scored, key=scored.get) if scored else None
+
+
 def _set_sticky_for(session_id: str | None, src: str, secs: int = STICKY_SECS):
     if not session_id:
         return
@@ -1765,6 +1835,16 @@ async def query(request: Request, payload: dict = Body(...)):
             )
             mcp_results = _filter_mcp_by_strong_tokens(mcp_results, q)
             mcp_results = _rerank_mcp_results(q, mcp_results)
+            # 링크/명시 pageId가 없으면 제목/연-월로 best pageId를 추정해 '그 페이지만' 남김
+            if mcp_results and not forced_page_id:
+                derived_pid = _pick_best_pid_by_title(q, mcp_results)
+                if derived_pid:
+                    mcp_results = [
+                        r for r in mcp_results
+                        if _url_has_page_id(r.get("url"), derived_pid) or str(r.get("id") or "") == derived_pid
+                    ]
+                    forced_page_id = derived_pid  # 이후 파이프라인에서 우선 사용
+
         except Exception as e:
             mcp_results = []
             log.error("forced MCP (confluence hint) failed: %s", traceback.format_exc())
@@ -2280,6 +2360,16 @@ async def query(request: Request, payload: dict = Body(...)):
             )
             mcp_results = _filter_mcp_by_strong_tokens(mcp_results, q)
             mcp_results = _rerank_mcp_results(q, mcp_results)
+            # [ADD] 폴백에서도 pageId 오토 추정
+            if mcp_results and not forced_page_id:
+                derived_pid = _pick_best_pid_by_title(q, mcp_results)
+                if derived_pid:
+                    mcp_results = [
+                        r for r in mcp_results
+                        if _url_has_page_id(r.get("url"), derived_pid) or str(r.get("id") or "") == derived_pid
+                    ]
+                    forced_page_id = derived_pid
+
         except Exception as e:
             log.error("MCP fallback fast failed: %s", "".join(traceback.format_exception(e)))
 
@@ -2400,8 +2490,11 @@ async def query(request: Request, payload: dict = Body(...)):
         }
 
 
-    src_urls = _collect_source_urls_from_contexts(contexts, prefer_page_id=forced_page_id)
-
+    prefer_pid_for_sources = forced_page_id or main_pid
+    src_urls = _collect_source_urls_from_contexts(
+    contexts, top_n=1 if prefer_pid_for_sources else 16, prefer_page_id=prefer_pid_for_sources
+    )
+    
     return {
         "hits": len(items),
         "items": items,

@@ -18,6 +18,8 @@ _NUM_ONLY_LINE = re.compile(r'(?m)^\s*(\d{1,3}(?:,\d{3})*|\d+)\s*$')
 ROUTER_STRICT_RAG = (os.getenv("ROUTER_STRICT_RAG", "1").lower() not in ("0","false","no"))
 ANSWER_MIN_OVERLAP = float(os.getenv("ROUTER_ANSWER_MIN_OVERLAP", "0.18"))
 
+# 유저 메시지에서 Confluence pageId를 뽑는 헬퍼
+_PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
 
 ROUTER_MAX_TOKENS = int(os.getenv("ROUTER_MAX_TOKENS", "2048"))
 ANSWER_MODE = os.getenv("ROUTER_ANSWER_MODE", "auto")
@@ -279,6 +281,16 @@ def pick_answer_mode(user_msg: str, ctx_text: str) -> str:
 
 # --- utils ----------------------------------------------------
 
+def _extract_page_id_from_messages(msgs: list[Msg]) -> str | None:
+    """사용자/어시스턴트 메시지 본문에서 pageId=숫자를 찾아낸다."""
+    for m in reversed(msgs or []):
+        if not m.content:
+            continue
+        mm = _PAGEID_RE.search(m.content)
+        if mm:
+            return mm.group(1)
+    return None
+
 def normalize_query(q: str) -> str:
     if not q: return ""
     s = q.strip()
@@ -469,6 +481,9 @@ async def chat(req: ChatReq):
     orig_user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "").strip()
     variants = generate_query_variants(orig_user_msg)
 
+    # 대화 메시지에서 pageId 힌트를 미리 뽑아둠
+    pid_hint = _extract_page_id_from_messages(req.messages) if req.messages else None
+    
     # 메타 태스크면 RAG 건너뛰고 그대로 모델로 전달 (JSON 형식 보존)
     if _is_webui_task(orig_user_msg):
         payload = {
@@ -483,7 +498,7 @@ async def chat(req: ChatReq):
                 r = await client.post(f"{OPENAI}/chat/completions", json=payload)
                 j = r.json()
 
-                # ★ 추가: 메타 태스크 응답도 think 제거
+                # 메타 태스크 응답도 think 제거
                 try:
                     msg = j.get("choices", [{}])[0].get("message", {})
                     c = msg.get("content") or ""
@@ -532,6 +547,11 @@ async def chat(req: ChatReq):
                 p1 = {"q": v, "k": 5, "sticky": False}
                 if spaces_hint:
                     p1["spaces"] = spaces_hint
+                # [ADD] 메시지와 pageId 힌트를 같이 보냄
+                if req.messages:
+                    p1["messages"] = [m.model_dump() for m in req.messages]  # ← 대화 전체 전달
+                if pid_hint:
+                    p1["pageId"] = pid_hint
                 j1 = (await client.post(f"{RAG}/qa", json=p1)).json()
             except Exception:
                 j1 = {}
@@ -539,6 +559,11 @@ async def chat(req: ChatReq):
                 p2 = {"q": v, "k": 5, "sticky": True}
                 if spaces_hint:
                     p2["spaces"] = spaces_hint
+                # [ADD] 동일 적용
+                if req.messages:
+                    p2["messages"] = [m.model_dump() for m in req.messages]
+                if pid_hint:
+                    p2["pageId"] = pid_hint
                 j2 = (await client.post(f"{RAG}/qa", json=p2)).json()
             except Exception:
                 j2 = {}
@@ -562,8 +587,6 @@ async def chat(req: ChatReq):
             qa_urls = _limit_urls(best.get("source_urls")) if best.get("source_urls") \
                       else _urls_from_contexts(best.get("contexts"))
             break
-
-
 
 
     # 2-A) QA 성공
@@ -627,16 +650,26 @@ async def chat(req: ChatReq):
         for v in variants:
             try:
                 payload1 = {"q": v, "k": 5, "sticky": False}
-                if spaces_hint:                     
+                if spaces_hint:
                     payload1["spaces"] = spaces_hint
+                # [ADD]
+                if req.messages:
+                    payload1["messages"] = [m.model_dump() for m in req.messages]
+                if pid_hint:
+                    payload1["pageId"] = pid_hint
                 j1 = (await client.post(f"{RAG}/qa", json=payload1)).json()
             except Exception:
                 j1 = {}
 
             try:
                 payload2 = {"q": v, "k": 5, "sticky": True}
-                if spaces_hint:                     
+                if spaces_hint:
                     payload2["spaces"] = spaces_hint
+                # [ADD]
+                if req.messages:
+                    payload2["messages"] = [m.model_dump() for m in req.messages]
+                if pid_hint:
+                    payload2["pageId"] = pid_hint
                 j2 = (await client.post(f"{RAG}/qa", json=payload2)).json()
             except Exception:
                 j2 = {}
