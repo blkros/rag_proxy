@@ -1342,36 +1342,14 @@ class AskPayload(BaseModel):
             d["space"] = d.pop("spaceKey")
         return d
 
-@app.post(
-    "/ask",
-    summary="Ask",
-    description="/ask → 내부적으로 /query 호출합니다. (벡터 검색 + 필요 시 폴백)",
-)
-async def ask(payload: AskPayload = Body(
-    ...,
-    example={"q": "NIA 사용자 시나리오", "k": 5}
-)):
-    """
-    [중요] 여기를 Pydantic 모델로 바꿔야 OpenAPI에 '필수 q'가 반영되어
-    Open WebUI가 빈 바디가 아닌 {'q': ...} 형태로 요청합니다.
-    """
+@app.post("/ask", summary="Ask", description="/ask → 내부적으로 /query 호출합니다. (벡터 검색 + 필요 시 폴백)")
+async def ask(request: Request, payload: AskPayload = Body(...)):
     # query()는 dict를 받으므로 모델을 dict로 변환
-    return await query(payload=payload.to_query_dict())
+    return await query(request=request, payload=payload.to_query_dict())
 
-@app.post(
-    "/qa",
-    summary="Qa Compat",
-    description="과거 호환용 엔드포인트. /ask와 동일하게 동작.",
-)
-async def qa_compat(payload: AskPayload = Body(
-    ...,
-    example={"q": "NIA 사용자 시나리오"}
-)):
-    """
-    [중요] /qa도 동일 스키마를 쓰면 OpenAPI 상으로 동일한 요구사항이 노출됩니다.
-    """
-    return await query(payload=payload.to_query_dict())
-
+@app.post("/qa", summary="Qa Compat", description="과거 호환용 엔드포인트. /ask와 동일하게 동작.")
+async def qa_compat(request: Request, payload: AskPayload = Body(...)):
+    return await query(request=request, payload=payload.to_query_dict())
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), overwrite: bool = Form(False)):
@@ -1673,7 +1651,7 @@ async def uploads_reset():
     
 
 @app.post("/query", include_in_schema=False)
-async def query(request: Request | None = None, payload: dict = Body(...)):
+async def query(request: Request, payload: dict = Body(...)):
     global vectorstore, retriever, current_source, current_source_until
     fallback_attempted = False
     added = 0  # ←← 미리 초기화(하단에서 안전하게 notes에 넣거나 안 넣기 위함)
