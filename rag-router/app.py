@@ -18,8 +18,10 @@ _NUM_ONLY_LINE = re.compile(r'(?m)^\s*(\d{1,3}(?:,\d{3})*|\d+)\s*$')
 ROUTER_STRICT_RAG = (os.getenv("ROUTER_STRICT_RAG", "1").lower() not in ("0","false","no"))
 ANSWER_MIN_OVERLAP = float(os.getenv("ROUTER_ANSWER_MIN_OVERLAP", "0.18"))
 
-# 유저 메시지에서 Confluence pageId를 뽑는 헬퍼
-_PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
+_PAGEID_ABS = re.compile(r"https?://[^\s]+?\bpageId=(\d{6,})")
+_PAGEID_REL = re.compile(r"(?m)(?:^|\s)/pages/viewpage\.action\?[^ \n]*\bpageId=(\d{6,})")
+_PAGEID_KV  = re.compile(r"(?i)\bpageid\s*[:=]\s*(\d{6,})")
+_PAGEID_ANY = re.compile(r"[?&]pageId=(\d{6,})")
 
 ROUTER_MAX_TOKENS = int(os.getenv("ROUTER_MAX_TOKENS", "2048"))
 ANSWER_MODE = os.getenv("ROUTER_ANSWER_MODE", "auto")
@@ -282,13 +284,24 @@ def pick_answer_mode(user_msg: str, ctx_text: str) -> str:
 # --- utils ----------------------------------------------------
 
 def _extract_page_id_from_messages(msgs: list[Msg]) -> str | None:
-    """사용자/어시스턴트 메시지 본문에서 pageId=숫자를 찾아낸다."""
-    for m in reversed(msgs or []):
-        if not m.content:
+    """
+    Confluence pageId는 'user' 메시지에서만 신뢰한다.
+    (assistant가 출력한 '출처:' 링크의 pageId는 피드백 루프를 만들므로 무시)
+    """
+    if not msgs:
+        return None
+
+    # 1) user 메시지(최신 → 과거)에서 절대/상대/키밸류 패턴 순으로 탐색
+    for m in reversed(msgs):
+        if m.role != "user" or not m.content:
             continue
-        mm = _PAGEID_RE.search(m.content)
-        if mm:
-            return mm.group(1)
+        c = m.content
+        for rx in (_PAGEID_ABS, _PAGEID_REL, _PAGEID_KV, _PAGEID_ANY):
+            mm = rx.search(c)
+            if mm:
+                return mm.group(1)
+
+    # 2) assistant 메시지는 사용하지 않는다 (의도적으로 차단)
     return None
 
 def normalize_query(q: str) -> str:
