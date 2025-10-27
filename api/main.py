@@ -26,7 +26,10 @@ from src.retrieval.rerank import parse_query_intent, pick_for_injection
 from api.smart_router import router as smart_router
 
 # empty FAISS 빌드를 위한 보조들
-import faiss
+try:
+    import faiss
+except ImportError:
+    raise RuntimeError("faiss(or faiss-cpu) 미설치. 설치 후 재실행하세요.")
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS as FAISSStore
 from langchain_community.docstore.in_memory import InMemoryDocstore
@@ -80,7 +83,7 @@ _CHAPTER_RE = re.compile(r"제\s*(\d+)\s*장")
 _ARTICLE_RE = re.compile(r"제\s*(\d+)\s*조")
 
 last_source: Optional[str] = None
-# >>> [ADD] 최근 소스 잠금 상태 (연속 질문 안정화용)
+# 최근 소스 잠금 상태 (연속 질문 안정화용)
 current_source: Optional[str] = None
 current_source_until: float = 0.0
 STICKY_SECS = int(getattr(settings, "STICKY_SECS", 180))
@@ -95,12 +98,13 @@ STICKY_BONUS  = float(getattr(settings, "STICKY_BONUS", 0.18))           # bonus
 PER_SOURCE_CAP = int(getattr(settings, "PER_SOURCE_CAP", 0))             # 0=off, >0이면 소스당 최대 N개
 
 
-# ← [ADD] 앵커 추출(질문 핵심어) + sticky 유효성 검사
+# 앵커 추출(질문 핵심어) + sticky 유효성 검사
 _GENERIC = set("보고 보고서 리포트 정보 정리 페이지 자료 문서 요약 정책 통계 항목 사이트 url 링크 출처".split())
 
-# >>> [ADD] pageId 추출/URL 정규화 유틸
+# pageId 추출/URL 정규화 유틸
 _PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
 
+_PAGEID_RE_STRICT = re.compile(r"[?&]pageId=(\d+)")
 
 # 1) '오늘/지금/현재' 같은 지시어가 필수
 _DEICTIC_RE = re.compile(r"(오늘|지금|현재)", re.I)
@@ -121,7 +125,7 @@ _COMPANY_HINT_RE = re.compile(
     re.I
 )
 
-# === v1_chat 출처 호스트 화이트리스트(환경변수) ===
+# v1_chat 출처 호스트 화이트리스트(환경변수)
 SOURCE_HOST_WHITELIST = [h.strip().lower() for h in os.getenv("ALLOWED_SOURCE_HOSTS","").split(",") if h.strip()]
 _URL_HOST_RE  = re.compile(r"^https?://([^/]+)")
 
@@ -283,7 +287,33 @@ def _mcp_results_to_items(mcp_results: list[dict], k: int) -> tuple[list[dict], 
             ))
     return items, contexts, up_docs
 
+def _guess_main_pid_from_contexts(contexts: list[dict], q: str) -> Optional[str]:
+    key = _norm_ko_text(_longest_ko_phrase(q) or "")
+    if not key:
+        return None
 
+    # 1) 타이틀 매칭 우선
+    scored = []
+    for c in contexts or []:
+        pid = str(c.get("page") or c.get("pageId") or "").strip()
+        title = _norm_ko_text(c.get("title") or "")
+        if not pid or not title:
+            continue
+        s = float(c.get("score") or 0.0)
+        if key == title:  s += 2.0
+        elif key in title: s += 1.2
+        scored.append((s, pid))
+
+    if scored:
+        scored.sort(reverse=True)
+        return scored[0][1]
+
+    # 2) (보조) 본문 내 하이퍼링크 앵커가 정확히 매칭되면 그 pageId 사용
+    for c in contexts or []:
+        for ln in _extract_confluence_links(c.get("text") or ""):
+            if key and key in _norm_ko_text(ln.get("anchor") or ""):
+                return ln.get("pageId")
+    return None
 
 # 빠른 MCP 폴백: 여러 후보 질의를 '동시에' 던지고 '첫 성공'만 사용
 async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_mcp: list[Optional[str]]) -> list[dict]:
@@ -493,18 +523,32 @@ async def _call_llm(messages: list[dict], **kwargs) -> str:
             return await call_chat_completions(messages)
         return call_chat_completions(messages)
 
+def _extract_page_id_strict(s: str|None) -> str|None:
+    if not s: return None
+    m = _PAGEID_RE_STRICT.search(s);  return m.group(1) if m else None
+
+def _url_has_page_id(url: Optional[str], page_id: Optional[str]) -> bool:
+    if not url or not page_id:
+        return False
+    return _extract_page_id_strict(url) == str(page_id)
+
+def _match_pageid(md: dict, pid: str) -> bool:
+    if not pid:
+        return True
+    pid_md = str((md or {}).get("page") or (md or {}).get("pageId") or "")
+    if pid_md:
+        return pid_md == pid
+    src = str((md or {}).get("source") or "")
+    url = str((md or {}).get("url") or "")
+    return _extract_page_id_strict(src) == pid or _extract_page_id_strict(url) == pid
+
+
 def _extract_page_id(src: Optional[str]) -> Optional[str]:
     """Confluence URL 에서 pageId= 숫자만 뽑는다."""
     if not src:
         return None
     m = _PAGEID_RE.search(str(src))
     return m.group(1) if m else None
-
-def _url_has_page_id(url: Optional[str], page_id: Optional[str]) -> bool:
-    """url 이 해당 pageId 를 가리키는지 여부"""
-    if not url or not page_id:
-        return False
-    return bool(_PAGEID_RE.search(str(url)) and page_id in str(url))
 
 def _set_sticky(src: str, secs: int = STICKY_SECS):
     """해당 소스를 잠시 기본 대상으로 고정(연속 질문 시 섞임 방지)"""
@@ -532,15 +576,7 @@ def _norm_kr(s: str) -> str:
     t = re.sub(r"\s+", "", t)        # 공백 제거 (아파트 누리 -> 아파트누리)
     return t.lower()
 
-def _match_pageid(md: dict, pid: str) -> bool:
-    if not pid:
-        return True
-    pid_md = str((md or {}).get("page") or (md or {}).get("pageId") or "")
-    src = str((md or {}).get("source") or "")
-    url = str((md or {}).get("url") or "")
-    return (pid_md == pid) or (f"pageId={pid}" in src) or (f"pageId={pid}" in url)
-
-### [ADD] 로컬 업로드 소스 판별(경로 정규화 포함)
+# 로컬 업로드 소스 판별(경로 정규화 포함)
 def _is_local_source(src: str) -> bool:
     s = _norm_source((src or "").replace("\\", "/"))
     up = (UPLOAD_DIR or "uploads").replace("\\", "/").strip("/")
@@ -557,7 +593,7 @@ def _apply_local_bonus(hits: list[dict]):
     for h in hits:
         md = (h.get("metadata") or {})
         src = str(md.get("source") or md.get("url") or "")
-        ### [FIX] 경로 표준화 기반의 로컬 판별 사용
+        # 경로 표준화 기반의 로컬 판별 사용
         if _is_local_source(src):
             h["score"] = float(h.get("score") or 0.0) + LOCAL_BONUS
 
@@ -684,7 +720,7 @@ def _split_core_and_acronyms(tokens: List[str]) -> Tuple[List[str], List[str]]:
     core, acr = [], []
     for t in tokens:
         if ACRONYM_RE.match(t):
-            acr.append(t.upper())     # ← 약어는 모두 대문자로 통일
+            acr.append(t.upper())     # 약어는 모두 대문자로 통일
         else:
             core.append(t)
     return core, acr
@@ -771,7 +807,29 @@ def _sparse_keyword_hits(q: str, limit: int = 150, space: Optional[str] = None) 
     out.sort(key=lambda h: h["score"], reverse=True)
     return out[:int(limit)]
 
-# ===== 제목/한글구절 정규화 유틸 =====
+def _looks_truncated(text: str) -> bool:
+    if not text: return False
+    t = text.strip()
+    # 문장부호로 끝나지 않거나, 리스트 헤더로 끝나면 '끊김'으로 간주
+    if re.search(r"[.!?…」）)]$", t): 
+        return False
+    if re.search(r"(\*\*?\s*\d+\.\s*|^\s*[-•]\s*)$", t):
+        return True
+    return len(t) > 200 and t[-1] not in ".!?…)]」"
+
+async def _ensure_finished(content: str) -> str:
+    if not _looks_truncated(content):
+        return content
+    msgs = [
+        {"role":"system","content":"사고과정은 출력하지 말고, 방금 답변을 간결히 끝맺음해라. 새 내용 늘리기 금지, 핵심 5~7줄로 마무리."},
+        {"role":"assistant","content":content},
+        {"role":"user","content":"위 답변이 중간에 끊겼습니다. 간결히 마무리해 주세요."}
+    ]
+    more = await _call_llm(messages=msgs, max_tokens=320, temperature=0.2)
+    return content + ("\n" if more else "") + (more or "")
+
+
+# 제목/한글구절 정규화 유틸
 def _norm_ko_text(s: str) -> str:
     # 이미 있는 _basic_normalize / _apply_canon_map / _collapse_korean_compounds 활용
     return _collapse_korean_compounds(_apply_canon_map(_basic_normalize(s))).lower()
@@ -803,7 +861,7 @@ def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
     q_tokens  = _tokenize_query(q)          # ['NIA','상가정보'] 등
     acrs      = [a.upper() for a in re.findall(r"\b[A-Za-z]{2,10}\b", q)]
 
-    # 추가: 약어+키프레이즈 결합(예: 'NIA상가정보')
+    # 약어+키프레이즈 결합(예: 'NIA상가정보')
     combo = _norm_ko_text((acrs[0] + keyphrase) if (acrs and keyphrase) else "")
 
     scored = []
@@ -1027,7 +1085,7 @@ def _reload_retriever():
 
 # 인덱싱 동시성 방지 락
 index_lock = asyncio.Lock()
-# [ADD] MCP 폴백 동시 호출을 막는 락
+# MCP 폴백 동시 호출을 막는 락
 mcp_lock = asyncio.Lock()
 
 # 문서 고유 ID (중복 방지용)
@@ -1550,7 +1608,7 @@ async def query(payload: dict = Body(...)):
     if not q.strip():
         raise HTTPException(400, "question/query/q/messages is required")
 
-    # [ADD] pageId 힌트만 추출(잠금 아님)
+    # pageId 힌트만 추출(잠금 아님)
     page_id = (payload or {}).get("pageId")
     if not page_id:
         m_pid = re.search(r"pageId\s*=\s*(\d+)", q)
@@ -1572,7 +1630,7 @@ async def query(payload: dict = Body(...)):
             "notes": {"meta_task": True}
         }
 
-    # === Direct-Answer 라우팅: 날짜/시간 등 상식형은 RAG/MCP 없이 즉답 (맨 앞 유지)
+    # Direct-Answer 라우팅: 날짜/시간 등 상식형은 RAG/MCP 없이 즉답 (맨 앞 유지)
     if _is_datetime_question(q):
         date_str, dow_str, time_str = _now_str_kst()
         sys = (
@@ -1639,8 +1697,7 @@ async def query(payload: dict = Body(...)):
             mcp_results = _rerank_mcp_results(q, mcp_results)
         except Exception as e:
             mcp_results = []
-            log.error("forced MCP (confluence hint) failed: %s", "".join(traceback.format_exception(e)))
-
+            log.error("forced MCP (confluence hint) failed: %s", traceback.format_exc())
 
         # pageId 강제 필터
         if forced_page_id and mcp_results:
@@ -1674,8 +1731,10 @@ async def query(payload: dict = Body(...)):
                     vectorstore.save_local(INDEX_DIR)
                     _reload_retriever()
 
-            # 출처도 main_pid 기준으로만
-            src_urls = _collect_source_urls_from_contexts(contexts, top_n=3, prefer_page_id=main_pid)
+            # 출처도 main_pid 기반 힌트
+            src_urls = _collect_source_urls_from_contexts(
+                contexts, top_n=1, prefer_page_id=(main_pid or forced_page_id)
+            )
 
             return {
                 "hits": len(items),
@@ -1710,7 +1769,7 @@ async def query(payload: dict = Body(...)):
                 },
             }
 
-    # === 여기부터 로컬 RAG 경로 ===
+    # 여기부터 로컬 RAG 경로
     if vectorstore is None:
         raise HTTPException(500, "vectorstore is not ready.")
 
@@ -1836,7 +1895,7 @@ async def query(payload: dict = Body(...)):
     except Exception:
         base_docs = []
 
-    # --- 경량 스파스(키워드) 후보 융합 ---
+    # 경량 스파스(키워드) 후보 융합
     want_sparse = ENABLE_SPARSE or bool(re.search(r"\b[A-Z]{2,10}\b", q)) or (len(_tokenize_query(q)) <= 3)
     if want_sparse:
         sparse_hits = _sparse_keyword_hits(q, limit=SPARSE_LIMIT, space=space)
@@ -1915,7 +1974,7 @@ async def query(payload: dict = Body(...)):
             for sp in allowed_spaces:
                 _apply_space_hint(pool_hits, sp)
 
-    # === 3-D) 의도 파악
+    # 3-D) 의도 파악
     intent = parse_query_intent(q)
     m_art = _ARTICLE_RE.search(q)
     article_no = intent.get("article_no") if m_art else None
@@ -2006,6 +2065,13 @@ async def query(payload: dict = Body(...)):
             "score": round(sc, 4),
             "title": md.get("title", ""),
         })
+
+    main_pid_eff = None
+    if not forced_page_id and _is_title_like(q) and items:
+        pid_guess = _guess_main_pid_from_contexts(contexts, q)
+        if pid_guess:
+            items, contexts, _ = _enforce_single_page(items, contexts, prefer_pid=pid_guess)
+            main_pid_eff = pid_guess
 
     # 로컬 경로에서도 pageId 힌트 강제(있을 때만)
     if forced_page_id and items:
@@ -2347,14 +2413,14 @@ async def documents_upsert(payload: dict = Body(...)):
         doc_meta.setdefault("title", title)
         doc_meta.setdefault("space", space)
         doc_meta.setdefault("kind", "chunk")
-        # [ADD] pageId가 오면 'page'에도 복사(중복 방지 ID 계산에 유리)
+        # pageId가 오면 'page'에도 복사(중복 방지 ID 계산에 유리)
         if "page" not in doc_meta and doc_meta.get("pageId"):
             doc_meta["page"] = doc_meta.get("pageId")
 
         for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
             to_add.append(Document(
                 page_content=c,
-                metadata=doc_meta    # ← [CHANGE] 재구성하지 말고 보강된 메타 그대로 저장
+                metadata=doc_meta    # 재구성하지 말고 보강된 메타 그대로 저장
             ))
 
     if not to_add:
@@ -2445,7 +2511,8 @@ async def v1_chat(payload: dict = Body(...)):
                     "컨텍스트:\n" + ctx
                 )
                 msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
-                content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
+                content = await _call_llm(messages=msgs, max_tokens=900, temperature=0.2)
+                content = await _ensure_finished(content)
             else:
                 # 컨텍스트가 비정상적으로 비었으면 일반지식 모드로 폴백
                 use_contexts = False
@@ -2458,7 +2525,8 @@ async def v1_chat(payload: dict = Body(...)):
                 "출처나 링크는 붙이지 마라."
             )
             msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
-            content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
+            content = await _call_llm(messages=msgs, max_tokens=1200, temperature=0.2)
+            content = await _ensure_finished(content)
 
     # 5) (중요) 출처는 '컨텍스트를 실제로 사용한 경우'에만, 그리고 http(s)만 붙이기
     if use_contexts:
