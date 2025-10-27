@@ -395,7 +395,11 @@ def _is_datetime_question(q: str) -> bool:
 
 _BAD_TITLE_RE = re.compile(r"(scrum|스크럼|회의록|daily|stand\s*up|스탠드업)", re.I)
 
-def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16) -> list[str]:
+def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16, prefer_page_id: Optional[str] = None) -> list[str]:
+    if prefer_page_id:
+        # 우선 해당 pageId의 컨텍스트만 남겨 출처를 고른다
+        ctxs = [c for c in (ctxs or []) if str(c.get("page") or c.get("pageId") or "") == str(prefer_page_id)]
+
     rows, seen, out = [], set(), []
     for c in ctxs or []:
         u   = c.get("source") or ""
@@ -408,15 +412,63 @@ def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16) -> lis
         is_bad  = bool(_BAD_TITLE_RE.search(title))
         rows.append((cu, score, is_conf, is_bad))
 
-    # Confluence 우선, 회의록/스크럼 후순위, 점수 내림차순
     rows.sort(key=lambda r: (r[2], not r[3], r[1]), reverse=True)
-
     for cu, *_ in rows:
         if cu not in seen:
             seen.add(cu); out.append(cu)
             if len(out) >= top_n: break
     return out
 
+def _pid_from_meta(md: dict) -> Optional[str]:
+    if not isinstance(md, dict): 
+        return None
+    pid = str(md.get("page") or md.get("pageId") or "").strip()
+    if pid: 
+        return pid
+    url = str(md.get("url") or md.get("source") or "")
+    m = _PAGEID_RE.search(url)
+    return m.group(1) if m else None
+
+def _enforce_single_page(items: list[dict], contexts: list[dict], prefer_pid: Optional[str] = None
+                         ) -> tuple[list[dict], list[dict], Optional[str]]:
+    """
+    items/contexts 안에 섞인 여러 pageId 중 하나만 남긴다.
+    prefer_pid가 있으면 그걸 우선, 없으면 '가장 많이 등장한' pageId를 고른다.
+    반환: (items_filtered, contexts_filtered, main_pid)
+    """
+    # 후보 pid 수집
+    pids = []
+    for it in items or []:
+        pid = _pid_from_meta(it.get("metadata") or {})
+        if pid: pids.append(pid)
+    for c in contexts or []:
+        pid = str(c.get("page") or c.get("pageId") or "").strip()
+        if pid: pids.append(pid)
+    main_pid = None
+
+    if prefer_pid and any(prefer_pid == p for p in pids):
+        main_pid = prefer_pid
+    elif pids:
+        from collections import Counter
+        main_pid = Counter(pids).most_common(1)[0][0]
+
+    if not main_pid:
+        return items, contexts, None
+
+    def _keep_item(it):
+        return _pid_from_meta(it.get("metadata") or {}) == main_pid
+
+    def _keep_ctx(c):
+        pid = str(c.get("page") or c.get("pageId") or "").strip()
+        return pid == main_pid
+
+    items2 = [it for it in (items or []) if _keep_item(it)]
+    contexts2 = [c for c in (contexts or []) if _keep_ctx(c)]
+
+    # 만약 필터 후 텅 비면(예: prefer_pid가 풀에 없었음) 원본 유지
+    if items2 and contexts2:
+        return items2, contexts2, main_pid
+    return items, contexts, main_pid
 
 def _now_str_kst() -> tuple[str, str, str]:
     try:
@@ -1609,6 +1661,10 @@ async def query(payload: dict = Body(...)):
             items, contexts, up_docs = _mcp_results_to_items(
                 mcp_results, k=int(k) if isinstance(k, int) else 5
             )
+            
+            # 단일 page 강제 (prefer: forced_page_id -> 없으면 다수결 Top-1)
+            items, contexts, main_pid = _enforce_single_page(items, contexts, prefer_pid=forced_page_id)
+
             added = 0
             if MCP_WRITEBACK and up_docs:
                 if MCP_WRITEBACK_TITLES_ONLY:
@@ -1618,7 +1674,9 @@ async def query(payload: dict = Body(...)):
                     vectorstore.save_local(INDEX_DIR)
                     _reload_retriever()
 
-            src_urls = _collect_source_urls_from_contexts(contexts)
+            # 출처도 main_pid 기준으로만
+            src_urls = _collect_source_urls_from_contexts(contexts, top_n=3, prefer_page_id=main_pid)
+
             return {
                 "hits": len(items),
                 "items": items,
@@ -1630,6 +1688,7 @@ async def query(payload: dict = Body(...)):
                 "notes": {
                     "forced_confluence": True,
                     "fallback_used": True,
+                    "main_page_id": main_pid,
                     "indexed": (added > 0),
                     **({"added": added} if added > 0 else {}),
                 },
@@ -1948,6 +2007,10 @@ async def query(payload: dict = Body(...)):
             "title": md.get("title", ""),
         })
 
+    # 로컬 경로에서도 pageId 힌트 강제(있을 때만)
+    if forced_page_id and items:
+        items, contexts, main_pid_local = _enforce_single_page(items, contexts, prefer_pid=forced_page_id)
+
     try:
         log.info(
             "Q=%r src_filter=%r sticky=%r page_id=%r pool=%d chosen=%d by_section=%s",
@@ -2075,8 +2138,12 @@ async def query(payload: dict = Body(...)):
 
         if mcp_results:
             items, contexts, up_docs = _mcp_results_to_items(
-                mcp_results, k=int(k) if isinstance(k, int) else 5
+            mcp_results, k=int(k) if isinstance(k, int) else 5
             )
+
+            # 단일 page 강제 (prefer: forced_page_id)
+            items, contexts, main_pid = _enforce_single_page(items, contexts, prefer_pid=forced_page_id)
+
             added = 0
             if MCP_WRITEBACK and up_docs:
                 if MCP_WRITEBACK_TITLES_ONLY:
@@ -2086,6 +2153,7 @@ async def query(payload: dict = Body(...)):
                     vectorstore.save_local(INDEX_DIR)
                     _reload_retriever()
 
+            # sticky 갱신은 유지
             try:
                 if mcp_results and (mcp_results[0].get("url") or mcp_results[0].get("id")):
                     want_sticky = False
@@ -2173,7 +2241,7 @@ async def query(payload: dict = Body(...)):
         }
 
 
-    src_urls = _collect_source_urls_from_contexts(contexts)
+    src_urls = _collect_source_urls_from_contexts(contexts, prefer_page_id=forced_page_id)
 
     return {
         "hits": len(items),
@@ -2348,7 +2416,7 @@ async def v1_chat(payload: dict = Body(...)):
         "space": space,
         "source": source,
         "sources": sources,
-        "spaces": spaces,  # ← 추가
+        "spaces": spaces,
         "sticky": False,  # 대화형 라우팅은 매질의 전환이 잦으므로 sticky 비활성
     })
 
