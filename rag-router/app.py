@@ -483,6 +483,8 @@ async def chat(req: ChatReq):
 
     # 대화 메시지에서 pageId 힌트를 미리 뽑아둠
     pid_hint = _extract_page_id_from_messages(req.messages) if req.messages else None
+    page_id_hint = _extract_page_id_from_messages(req.messages)
+    msg_dump = [m.model_dump() for m in req.messages]
     
     # 메타 태스크면 RAG 건너뛰고 그대로 모델로 전달 (JSON 형식 보존)
     if _is_webui_task(orig_user_msg):
@@ -542,28 +544,22 @@ async def chat(req: ChatReq):
         # === QA 경로 ===
         qa_json = None; qa_items = []; qa_urls = []
         for v in variants:
-            #  QA 호출에도 spaces_hint 전달(기존 기능 유지, 정확도 ↑) 
             try:
                 p1 = {"q": v, "k": 5, "sticky": False}
-                if spaces_hint:
-                    p1["spaces"] = spaces_hint
-                # [ADD] 메시지와 pageId 힌트를 같이 보냄
-                if req.messages:
-                    p1["messages"] = [m.model_dump() for m in req.messages]  # ← 대화 전체 전달
-                if pid_hint:
-                    p1["pageId"] = pid_hint
+                if spaces_hint: p1["spaces"] = spaces_hint
+                p1["messages"] = msg_dump
+                if page_id_hint: p1["pageId"] = page_id_hint
+
                 j1 = (await client.post(f"{RAG}/qa", json=p1)).json()
             except Exception:
                 j1 = {}
+
             try:
                 p2 = {"q": v, "k": 5, "sticky": True}
-                if spaces_hint:
-                    p2["spaces"] = spaces_hint
-                # [ADD] 동일 적용
-                if req.messages:
-                    p2["messages"] = [m.model_dump() for m in req.messages]
-                if pid_hint:
-                    p2["pageId"] = pid_hint
+                if spaces_hint: p2["spaces"] = spaces_hint
+                p2["messages"] = msg_dump
+                if page_id_hint: p2["pageId"] = page_id_hint
+
                 j2 = (await client.post(f"{RAG}/qa", json=p2)).json()
             except Exception:
                 j2 = {}
@@ -646,30 +642,23 @@ async def chat(req: ChatReq):
         best_urls_good=[]; best_urls_any=[]
         used_q_good=None; used_q_any=None
 
-        # [PATCH] /qa 호출 페이로드에 spaces 전달
         for v in variants:
             try:
                 payload1 = {"q": v, "k": 5, "sticky": False}
-                if spaces_hint:
-                    payload1["spaces"] = spaces_hint
-                # [ADD]
-                if req.messages:
-                    payload1["messages"] = [m.model_dump() for m in req.messages]
-                if pid_hint:
-                    payload1["pageId"] = pid_hint
+                if spaces_hint: payload1["spaces"] = spaces_hint
+                payload1["messages"] = msg_dump
+                if page_id_hint: payload1["pageId"] = page_id_hint
+
                 j1 = (await client.post(f"{RAG}/qa", json=payload1)).json()
             except Exception:
                 j1 = {}
 
             try:
                 payload2 = {"q": v, "k": 5, "sticky": True}
-                if spaces_hint:
-                    payload2["spaces"] = spaces_hint
-                # [ADD]
-                if req.messages:
-                    payload2["messages"] = [m.model_dump() for m in req.messages]
-                if pid_hint:
-                    payload2["pageId"] = pid_hint
+                if spaces_hint: payload2["spaces"] = spaces_hint
+                payload2["messages"] = msg_dump
+                if page_id_hint: payload2["pageId"] = page_id_hint
+
                 j2 = (await client.post(f"{RAG}/qa", json=payload2)).json()
             except Exception:
                 j2 = {}
