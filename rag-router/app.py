@@ -16,7 +16,7 @@ TZ = os.getenv("ROUTER_TZ", "Asia/Seoul")
 _NUM_ONLY_LINE = re.compile(r'(?m)^\s*(\d{1,3}(?:,\d{3})*|\d+)\s*$')
 
 ROUTER_STRICT_RAG = (os.getenv("ROUTER_STRICT_RAG", "1").lower() not in ("0","false","no"))
-ANSWER_MIN_OVERLAP = float(os.getenv("ROUTER_ANSWER_MIN_OVERLAP", "0.12"))
+ANSWER_MIN_OVERLAP = float(os.getenv("ROUTER_ANSWER_MIN_OVERLAP", "0.18"))
 
 
 ROUTER_MAX_TOKENS = int(os.getenv("ROUTER_MAX_TOKENS", "2048"))
@@ -189,7 +189,7 @@ def relevance_ratio(q: str, ctx: str, ctx_limit: int = 2000) -> float:
 
 
 # 환경변수로 문턱값 조정 가능 (기본 0.2)
-REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.06"))
+REL_THRESH = float(os.getenv("ROUTER_MIN_OVERLAP", "0.10"))
 
 
 def supported_by_context(answer: str, ctx: str) -> bool:

@@ -304,8 +304,9 @@ def _mcp_results_to_items(mcp_results: list[dict], k: int) -> tuple[list[dict], 
 
         if title:
             up_docs.append(Document(
-                page_content=f"[TITLE] {title}",
-                metadata={"source": src_url, "title": title, "space": space, "kind": "title", "page": pid or None, "pageId": pid or None}
+                page_content=title,  
+                metadata={"source": src_url, "title": title, "space": space, "kind": "title",
+                        "page": pid or None, "pageId": pid or None}
             ))
         for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
             up_docs.append(Document(
@@ -1143,7 +1144,7 @@ def _load_or_init_vectorstore() -> FAISSStore:
 def _empty_faiss() -> FAISSStore:
     emb = _make_embedder()
     dim = len(emb.embed_query("dim-probe"))
-    index = faiss.IndexFlatL2(dim)   # normalize_embeddings=True이지만 기본 L2로 통일
+    index = faiss.IndexFlatIP(dim)   # 정규화 임베딩 + 내적(=코사인)으로 사용
     return FAISSStore(
         embedding_function=emb,
         index=index,
@@ -1416,7 +1417,8 @@ async def ingest(
 
     # 로딩/청킹
     try:
-        docs = load_docs_any(
+        docs = await asyncio.to_thread(
+            load_docs_any,
             dest,
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
@@ -1433,14 +1435,11 @@ async def ingest(
     try:
         async with index_lock:
             before = len(vectorstore.docstore._dict)
-            added = _upsert_docs_no_dup(docs)
+            added = await asyncio.to_thread(_upsert_docs_no_dup, docs)  # [FIX]
             after = len(vectorstore.docstore._dict)
-
-            # 여기서 전역 업데이트 & sticky (전역선언은 함수 맨 위에서 이미 했음)
             last_source = _norm_source(str(dest))
             session_id = request.headers.get("X-Chat-Session")
             _set_sticky_for(session_id, last_source)
-
         return {
             "saved": {"path": str(dest), "bytes": dest.stat().st_size},
             "indexed": len(docs),
@@ -1479,7 +1478,8 @@ async def update_index(request: Request, payload: dict):
 
     # 1) 문서 로딩
     try:
-        docs = load_docs_any(
+        docs = await asyncio.to_thread(
+            load_docs_any,
             candidate,
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
@@ -1496,10 +1496,9 @@ async def update_index(request: Request, payload: dict):
     try:
         async with index_lock:
             before = len(vectorstore.docstore._dict)
-            added = _upsert_docs_no_dup(docs)
+            added = await asyncio.to_thread(_upsert_docs_no_dup, docs)  # [FIX]
             after = len(vectorstore.docstore._dict)
 
-            # 업서트 성공 후에만 최근 소스/sticky 갱신
             last_source = _norm_source(str(candidate))
             session_id = request.headers.get("X-Chat-Session")
             _set_sticky_for(session_id, last_source)
@@ -1518,6 +1517,7 @@ async def update_index(request: Request, payload: dict):
         log.exception("update failed")
         detail = str(e) or e.__class__.__name__
         raise HTTPException(500, f"update failed: {detail}")
+
 
 
 @app.delete("/delete")
@@ -2013,9 +2013,8 @@ async def query(request: Request | None = None, payload: dict = Body(...)):
     # L2 → 유사도 근사
     def _sim_from_dist(dist):
         try:
-            d2 = float(dist)      # FAISS L2는 '제곱 거리'
-            cos = 1.0 - (d2 / 2)  # cosθ = 1 - d²/2  (단위벡터 가정)
-            return max(0.0, min(1.0, (cos + 1.0) * 0.5))  # 0~1 스케일링
+            sim = float(dist)                 # faiss IndexFlatIP → 내적(클수록 유사)
+            return max(0.0, min(1.0, (sim + 1.0) * 0.5))  # [-1,1] → [0,1]
         except Exception:
             return 0.0
 
@@ -2030,7 +2029,7 @@ async def query(request: Request | None = None, payload: dict = Body(...)):
         pass
 
     for d, dist in pairs:
-        sim = _sim_from_dist(dist)
+        sim = _sim_from_dist(dist)   # [FIX] 위에서 교체한 함수 사용
         md = dict(d.metadata or {})
         md["source"] = str(md.get("source",""))
         pool_hits.append({
