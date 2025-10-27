@@ -8,11 +8,13 @@ from fastapi import Body
 import time
 import traceback
 import src.vectorstore as VS
-from pydantic import BaseModel
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import inspect
 import unicodedata
+from fastapi import Request
+from collections import OrderedDict
+import threading
 
 from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
@@ -38,6 +40,8 @@ logging.basicConfig(level=logging.INFO)
 DISABLE_INTERNAL_MCP = (os.getenv("DISABLE_INTERNAL_MCP", "0").lower() in ("1","true","yes"))
 MCP_WRITEBACK = (os.getenv("MCP_WRITEBACK", "off").lower() in ("1","true","yes","on","persist"))
 MCP_WRITEBACK_TITLES_ONLY = (os.getenv("MCP_WRITEBACK_TITLES_ONLY","off").lower() in ("1","true","yes","on"))
+STICKY_BREAK_ON_ACRONYM = bool(getattr(settings, "STICKY_BREAK_ON_ACRONYM", True))
+
 
 PAGE_FILTER_MODE = getattr(settings, "PAGE_FILTER_MODE", "soft")   # "soft"|"hard"|"off"
 PAGE_HINT_BONUS = float(getattr(settings, "PAGE_HINT_BONUS", 0.35))
@@ -130,6 +134,32 @@ ACRONYM_BODY_BONUS  = float(getattr(settings, "ACRONYM_BODY_BONUS", 0.25))
 # 상단 유틸/정규식 근처
 _A_HREF_RE = re.compile(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I|re.S)
 _RAW_URL_RE = re.compile(r'https?://[^\s"\']+pageId=\d+[^\s"\']*', re.I)
+
+# 세션별 sticky 저장 (session_id -> (source, expires))
+_sticky_lock = threading.Lock()
+_sticky_map: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
+_STICKY_CAP = 512  # LRU 상한
+
+def _set_sticky_for(session_id: str | None, src: str, secs: int = STICKY_SECS):
+    if not session_id:
+        return
+    with _sticky_lock:
+        _sticky_map[session_id] = (_norm_source(src), time.time() + secs)
+        while len(_sticky_map) > _STICKY_CAP:
+            _sticky_map.popitem(last=False)
+
+def _get_sticky_for(session_id: str | None) -> tuple[Optional[str], float]:
+    if not session_id:
+        return (None, 0.0)
+    with _sticky_lock:
+        v = _sticky_map.get(session_id)
+        if not v:
+            return (None, 0.0)
+        src, exp = v
+        if time.time() >= exp:
+            _sticky_map.pop(session_id, None)
+            return (None, 0.0)
+        return (src, exp)
 
 def _extract_confluence_links(html_or_text: str) -> list[dict]:
     out, seen = [], set()
@@ -652,8 +682,13 @@ def _apply_sticky_bonus(hits: list[dict], sticky_src: str | None):
             h["score"] = float(h.get("score") or 0.0) + STICKY_BONUS
 
 def _is_title_like(q: str) -> bool:
-    # 긴 한글 구절이 있고, 전체 토큰이 과하지 않으면 '제목형'으로 판단
-    return bool(_longest_ko_phrase(q)) and (len(_tokenize_query(q)) <= 4)
+    # 기존 기준 유지
+    if bool(_longest_ko_phrase(q)) and (len(_tokenize_query(q)) <= 4):
+        return True
+    # 약어 + 한글 조합(토큰 4개 이하)도 제목형으로 본다
+    if re.search(r"\b[A-Z]{2,10}\b", q or "") and re.search(r"[가-힣]{2,}", q or "") and (len(_tokenize_query(q)) <= 4):
+        return True
+    return False
 
 def _rebalance_by_source(hits: list[dict], k: int, per_source_cap: int) -> list[dict]:
     """소스 다양성 보장: 소스당 최대 per_source_cap개, 라운드로빈으로 k개 선택"""
@@ -1320,7 +1355,7 @@ async def ask(payload: AskPayload = Body(
     Open WebUI가 빈 바디가 아닌 {'q': ...} 형태로 요청합니다.
     """
     # query()는 dict를 받으므로 모델을 dict로 변환
-    return await query(payload.to_query_dict())
+    return await query(payload=payload.to_query_dict())
 
 @app.post(
     "/qa",
@@ -1334,7 +1369,7 @@ async def qa_compat(payload: AskPayload = Body(
     """
     [중요] /qa도 동일 스키마를 쓰면 OpenAPI 상으로 동일한 요구사항이 노출됩니다.
     """
-    return await query(payload.to_query_dict())
+    return await query(payload=payload.to_query_dict())
 
 
 @app.post("/upload")
@@ -1357,6 +1392,7 @@ async def upload(file: UploadFile = File(...), overwrite: bool = Form(False)):
 
 @app.post("/ingest")
 async def ingest(
+    request: Request,
     file: UploadFile = File(...),
     overwrite: bool = Form(False),
     parser: str = Form("auto"),
@@ -1400,9 +1436,10 @@ async def ingest(
             added = _upsert_docs_no_dup(docs)
             after = len(vectorstore.docstore._dict)
 
-            # ← 여기서 전역 업데이트 & sticky (전역선언은 함수 맨 위에서 이미 했음)
+            # 여기서 전역 업데이트 & sticky (전역선언은 함수 맨 위에서 이미 했음)
             last_source = _norm_source(str(dest))
-            _set_sticky(last_source)
+            session_id = request.headers.get("X-Chat-Session")
+            _set_sticky_for(session_id, last_source)
 
         return {
             "saved": {"path": str(dest), "bytes": dest.stat().st_size},
@@ -1416,7 +1453,7 @@ async def ingest(
 
 
 @app.post("/update")
-async def update_index(payload: dict):
+async def update_index(request: Request, payload: dict):
     global vectorstore, last_source   # ← 함수 제일 위에 둡니다
 
     if vectorstore is None:
@@ -1464,7 +1501,8 @@ async def update_index(payload: dict):
 
             # 업서트 성공 후에만 최근 소스/sticky 갱신
             last_source = _norm_source(str(candidate))
-            _set_sticky(last_source)
+            session_id = request.headers.get("X-Chat-Session")
+            _set_sticky_for(session_id, last_source)
 
         return {
             "ok": True,
@@ -1635,7 +1673,7 @@ async def uploads_reset():
     
 
 @app.post("/query", include_in_schema=False)
-async def query(payload: dict = Body(...)):
+async def query(request: Request | None = None, payload: dict = Body(...)):
     global vectorstore, retriever, current_source, current_source_until
     fallback_attempted = False
     added = 0  # ←← 미리 초기화(하단에서 안전하게 notes에 넣거나 안 넣기 위함)
@@ -1665,6 +1703,12 @@ async def query(payload: dict = Body(...)):
     page_id = str(page_id) if page_id is not None else None
 
     confl_hint = bool(CONFL_HINT_RE.search(q))
+
+    session_id = (
+        (request.headers.get("X-Chat-Session") if isinstance(request, Request) else None)
+        or (payload or {}).get("session_id")
+        or (payload or {}).get("sid")
+    )
 
     # 메타태스크는 RAG/MCP 건너뜀 (맨 앞 유지)
     if re.match(r"(?is)^\s*#{3}\s*task\s*:", q):
@@ -1759,7 +1803,7 @@ async def query(payload: dict = Body(...)):
             first = mcp_results[0]
             target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
             if target:
-                _set_sticky(target)
+                _set_sticky_for(session_id, target)
 
         # 화면 items/contexts 생성 + (옵션) 인덱스 업서트
         if mcp_results:
@@ -1825,6 +1869,11 @@ async def query(payload: dict = Body(...)):
     sticky_flag = (payload or {}).get("sticky")
     ignore_sticky = (sticky_flag is False) or (isinstance(sticky_flag, str) and str(sticky_flag).lower() in ("0","false","no"))
 
+    # 약어가 포함된 전환 질문이면(예: 'NIA 프로젝트'), 로컬 Sticky를 1턴 해제
+    if (not ignore_sticky) and STICKY_BREAK_ON_ACRONYM:
+        if re.search(r"\b[A-Z]{2,10}\b", q or "") and (current_source and _is_local_source(current_source)):
+            ignore_sticky = True
+
     sticky_source: Optional[str] = None
 
     # sticky 적용 (유효기간 + 관련성 체크)
@@ -1832,21 +1881,31 @@ async def query(payload: dict = Body(...)):
         sticky_source = None  # '제목형'은 특정 파일에 고정하지 않음
 
     now = time.time()
-    if (not ignore_sticky) and not src_filter and not src_set and current_source and now < current_source_until:
-        if (not STICKY_STRICT) or _sticky_is_relevant(q, current_source):
-            if STICKY_MODE == "filter":
-                src_filter = current_source
-            else:  # "bonus"
-                sticky_source = current_source
-        else:
-            current_source = None
-            current_source_until = 0.0
+    if (not ignore_sticky) and not src_filter and not src_set:
+        # 1) 세션 sticky 우선
+        s_src, s_until = _get_sticky_for(session_id)
+        if s_src and now < s_until:
+            if (not STICKY_STRICT) or _sticky_is_relevant(q, s_src):
+                if STICKY_MODE == "filter":
+                    src_filter = s_src
+                else:
+                    sticky_source = s_src
+        # 2) 레거시 전역 sticky 보조
+        elif current_source and now < current_source_until:
+            if (not STICKY_STRICT) or _sticky_is_relevant(q, current_source):
+                if STICKY_MODE == "filter":
+                    src_filter = current_source
+                else:
+                    sticky_source = current_source
+            else:
+                current_source = None
+                current_source_until = 0.0
 
-    # "이 파일/첨부한 파일" 지시어면 최근 업로드 파일로 고정
+    # “이 파일/첨부한 파일” 지시어 → 세션 sticky 업데이트
     global last_source
     if not src_filter and not src_set and last_source and THIS_FILE_PAT.search(q):
         src_filter = last_source
-        _set_sticky(last_source)
+        _set_sticky_for(session_id, last_source)
 
     # 3-A) 후보 선택은 MMR로
     try:
@@ -1876,7 +1935,7 @@ async def query(payload: dict = Body(...)):
             ]
             if cands:
                 src_filter = cands[0]
-                _set_sticky(src_filter)
+                _set_sticky_for(session_id, src_filter)
         except Exception:
             pass
 
@@ -1954,9 +2013,9 @@ async def query(payload: dict = Body(...)):
     # L2 → 유사도 근사
     def _sim_from_dist(dist):
         try:
-            d = float(dist)
-            s = 1.0 - 0.5 * d
-            return max(0.0, min(1.0, s))
+            d2 = float(dist)      # FAISS L2는 '제곱 거리'
+            cos = 1.0 - (d2 / 2)  # cosθ = 1 - d²/2  (단위벡터 가정)
+            return max(0.0, min(1.0, (cos + 1.0) * 0.5))  # 0~1 스케일링
         except Exception:
             return 0.0
 
@@ -2257,7 +2316,7 @@ async def query(payload: dict = Body(...)):
             first = mcp_results[0]
             target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
             if target:
-                _set_sticky(target)
+                _set_sticky_for(session_id, target)
 
         if mcp_results:
             items, contexts, up_docs = _mcp_results_to_items(
@@ -2285,7 +2344,7 @@ async def query(payload: dict = Body(...)):
                     if STICKY_AFTER_MCP and want_sticky:
                         try:
                             first = mcp_results[0]
-                            _set_sticky(first.get("url") or f"confluence:{first.get('id')}")
+                            _set_sticky_for(session_id, first.get("url") or f"confluence:{first.get('id')}")
                         except Exception:
                             pass
             except Exception:
@@ -2338,7 +2397,7 @@ async def query(payload: dict = Body(...)):
                     first = mcp_results[0]
                     target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
                     if target:
-                        _set_sticky(target)
+                        _set_sticky_for(session_id, target)
 
     base_notes = {"missing_article": missing_article, "article_no": article_no}
     if fallback_attempted:
@@ -2524,7 +2583,7 @@ app.include_router(smart_router)
 from api.smart_router import ask_smart
 
 @app.post("/v1/chat/completions")
-async def v1_chat(payload: dict = Body(...)):
+async def v1_chat(request: Request, payload: dict = Body(...)):
     import time as _time
 
     # 마지막 user 메시지 추출
@@ -2543,24 +2602,27 @@ async def v1_chat(payload: dict = Body(...)):
     source  = payload.get("source")
     sources = payload.get("sources")
     spaces = payload.get("spaces")
-    r = await query({
-        "question": q,
-        "pageId": page_id,
-        "space": space,
-        "source": source,
-        "sources": sources,
-        "spaces": spaces,
-        # "sticky": False,  # 대화형 라우팅은 매질의 전환이 잦으므로 sticky 비활성
-        "messages": payload.get("messages"),
-    })
-
-    # 2) direct_answer가 있으면 그대로 사용
-    content = r.get("direct_answer")
+    session_id = request.headers.get("X-Chat-Session")
+    r = await query(
+        request=request,
+        payload={
+            "question": q,
+            "pageId": page_id,
+            "space": space,
+            "source": source,
+            "sources": sources,
+            "spaces": spaces,
+            "messages": payload.get("messages"),
+            "session_id": session_id,
+        },
+    )
 
     # 3) 컨텍스트가 있으면 우선 사용(단, 'no_rag'처럼 의도적으로 비-RAG 라우팅한 경우 제외)
     notes = r.get("notes", {}) or {}
     use_contexts = bool(r.get("contexts")) and not notes.get("low_relevance", False)
     prefer_contexts = use_contexts and notes.get("routed") != "no_rag"
+
+    content = None
 
     if not content:
         if use_contexts:
@@ -2581,18 +2643,30 @@ async def v1_chat(payload: dict = Body(...)):
             else:
                 # 컨텍스트가 비정상적으로 비었으면 일반지식 모드로 폴백
                 use_contexts = False
+        else:
+            # datetime 등 'no_rag' 라우팅이면 direct_answer 우선 사용
+            if notes.get("routed") == "no_rag" and r.get("direct_answer"):
+                content = r["direct_answer"]
+            else:
+                sys = (
+                    "너는 내부 문서를 인용하지 않고도 답할 수 있는 일반 지식 질문에 답하는 어시스턴트다. "
+                    "사고과정은 출력하지 말고, 한국어로 간결하고 정확하게 답하라. "
+                    "출처나 링크는 붙이지 마라."
+                )
+                msgs = [{"role":"system","content":sys},{"role":"user","content":q}]
+                content = await _call_llm(messages=msgs, max_tokens=1200, temperature=0.2)
+                content = await _ensure_finished(content)
 
-        if not use_contexts:
-            # 4) 일반지식/비도메인 질문 → RAG 없이 모델 지식으로 답변 (출처 금지)
-            sys = (
-                "너는 내부 문서를 인용하지 않고도 답할 수 있는 일반 지식 질문에 답하는 어시스턴트다. "
-                "사고과정은 출력하지 말고, 한국어로 간결하고 정확하게 답하라. "
-                "출처나 링크는 붙이지 마라."
-            )
-            msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
-            content = await _call_llm(messages=msgs, max_tokens=1200, temperature=0.2)
-            content = await _ensure_finished(content)
-
+    def _weak_ctx(q: str, ctxs: list[dict]) -> bool:
+        import re
+        def toks(s): return re.findall(r"[가-힣A-Za-z0-9]{2,}", (s or "").lower())
+        qk = list(dict.fromkeys(toks(q)))[:8]
+        if not qk: 
+            return True
+        txt = " ".join(c.get("text","") for c in ctxs)[:4000].lower()
+        hit = sum(1 for t in qk if t in txt)
+        need = max(2, int(len(qk) * 0.35))   # 질문 토큰의 35% 정도 필요
+        return hit < need
 
     # 5) 출처는 '컨텍스트를 실제로 사용한 경우'에만
     raw_urls = r.get("source_urls", []) or []

@@ -82,6 +82,16 @@ def _filter_urls_by_host(urls: list[str]) -> list[str]:
             out.append(u)
     return out
 
+def _is_useful_ctx(j: dict) -> bool:
+    """/query(or /qa) 결과가 실제로 답변에 쓸만한 컨텍스트인지 판단"""
+    if not j:
+        return False
+    notes = j.get("notes") or {}
+    if notes.get("low_relevance"):
+        return False
+    ctxs = j.get("contexts") or j.get("items") or []
+    return bool(ctxs)
+
 
 def _strip_josa(tok: str) -> str:
     return _JOSA_RE.sub('', tok)
@@ -363,15 +373,20 @@ def build_system_with_context(ctx_text: str, mode: str) -> str:
         "[컨텍스트 끝]\n"
     )
 
-def _limit_urls(urls: List[str] | None, top_n: int = ROUTER_SOURCES_MAX) -> List[str]:
+def _limit_urls(urls: list[str], max_n: int | None = None) -> list[str]:
+    max_n = max_n or ROUTER_SOURCES_MAX
     out, seen = [], set()
     for u in urls or []:
         nu = _normalize_url(u)
-        if nu and nu not in seen:
-            seen.add(nu); out.append(nu)
-        if len(out) >= top_n:
+        if not nu: 
+            continue
+        if nu in seen:
+            continue
+        seen.add(nu)
+        out.append(nu)
+        if len(out) >= max_n:
             break
-    return out
+    return _filter_urls_by_host(out)
 
 
 def extract_texts(items: List[dict]) -> List[str]:
@@ -390,16 +405,14 @@ def extract_texts(items: List[dict]) -> List[str]:
                         texts.append(unescape(val.strip())); break
     return texts
 
-# [추가] URL 정규화(Confluence pageId 기준으로 중복 제거)
+# URL 정규화(Confluence pageId 기준으로 중복 제거)
 def _normalize_url(u: str) -> str:
     if not u:
         return ""
-    u = str(u).split("#")[0].strip().rstrip("/")
-    m = re.search(r"(pageId=\d+)", u)
-    if m:
-        base = u.split("?")[0]
-        return f"{base}?{m.group(1)}"
-    return u
+    s = re.sub(r"#.*$", "", u.strip())  # 앵커 제거
+    s = re.sub(r"(\?|&)(?:utm_[^=&]+|spm|fbclid)=[^&]*", "", s)  # 잡파라미터 제거
+    s = re.sub(r"[?&]+$", "", s)
+    return s
 
 def _collect_urls_from_items(items: List[dict], top_n: Optional[int] = None) -> List[str]:
     top_n = top_n or ROUTER_SOURCES_MAX
@@ -532,9 +545,10 @@ async def chat(req: ChatReq):
 
 
             # 더 나은 쪽 선택
-            best = max([j1, j2], key=_qa_score)
-            if _qa_score(best) <= 0:
+            cands = [j for j in (j1, j2) if _is_useful_ctx(j)]
+            if not cands:
                 continue
+            best = max(cands, key=_qa_score)
 
             items = best.get("items") or []
             ctx_text = "\n\n".join(extract_texts(items))[:MAX_CTX_CHARS]
@@ -630,6 +644,8 @@ async def chat(req: ChatReq):
 
             # 여기서 바로 평가/갱신 (바깥에 동일 코드 두지 말기)
             for qj in (j1, j2):
+                if (qj.get("notes") or {}).get("low_relevance"):
+                    continue
                 items = (qj.get("items") or qj.get("contexts") or [])
                 urls = _limit_urls(qj.get("source_urls")) if qj.get("source_urls") \
                        else _urls_from_contexts(qj.get("contexts"))
