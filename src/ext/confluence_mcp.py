@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os, asyncio, json, logging, re
 from typing import Any, Dict, List
+import requests
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -165,3 +166,50 @@ def _dedup(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen.add(key)
         out.append(r)
     return out
+
+
+def _http_base_from_mcp(mcp_base: str) -> str:
+    b = mcp_base.rstrip('/')
+    # '/sse'와 쿼리를 떼어냄 (예: http://host:9000/sse?version=... -> http://host:9000)
+    b = re.sub(r'/sse(\?.*)?$', '', b)
+    return b
+
+def mcp_read_page(page_id: str, timeout: int = 15):
+    mcp_base = (os.getenv("MCP_URL") or os.getenv("MCP_BASE"))
+    if mcp_base:
+        base = _http_base_from_mcp(mcp_base)
+        for ep in (f"{base}/read?id={page_id}",
+                   f"{base}/resources/read?id={page_id}",
+                   f"{base}/read?page_id={page_id}"):
+            try:
+                r = requests.get(ep, timeout=timeout, headers={"Accept":"application/json"})
+                if r.status_code == 200 and r.headers.get("content-type","").startswith("application/json"):
+                    data = r.json()
+                    return {
+                        "id": str(data.get("id") or page_id),
+                        "title": data.get("title"),
+                        "space": (data.get("space") or {}).get("key") if isinstance(data.get("space"), dict) else data.get("space"),
+                        "url": data.get("url") or data.get("webui") or data.get("link"),
+                        "body_html": data.get("body_html") or data.get("html") or (data.get("body", {}).get("view", {}).get("value") if isinstance(data.get("body"), dict) else None),
+                    }
+            except Exception:
+                pass  # try next pattern or fall back to REST
+
+    # 2) Fall back: Confluence REST by ID (requires creds)
+    base = os.getenv("CONFLUENCE_BASE") or os.getenv("CONFLUENCE_URL")
+    user = os.getenv("CONFLUENCE_USER")
+    pw   = os.getenv("CONFLUENCE_PASS") or os.getenv("CONFLUENCE_PASSWORD")
+    if base and user and pw:
+        url = f"{base.rstrip('/')}/rest/api/content/{page_id}?expand=title,space,body.view,_links"
+        r = requests.get(url, auth=(user, pw), timeout=timeout)
+        r.raise_for_status()
+        j = r.json()
+        return {
+            "id": str(j.get("id") or page_id),
+            "title": j.get("title"),
+            "space": (j.get("space") or {}).get("key"),
+            "url": base.rstrip('/') + (j.get("_links", {}) or {}).get("webui", ""),
+            "body_html": ((j.get("body") or {}).get("view") or {}).get("value"),
+        }
+
+    raise RuntimeError("mcp_read_page: Neither MCP nor Confluence REST credentials are configured.")
