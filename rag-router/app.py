@@ -1,4 +1,6 @@
 # rag-router/app.py
+from __future__ import annotations
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
@@ -7,7 +9,6 @@ from html import unescape
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from functools import lru_cache
-from __future__ import annotations
 
 RAG = os.getenv("RAG_PROXY_URL", "http://rag-proxy:8080")
 OPENAI = os.getenv("OPENAI_URL", "http://172.16.10.168:9993/v1")
