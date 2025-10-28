@@ -68,6 +68,75 @@ _JOSA_RE = re.compile(r'(에서|에게|으로써|으로서|으로부터|로부�
 
 ALLOWED_SOURCE_HOSTS = [h.strip().lower() for h in os.getenv("ALLOWED_SOURCE_HOSTS","").split(",") if h.strip()]
 
+# --- token budget (approx) ------------------------------------
+MODEL_LIMIT_TOKENS = int(os.getenv("ROUTER_MODEL_LIMIT_TOKENS", "16384"))  # qwen3-30b-a3b-fp8 한계
+OUTPUT_TOKENS      = int(os.getenv("ROUTER_MAX_TOKENS", str(ROUTER_MAX_TOKENS if 'ROUTER_MAX_TOKENS' in globals() else 2048)))
+SAFETY_MARGIN      = int(os.getenv("ROUTER_CTX_SAFETY_MARGIN", "512"))     # 여유
+
+def _est_tokens(s: str) -> int:
+    # UTF-8 바이트 기반 러프 추정(한국어 기준 꽤 보수적으로 잡힘)
+    if not s: return 0
+    return math.ceil(len(s.encode("utf-8")) / 3.2)
+
+def _trim_by_tokens(s: str, budget_tokens: int) -> str:
+    if budget_tokens <= 0: 
+        return ""
+    # 바이트 단위로 잘라 과다 입력 방지
+    enc = s.encode("utf-8")
+    approx_bytes = int(budget_tokens * 3.2)
+    if len(enc) <= approx_bytes:
+        return s
+    cut = enc[:approx_bytes]
+    # 멀티바이트 경계 보정
+    while True:
+        try:
+            return cut.decode("utf-8", errors="ignore")
+        except UnicodeDecodeError:
+            cut = cut[:-1]
+
+def _fit_ctx_to_budget(system_prefix: str, user_text: str, ctx_text: str) -> str:
+    """system_prefix: 컨텍스트를 제외한 시스템 프롬프트(규칙/스타일만), 
+       user_text: 보낼 사용자 메시지(트림된 것), ctx_text: 원본 컨텍스트"""
+    max_input = MODEL_LIMIT_TOKENS - OUTPUT_TOKENS - SAFETY_MARGIN
+    use = _est_tokens(system_prefix) + _est_tokens(user_text)
+    remain = max(0, max_input - use)
+    if remain <= 0:
+        return ""
+    return _trim_by_tokens(ctx_text, remain)
+
+def _build_system_prefix(mode: str) -> str:
+    # build_system_with_context에서 컨텍스트만 뺀 “고정 프리픽스” 생성
+    dummy = build_system_with_context("", mode)
+    # 컨텍스트 태그 라인은 남아있어도 길이에 큰 영향 없음
+    return dummy
+
+
+# --- 상단 환경변수/유틸 근처에 추가 ---
+HISTORY_KEEP = int(os.getenv("ROUTER_KEEP_HISTORY", "0"))  # 0이면 마지막 user만
+USER_MAX_CHARS = int(os.getenv("ROUTER_USER_MAX_CHARS", "2000"))
+
+def _trim_user_text(s: str, limit: int) -> str:
+    s = s or ""
+    if len(s) <= limit:
+        return s
+    half = max(600, limit // 2)
+    return s[:half] + "\n...\n" + s[-half:]
+
+def _limited_messages(req_msgs: List[Msg]) -> List[dict]:
+    # 마지막 user 메세지
+    last_user = next((m for m in reversed(req_msgs) if m.role == "user"), None)
+    if not last_user:
+        return [{"role": "user", "content": ""}]
+    trimmed = _trim_user_text(sanitize(strip_reasoning(last_user.content)), USER_MAX_CHARS)
+    if HISTORY_KEEP <= 0:
+        return [{"role": "user", "content": trimmed}]
+    # (옵션) 최근 N쌍 유지하되 각 500자 이하로 요약 컷
+    hist = []
+    for m in req_msgs[-(2*HISTORY_KEEP+1): -1]:
+        c = sanitize(strip_reasoning(m.content or ""))[:500]
+        hist.append({"role": m.role, "content": c})
+    return hist + [{"role": "user", "content": trimmed}]
+
 def _host_of(u: str) -> str:
     m = re.match(r"https?://([^/]+)", str(u or ""))
     return m.group(1).lower() if m else ""
@@ -460,7 +529,7 @@ async def chat(req: ChatReq):
     if _is_webui_task(orig_user_msg):
         payload = {
             "model": OPENAI_MODEL,
-            "messages": [m.model_dump() for m in req.messages],
+            "messages": _limited_messages(req.messages),
             "stream": False,
             "temperature": 0,
             "max_tokens": req.max_tokens or ROUTER_MAX_TOKENS,
@@ -562,13 +631,19 @@ async def chat(req: ChatReq):
         qa_json = None
 
     if qa_json:
-        ctx_for_prompt = sanitize(ctx_text)    
+        ctx_for_prompt = sanitize(ctx_text)
         mode = pick_answer_mode(orig_user_msg, ctx_for_prompt)
+
+        sys_prefix = _build_system_prefix(mode)
+        limited_msgs = _limited_messages(req.messages)
+        user_for_budget = next((m["content"] for m in reversed(limited_msgs) if m["role"]=="user"), "")
+        ctx_for_prompt = _fit_ctx_to_budget(sys_prefix, user_for_budget, ctx_for_prompt)
+
         system_prompt = build_system_with_context(ctx_for_prompt, mode)
         max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
         payload = {
             "model": OPENAI_MODEL,
-            "messages": [{"role":"system","content":system_prompt}] + [m.model_dump() for m in req.messages],
+            "messages": [{"role":"system","content":system_prompt}] + limited_msgs,
             "stream": False,
             "temperature": 0,
             "max_tokens": max_tokens,
@@ -583,7 +658,6 @@ async def chat(req: ChatReq):
                 raw = ""
 
         content = sanitize(strip_reasoning(raw).strip()) or "인덱스에 근거 없음"
-
 
         strict = bool(spaces_hint) and ROUTER_STRICT_RAG
         if strict and not supported_by_context(content, ctx_for_prompt):
@@ -682,9 +756,10 @@ async def chat(req: ChatReq):
             )
         }
         max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
+        limited_msgs = _limited_messages(req.messages)
         payload = {
             "model": OPENAI_MODEL,
-            "messages": [sysmsg] + [m.model_dump() for m in req.messages],
+            "messages": [sysmsg] + limited_msgs,
             "stream": False,
             "temperature": 0,
             "max_tokens": max_tokens
@@ -718,11 +793,22 @@ async def chat(req: ChatReq):
     mode = pick_answer_mode(orig_user_msg, ctx_for_prompt)
     system_prompt = build_system_with_context(ctx_for_prompt, mode)
     max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
+    
+    limited_msgs = _limited_messages(req.messages)
+
+    sys_prefix = _build_system_prefix(mode)
+    user_for_budget = next((m["content"] for m in reversed(limited_msgs) if m["role"]=="user"), "")
+    ctx_for_prompt = _fit_ctx_to_budget(sys_prefix, user_for_budget, ctx_for_prompt)
+    system_prompt = build_system_with_context(ctx_for_prompt, mode)
+
     payload = {
         "model": OPENAI_MODEL,
-        "messages":[{"role":"system","content":system_prompt}] + [m.model_dump() for m in req.messages],
-        "stream": False, "temperature": 0, "max_tokens": max_tokens
+        "messages": [{"role":"system","content":system_prompt}] + limited_msgs,
+        "stream": False,
+        "temperature": 0,
+        "max_tokens": max_tokens
     }
+
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
             r = await client.post(f"{OPENAI}/chat/completions", json=payload)
