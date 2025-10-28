@@ -83,6 +83,15 @@ THIS_FILE_PAT = re.compile(
     r"위\s*(?:파일|문서|자료))",
     re.I
 )
+
+_WS = re.compile(r"\s+")
+TAILS = [
+    "에 대하여 설명해 주세요", "에 대하여 설명해주세요", "에 대하여 설명해줘", "에 대하여",
+    "에 대한 설명을 해주세요", "에 대한 설명", "에 대한", "설명해 주세요", "설명해주세요",
+    "설명해줘", "알려주세요", "알려 줘", "정의해줘", "정의", "소개해줘", "소개"
+]
+
+
 _CHAPTER_RE = re.compile(r"제\s*(\d+)\s*장")
 _ARTICLE_RE = re.compile(r"제\s*(\d+)\s*조")
 
@@ -527,6 +536,36 @@ async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_
         await asyncio.gather(*tasks, return_exceptions=True)
     return []
 
+def normalize_ko(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"[\"'`“”‘’\[\]\(\)<>]", " ", s)
+    s = re.sub(_WS, " ", s)
+    return s
+
+def extract_title_candidates(q: str) -> List[str]:
+    qn = normalize_ko(q)
+    base = qn
+    for t in TAILS:
+        if base.endswith(t):
+            base = base[: -len(t)].strip()
+            break
+    # 앞뒤 조사 잔여 정리
+    base = re.sub(r"(에|을|를|은|는|의)$", "", base).strip()
+    cands = [base]
+
+    # “NIA XXX” 형태면 보조 후보로 XXX도 넣기
+    m = re.match(r"^(NIA|니아)\s+(.+)$", base, flags=re.IGNORECASE)
+    if m:
+        cands.append(m.group(2).strip())
+
+    # 중복 제거, 길이 1 이상만
+    seen, out = set(), []
+    for s in cands:
+        s = re.sub(_WS, " ", s)
+        if len(s) >= 1 and s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
 def _anchor_tokens_from_query(q: str) -> list[str]:
     # _tokenize_query는 파일에 이미 정의되어 있음
     toks = _tokenize_query(q)
@@ -784,6 +823,41 @@ def _is_title_like(q: str) -> bool:
     if re.search(r"\b[A-Z]{2,10}\b", q or "") and re.search(r"[가-힣]{2,}", q or "") and (len(_tokenize_query(q)) <= 4):
         return True
     return False
+
+PREFERRED_SPACES = [s.strip() for s in os.environ.get("PREFERRED_SPACES", "").split(",") if s.strip()]
+
+def pick_best_exact_title_result(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not items:
+        return None
+
+    # 1) 선호 스페이스 우선 (문자열/딕셔너리 모두 대응)
+    def _space_key(r):
+        sp = r.get("space")
+        if isinstance(sp, dict):
+            return (sp.get("key") or "").strip()
+        return (sp or "").strip()
+
+    if PREFERRED_SPACES:
+        preferred = [r for r in items if _space_key(r) in PREFERRED_SPACES]
+        if preferred:
+            items = preferred
+
+    # 2) 최근 업데이트 우선
+    def ts(r):
+        return r.get("updated") or r.get("lastModified") or r.get("version_when") or 0
+    items.sort(key=ts, reverse=True)
+    return items[0]
+
+
+# 정확 제목 매칭용 (CQL 없이도 '정확 제목'만 추려냄)
+async def mcp_search_exact_title(title: str, limit: int = 5, space: str | None = None) -> List[Dict[str, Any]]:
+    # mcp_search는 현재 환경에서 "질의 문자열"을 받으므로 변형 없이 호출
+    rows = await mcp_search(title, limit=limit, timeout=MCP_TIMEOUT, space=space, langs=SEARCH_LANGS)
+    if not rows:
+        return []
+    tnorm = _norm_ko_text(title)
+    exacts = [r for r in rows if _norm_ko_text(r.get("title") or "") == tnorm]
+    return exacts or []
 
 def _rebalance_by_source(hits: list[dict], k: int, per_source_cap: int) -> list[dict]:
     """소스 다양성 보장: 소스당 최대 per_source_cap개, 라운드로빈으로 k개 선택"""
@@ -1875,6 +1949,42 @@ async def query(request: Request, payload: dict = Body(...)):
         space = allowed_spaces[0]
     if isinstance(space, str):
         space = space.strip() or None
+
+    # 정확 제목 선(先)잠금: 제목형 질의면 먼저 pageId를 확정해둔다.
+    if not forced_page_id and _is_title_like(q) and not _RETRIEVAL_HINT_RE.search(q):
+        try:
+            title_cands = extract_title_candidates(q)  # 예: ["NIA 상가정보", "상가정보"]
+            for t in title_cands:
+                # 현재 space 힌트가 있으면 같이 전달
+                rows = await mcp_search_exact_title(t, limit=7, space=space)
+                if not rows:
+                    continue
+                best = pick_best_exact_title_result(rows)
+                if not best:
+                    continue
+
+                # pageId 추출
+                pid = (best.get("id") or "").strip()
+                if not pid:
+                    m = _PAGEID_RE.search(best.get("url") or "")
+                    pid = m.group(1) if m else ""
+
+                if pid:
+                    forced_page_id = pid  # ↓ 아래 파이프라인 전역으로 전달
+                    # space 힌트 없으면 best의 space로 보강
+                    if not space:
+                        sp = best.get("space")
+                        space = (sp.get("key") if isinstance(sp, dict) else sp) or space
+
+                    # 세션 sticky도 페이지로 고정(다음 턴 혼선 방지)
+                    if STICKY_AFTER_MCP:
+                        try:
+                            _set_sticky_for(session_id, _canon_url(best.get("url") or "", pid))
+                        except Exception:
+                            pass
+                    break
+        except Exception:
+            pass
 
     # 4) 강제 Confluence 분기: 질문에 '컨플/컨플루언스' 있으면 retriever 호출 전에 바로 처리
     if confl_hint and not DISABLE_INTERNAL_MCP:
