@@ -21,7 +21,7 @@ from src.rag_pipeline import build_rag_chain, Document
 from src.loaders import load_docs_any
 from fastapi.middleware.cors import CORSMiddleware
 from src.config import settings
-from src.ext.confluence_mcp import mcp_search
+from src.ext.confluence_mcp import mcp_search, mcp_read_page
 import asyncio, hashlib
 from collections import Counter
 from src.retrieval.rerank import parse_query_intent, pick_for_injection
@@ -172,6 +172,12 @@ def _extract_year_month(q: str) -> str | None:
 
 def _is_reportish(q: str) -> bool:
     return bool(re.search(r"(주간|월간)\s*(업무|보고)", q or ""))
+
+def _must_read_full(q: str, forced_page_id: Optional[str] = None) -> bool:
+    """연-월/주간·월간 보고서 질의 또는 pageId 강제 시, 검색결과 '발췌(excerpt)'가 아닌 본문을 반드시 읽도록 지시"""
+    if forced_page_id:
+        return True
+    return bool(_extract_year_month(q) or _is_reportish(q))
 
 def _pick_best_pid_by_title(q: str, results: list[dict]) -> str | None:
     if not results:
@@ -349,43 +355,60 @@ def _resolve_allowed_spaces(client_spaces: list | None) -> list | None:
         return inter or ENV_SPACES
     return ENV_SPACES or (cs or None)
 
-def _mcp_results_to_items(mcp_results: list[dict], k: int) -> tuple[list[dict], list[dict], list[Document]]:
+# [REPLACE] 기존 _mcp_results_to_items 시그니처/내부 일부 교체
+def _mcp_results_to_items(
+    mcp_results: list[dict],
+    k: int,
+    *,
+    fetch_full: bool = False   # ← [ADD] 본문 강제 읽기 플래그
+) -> tuple[list[dict], list[dict], list[Document]]:
     items, contexts, up_docs = [], [], []
     for r in (mcp_results or [])[:k]:
         title = (r.get("title") or "").strip()
         body  = (r.get("body") or r.get("excerpt") or r.get("text") or "")
         body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
 
+        # [ADD] pageId 확보
         pid = (r.get("id") or "").strip()
         if not pid:
             m_pid = re.search(r"[?&]pageId=(\d+)", (r.get("url") or ""))
             if m_pid: pid = m_pid.group(1)
 
+        # [ADD] 보고서/연-월/pageId 강제 등 '본문 읽기'가 필요한 경우, 발췌가 짧으면 본문 조회
+        if fetch_full and pid:
+            try:
+                if (not body) or (len(body) < 600):  # excerpt만 온 케이스 방지
+                    full = mcp_read_page(pid, timeout=MCP_TIMEOUT) or ""
+                    if full and len(full) > len(body or ""):
+                        body = full
+            except Exception:
+                pass
+
         raw_url = (r.get("url") or f"confluence:{pid}").strip()
-        src_url = _canon_url(raw_url, pid if pid else None)   
+        src_url = _canon_url(raw_url, pid if pid else None)
         space   = (r.get("space") or "").strip()
         text    = ((title + "\n\n") if title else "") + (body or "")
 
         md = {
-            "source": src_url,     # ← 표준화된 URL을 source/url 모두에
+            "source": src_url,
             "url": src_url,
             "kind": "confluence",
             "page": pid or None,
-            "pageId": pid or None, 
+            "pageId": pid or None,
             "space": space,
             "title": title,
         }
 
-        score = float(r.get("_rank") or r.get("score") or 0.5)  # ← 재랭킹 점수 반영
+        score = float(r.get("_rank") or r.get("score") or 0.5)
 
         items.append({"text": text, "metadata": md, "score": score})
-        contexts.append({"text": text, "source": md["source"], "page": md["page"], "kind": md["kind"], "score": score, "title": title,})
+        contexts.append({"text": text, "source": md["source"], "page": md["page"], "kind": md["kind"], "score": score, "title": title})
 
+        # 업서트용 문서 구성
         if title:
             up_docs.append(Document(
-                page_content=title,  
-                metadata={"source": src_url, "title": title, "space": space, "kind": "title",
-                        "page": pid or None, "pageId": pid or None}
+                page_content=title,
+                metadata={"source": src_url, "title": title, "space": space, "kind": "title", "page": pid or None, "pageId": pid or None}
             ))
         for c in _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
             up_docs.append(Document(
@@ -428,6 +451,13 @@ async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_
     if forced_page_id:
         cand.append(f"id={forced_page_id}")
     cand.append(q)
+
+    # [ADD] 연-월 질의면 "YYYY.MM / YYYY년 M월 / YYYY-M" 등 변형을 함께 시도
+    ym = _extract_year_month(q)
+    if ym:
+        y, m = ym.split(".")
+        cand.extend([f"{y}.{m}", f"{y}년 {int(m)}월", f"{y}-{m}"])
+
     q2 = _to_mcp_keywords(q)
     if q2 and q2 != q:
         cand.append(q2)
@@ -2359,9 +2389,10 @@ async def query(request: Request, payload: dict = Body(...)):
 
         if mcp_results:
             items, contexts, up_docs = _mcp_results_to_items(
-            mcp_results, k=int(k) if isinstance(k, int) else 5
+                mcp_results,
+                k=int(k) if isinstance(k, int) else 5,
+                fetch_full=_must_read_full(q, forced_page_id=forced_page_id)
             )
-
             # 단일 page 강제 (prefer: forced_page_id)
             items, contexts, main_pid = _enforce_single_page(items, contexts, prefer_pid=forced_page_id)
 
@@ -2421,7 +2452,11 @@ async def query(request: Request, payload: dict = Body(...)):
                             or str(r.get("id") or "") == forced_page_id]
 
             if mcp_results:
-                items, contexts, up_docs = _mcp_results_to_items(mcp_results, k=int(k) if isinstance(k, int) else 5)
+                items, contexts, up_docs = _mcp_results_to_items(
+                mcp_results,
+                k=int(k) if isinstance(k, int) else 5,
+                fetch_full=_must_read_full(q, forced_page_id=forced_page_id)   # ← 본문 강제 읽기
+                )
 
                 added = 0
                 if MCP_WRITEBACK and up_docs:
