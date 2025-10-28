@@ -151,6 +151,30 @@ _YM1 = re.compile(r"(20\d{2})[.\-/\s]?(1?\d)\s*월?")
 _YM2 = re.compile(r"(20\d{2})\s*년\s*(1?\d)\s*월")
 _YM3 = re.compile(r"\b(1?\d)\s*월\b")  # 연도 없는 '10월' 등
 
+# === user 메시지 과대 길이 가드 ===
+MAX_USER_CHARS   = int(os.getenv("MAX_USER_CHARS", "4000"))   # user content 상한(문자수)
+MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS","12000")) # 시스템+컨텍스트+질문 총합 상한(문자수)
+
+def _extract_user_question(messages, fallback_prompt=""):
+    """
+    Open WebUI가 파일 본문을 통째로 content에 붙여넣는 경우가 있으므로
+    - 너무 긴 content는 '마지막 문단(질문일 확률 높음)'만 남김
+    - 기본적으로 마지막 user 메시지를 채택
+    """
+    q = ""
+    for m in messages or []:
+        if (m.get("role") or "").lower() != "user":
+            continue
+        content = m.get("content") or ""
+        if len(content) > MAX_USER_CHARS:
+            # 꼬리 문단 위주로 보존 (질문이 보통 마지막에 있음)
+            tail = content[-1200:]
+            parts = re.split(r"\n\s*\n", tail)
+            content = (parts[-1] if parts else tail)[-800:]
+        q = content  # 가장 최근 user 내용으로 갱신
+    return (q or fallback_prompt or "").strip()
+
+
 def _extract_year_month(q: str) -> str | None:
     if not q: 
         return None
@@ -2387,7 +2411,8 @@ async def query(request: Request, payload: dict = Body(...)):
             )
             mcp_results = _filter_mcp_by_strong_tokens(mcp_results, q)
             mcp_results = _rerank_mcp_results(q, mcp_results)
-            # [ADD] 폴백에서도 pageId 오토 추정
+
+            # pageId 추정 (없을 때만)
             if mcp_results and not forced_page_id:
                 derived_pid = _pick_best_pid_by_title(q, mcp_results)
                 if derived_pid:
@@ -2400,22 +2425,25 @@ async def query(request: Request, payload: dict = Body(...)):
         except Exception as e:
             log.error("MCP fallback fast failed: %s", "".join(traceback.format_exception(e)))
 
+        # 강제 pid 필터
         if forced_page_id and mcp_results:
             mcp_results = [
                 r for r in mcp_results
                 if _url_has_page_id(r.get("url"), forced_page_id) or str(r.get("id") or "") == forced_page_id
             ]
 
-        if mcp_results and STICKY_AFTER_MCP:
-            first = mcp_results[0]
-            target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
-            if target:
-                _set_sticky_for(session_id, target)
-
         if mcp_results:
-            items, contexts, up_docs = await _mcp_results_to_items(mcp_results, k=int(k) if isinstance(k, int) else 5)
+            fetch_full = _must_read_full(q, forced_page_id=forced_page_id) \
+                         or bool(forced_page_id) \
+                         or _is_title_like(q)
 
-            # 단일 page 강제 (prefer: forced_page_id)
+            items, contexts, up_docs = await _mcp_results_to_items(
+                mcp_results,
+                k=int(k) if isinstance(k, int) else 5,
+                fetch_full=fetch_full
+            )
+
+            # 단일 page로 정리
             items, contexts, main_pid = _enforce_single_page(items, contexts, prefer_pid=forced_page_id)
 
             added = 0
@@ -2426,6 +2454,12 @@ async def query(request: Request, payload: dict = Body(...)):
                     added = _upsert_docs_no_dup(up_docs)
                     vectorstore.save_local(INDEX_DIR)
                     _reload_retriever()
+
+            if STICKY_AFTER_MCP:
+                first = mcp_results[0]
+                target = first.get("url") or (f"confluence:{forced_page_id}" if forced_page_id else None)
+                if target:
+                    _set_sticky_for(session_id, target)
 
             # sticky 갱신은 유지
             try:
@@ -2444,20 +2478,26 @@ async def query(request: Request, payload: dict = Body(...)):
 
     # 장/조 질의면 필터 스킵
     if items and not (chapter_no or article_no):
-        ctx_all_final = "\n".join(c["text"] for c in contexts)
-        titles_meta_final = " ".join(
-            f"{(h.get('metadata') or {}).get('title','')} {(h.get('metadata') or {}).get('source','')}"
-            for h in items
+        # 추가: Confluence 단일 페이지로 수렴했고, 강한 힌트가 있으면 게이트 스킵
+        skip_gate = (forced_page_id or _is_title_like(q)) and all(
+            (c.get("kind") == "confluence") for c in contexts
         )
-        core_final = [t for t in _query_tokens(q) if not ACRONYM_RE.match(t)]
-        blob_norm_final = _norm_kr(ctx_all_final + " " + titles_meta_final)
-        if core_final and not any(_norm_kr(t) in blob_norm_final for t in core_final):
-            items, contexts = [], []
-
-        if items:
-            anchors = _anchor_tokens_from_query(q) + re.findall(r"[A-Z]{2,5}", q)
-            if anchors and not any(_norm_kr(a) in blob_norm_final for a in anchors):
+        if not skip_gate:
+            # 기존의 core/anchor 검증 로직 유지
+            ctx_all_final = "\n".join(c["text"] for c in contexts)
+            titles_meta_final = " ".join(
+                f"{(h.get('metadata') or {}).get('title','')} {(h.get('metadata') or {}).get('source','')}"
+                for h in items
+            )
+            core_final = [t for t in _query_tokens(q) if not ACRONYM_RE.match(t)]
+            blob_norm_final = _norm_kr(ctx_all_final + " " + titles_meta_final)
+            if core_final and not any(_norm_kr(t) in blob_norm_final for t in core_final):
                 items, contexts = [], []
+            if items:
+                anchors = _anchor_tokens_from_query(q) + re.findall(r"[A-Z]{2,5}", q)
+                if anchors and not any(_norm_kr(a) in blob_norm_final for a in anchors):
+                    items, contexts = [], []
+
 
         # 비었을 때의 보조 폴백도 fast 버전으로
         if not items and not DISABLE_INTERNAL_MCP and _should_use_mcp(q, client_spaces, space, reasons, local_ok):
@@ -2473,11 +2513,14 @@ async def query(request: Request, payload: dict = Body(...)):
                             if _url_has_page_id(r.get("url"), forced_page_id)
                             or str(r.get("id") or "") == forced_page_id]
 
-            if mcp_results:
+                fetch_full = _must_read_full(q, forced_page_id=forced_page_id) \
+                            or bool(forced_page_id) \
+                            or _is_title_like(q)
+
                 items, contexts, up_docs = await _mcp_results_to_items(
                     mcp_results,
                     k=int(k) if isinstance(k, int) else 5,
-                    fetch_full=_must_read_full(q, forced_page_id=forced_page_id)
+                    fetch_full=fetch_full
                 )
 
                 added = 0
@@ -2684,23 +2727,17 @@ from api.smart_router import ask_smart
 async def v1_chat(request: Request, payload: dict = Body(...)):
     import time as _time
 
-    # 마지막 user 메시지 추출
-    q = ""
-    for m in payload.get("messages", []):
-        if m.get("role") == "user" and m.get("content"):
-            q = m["content"]
-    if not q:
-        q = payload.get("prompt") or ""
+    q = _extract_user_question(payload.get("messages", []), payload.get("prompt"))
     if not q.strip():
         raise HTTPException(400, "user message required")
 
-    # 1) 내부 /query 직접 호출
     page_id = payload.get("pageId") or payload.get("page_id")
     space   = payload.get("space") or payload.get("spaceKey")
     source  = payload.get("source")
     sources = payload.get("sources")
-    spaces = payload.get("spaces")
+    spaces  = payload.get("spaces")
     session_id = request.headers.get("X-Chat-Session")
+
     r = await query(
         request=request,
         payload={
@@ -2715,59 +2752,49 @@ async def v1_chat(request: Request, payload: dict = Body(...)):
         },
     )
 
-    # 3) 컨텍스트가 있으면 우선 사용(단, 'no_rag'처럼 의도적으로 비-RAG 라우팅한 경우 제외)
     notes = r.get("notes", {}) or {}
     use_contexts = bool(r.get("contexts")) and not notes.get("low_relevance", False)
     prefer_contexts = use_contexts and notes.get("routed") != "no_rag"
 
     content = None
+    ctx = ""   # <- 항상 초기화
 
-    if not content:
-        if use_contexts:
-            # (현행) 컨텍스트 요약 경로 유지
-            ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()
-            ctx = ctx[:8000]
-            if ctx:
-                sys = (
-                    "사고과정을 출력하지 말고, 아래 컨텍스트에 **근거한 사실만** 한국어로 답하라. "
-                    "질문에 '제 N장' 또는 '제 N조'가 있으면, 컨텍스트에서 해당 장/조를 먼저 **그대로 인용(>)**하고, "
-                    "다음 줄에 한 문장 요약을 붙여라. "
-                    "컨텍스트에 없는 내용은 절대 추측하지 말고, 부족하면 '컨텍스트에 해당 정보가 없습니다'라고 말하라.\n\n"
-                    "컨텍스트:\n" + ctx
-                )
-                msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
-                content = await _call_llm(messages=msgs, max_tokens=900, temperature=0.2)
-                content = await _ensure_finished(content)
-            else:
-                # 컨텍스트가 비정상적으로 비었으면 일반지식 모드로 폴백
-                use_contexts = False
+    if use_contexts:
+        # 컨텍스트 기반 경로 (길이 가드 포함)
+        ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()
+        ctx = ctx[:8000]
+
+        if len(ctx) + len(q) > MAX_PROMPT_CHARS:
+            keep_q = q[-1000:]
+            ctx = ctx[:max(0, MAX_PROMPT_CHARS - len(keep_q) - 512)]
+            q = keep_q
+
+        sys = (
+            "사고과정을 출력하지 말고, 아래 컨텍스트에 **근거한 사실만** 한국어로 답하라. "
+            "질문에 '제 N장' 또는 '제 N조'가 있으면, 컨텍스트에서 해당 장/조를 먼저 **그대로 인용(>)**하고, "
+            "다음 줄에 한 문장 요약을 붙여라. "
+            "컨텍스트에 없는 내용은 절대 추측하지 말고, 부족하면 '컨텍스트에 해당 정보가 없습니다'라고 말하라.\n\n"
+            "컨텍스트:\n" + ctx
+        )
+        msgs = [{"role":"system","content":sys},{"role":"user","content":q}]
+        content = await _call_llm(messages=msgs, max_tokens=900, temperature=0.2)
+        content = await _ensure_finished(content)
+    else:
+        # direct-answer 라우팅이 있으면 그걸 우선
+        if notes.get("routed") == "no_rag" and r.get("direct_answer"):
+            content = r["direct_answer"]
         else:
-            # datetime 등 'no_rag' 라우팅이면 direct_answer 우선 사용
-            if notes.get("routed") == "no_rag" and r.get("direct_answer"):
-                content = r["direct_answer"]
-            else:
-                sys = (
-                    "너는 내부 문서를 인용하지 않고도 답할 수 있는 일반 지식 질문에 답하는 어시스턴트다. "
-                    "사고과정은 출력하지 말고, 한국어로 간결하고 정확하게 답하라. "
-                    "출처나 링크는 붙이지 마라. "
-                    "특히 '페이지 ID'나 내부 링크를 추측해서 적지 마라."
-                )
-                msgs = [{"role":"system","content":sys},{"role":"user","content":q}]
-                content = await _call_llm(messages=msgs, max_tokens=1200, temperature=0.2)
-                content = await _ensure_finished(content)
+            sys = (
+                "너는 내부 문서를 인용하지 않고도 답할 수 있는 일반 지식 질문에 답하는 어시스턴트다. "
+                "사고과정은 출력하지 말고, 한국어로 간결하고 정확하게 답하라. "
+                "출처나 링크는 붙이지 마라. "
+                "특히 '페이지 ID'나 내부 링크를 추측해서 적지 마라."
+            )
+            msgs = [{"role":"system","content":sys},{"role":"user","content":q}]
+            content = await _call_llm(messages=msgs, max_tokens=1200, temperature=0.2)
+            content = await _ensure_finished(content)
 
-    def _weak_ctx(q: str, ctxs: list[dict]) -> bool:
-        import re
-        def toks(s): return re.findall(r"[가-힣A-Za-z0-9]{2,}", (s or "").lower())
-        qk = list(dict.fromkeys(toks(q)))[:8]
-        if not qk: 
-            return True
-        txt = " ".join(c.get("text","") for c in ctxs)[:4000].lower()
-        hit = sum(1 for t in qk if t in txt)
-        need = max(2, int(len(qk) * 0.35))   # 질문 토큰의 35% 정도 필요
-        return hit < need
-
-    # 5) 출처는 '컨텍스트를 실제로 사용한 경우'에만
+    # 출처 블록(컨텍스트 실제 사용 시에만)
     raw_urls = r.get("source_urls", []) or []
     abs_urls = []
     for u in raw_urls:
@@ -2777,17 +2804,15 @@ async def v1_chat(request: Request, payload: dict = Body(...)):
             abs_urls.append(u)
 
     allowed_list = _filter_urls_by_host(abs_urls)
-    allowed_http = [u for u in allowed_list if isinstance(u, str) and (u.startswith(("http://", "https://")) or u.startswith("/"))]
+    allowed_http = [u for u in allowed_list if isinstance(u, str) and (u.startswith(("http://","https://")) or u.startswith("/"))]
 
     if prefer_contexts and allowed_http:
-        src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_http)
-        content = (content or "") + src_block
+        content = (content or "") + "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_http)
 
-    # 6) OpenAI 호환 응답은 그대로 유지
     return {
-        "object": "chat.completion",
-        "model": "qwen3-30b-a3b-fp8-router",
+        "object":"chat.completion",
+        "model":"qwen3-30b-a3b-fp8-router",
         "created": int(_time.time()),
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
         "notes": r.get("notes", {}),
     }
