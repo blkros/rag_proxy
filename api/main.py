@@ -207,46 +207,50 @@ def _pick_best_pid_by_title(q: str, results: list[dict]) -> str | None:
     if not results:
         return None
 
-    ym = _extract_year_month(q)             # '2025.10' 형태 또는 None
-    reportish = _is_reportish(q)            # '주간/월간 ... 보고' 등
+    ym = _extract_year_month(q)
+    reportish = _is_reportish(q)
     keyphrase = _norm_ko_text(_longest_ko_phrase(q) or "")
+    acrs = [a.upper() for a in re.findall(r"\b[A-Za-z]{2,10}\b", q)]
+    combo = _norm_ko_text((acrs[0] + " " + keyphrase) if (acrs and keyphrase) else "")
 
+    def _pid_of(r: dict) -> str | None:
+        pid = (r.get("id") or "").strip()
+        if not pid:
+            m = _PAGEID_RE.search(r.get("url") or "")
+            pid = m.group(1) if m else ""
+        return pid or None
+
+    # 0) 제목 "정확 일치" 즉시 반환: combo → keyphrase
+    if combo:
+        for r in results:
+            if _norm_ko_text(r.get("title") or "") == combo:
+                pid = _pid_of(r)
+                if pid: return pid
+    if keyphrase:
+        for r in results:
+            if _norm_ko_text(r.get("title") or "") == keyphrase:
+                pid = _pid_of(r)
+                if pid: return pid
+
+    # 1) 가산점 기반(기존 로직)으로 스코어링
     scored: dict[str, float] = {}
     for r in results:
         title = (r.get("title") or "")
         ntitle = _norm_ko_text(title)
         body  = r.get("body") or r.get("excerpt") or r.get("text") or ""
-        pid   = (r.get("id") or "").strip()
-        if not pid:
-            m = _PAGEID_RE.search(r.get("url") or "")
-            pid = m.group(1) if m else ""
+        pid   = _pid_of(r)
         if not pid:
             continue
 
         s = float(r.get("_rank") or r.get("score") or 0.0)
-        # 제목에 'YYYY.MM' 있으면 최우선
         if ym and ym in ntitle:             s += 2.5
-        # '주간/월간' 키워드 보너스
-        if reportish and re.search(r"(주간|월간)", title): 
-            s += 1.2
-        # 팀명/핵심 구절 매치
-        if keyphrase and keyphrase in ntitle: 
-            s += 0.8
-        # 회의록/스크럼 같은 일반 타이틀은 감점
-        if _BAD_TITLE_RE.search(title or ""): 
-            s -= 0.4
-
+        if reportish and re.search(r"(주간|월간)", title): s += 1.2
+        if keyphrase and keyphrase in ntitle: s += 0.8
+        if _BAD_TITLE_RE.search(title or ""): s -= 0.4
         scored[pid] = max(scored.get(pid, 0.0), s)
 
-        # ⚠ 앵커 가산점은 '일반 질의'에서만 사용.
-        # 월간/주간 보고 또는 연-월 질의(ym/reportish)에는 비활성화해 엉뚱한 pageId 점프를 차단.
-        if not (ym or reportish):
-            for ln in _extract_confluence_links(body):
-                anc = _norm_ko_text(ln.get("anchor") or "")
-                if keyphrase and (anc == keyphrase or keyphrase in anc):
-                    scored[ln["pageId"]] = max(scored.get(ln["pageId"], 0.0), s + 1.2)
-
     return max(scored, key=scored.get) if scored else None
+
 
 
 def _set_sticky_for(session_id: str | None, src: str, secs: int = STICKY_SECS):
@@ -474,7 +478,6 @@ async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_
         cand.append(f"id={forced_page_id}")
     cand.append(q)
 
-    # [ADD] 연-월 질의면 "YYYY.MM / YYYY년 M월 / YYYY-M" 등 변형을 함께 시도
     ym = _extract_year_month(q)
     if ym:
         y, m = ym.split(".")
@@ -483,10 +486,17 @@ async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_
     q2 = _to_mcp_keywords(q)
     if q2 and q2 != q:
         cand.append(q2)
+
+    # 약어+한글구절 조합을 함께 시도 (예: "NIA 상가정보")
+    acrs = re.findall(r"\b[A-Za-z]{2,10}\b", q)
+    ko_phrase = _longest_ko_phrase(q)
+    if acrs and ko_phrase:
+        cand.extend([f"{acrs[0]} {ko_phrase}", f"\"{acrs[0]} {ko_phrase}\""])
+
     ko = re.findall(r"[가-힣]{2,}", q)
     if ko:
         cand.append(_strip_josa(sorted(ko, key=len, reverse=True)[0]))
-    # dedup & cap
+
     seen = set()
     qlist = [x for x in cand if x and not (x in seen or seen.add(x))][:MCP_MAX_TASKS]
 
@@ -1069,7 +1079,7 @@ def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
     keyphrase = _longest_ko_phrase(q)
     q_tokens  = _tokenize_query(q)
     acrs      = [a.upper() for a in re.findall(r"\b[A-Za-z]{2,10}\b", q)]
-    combo     = _norm_ko_text((acrs[0] + keyphrase) if (acrs and keyphrase) else "")
+    combo     = _norm_ko_text((acrs[0] + " " + keyphrase) if (acrs and keyphrase) else "")
     exact_key = _norm_ko_text(keyphrase or "")
 
     scored = []
@@ -1081,7 +1091,7 @@ def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
         s = float(r.get("score") or 0.0)
 
         if exact_key and ntitle:
-            if ntitle == exact_key:     s += 3.5   # 정확 제목 일치는 강하게
+            if ntitle == exact_key:     s += 3.5
             elif exact_key in ntitle:   s += 1.2
 
         if combo and ntitle:
@@ -1101,29 +1111,31 @@ def _rerank_mcp_results(q: str, results: list[dict]) -> list[dict]:
         r["_rank"] = s
         scored.append(r)
 
-    # (기존 앵커 기반 보정 로직은 유지)… [중략]
-
     scored.sort(key=lambda x: x.get("_rank", 0.0), reverse=True)
 
-    # ★ 정확 제목 일치가 하나라도 있으면 해당 pageId만 남기기(하드 잠금)
-    if exact_key:
-        exact = []
-        for r in scored:
-            if _norm_ko_text(r.get("title") or "") == exact_key:
-                exact.append(r)
-        if exact:
-            # 가장 높은 랭크의 정확일치 페이지의 pid로 필터링
-            best = max(exact, key=lambda x: x.get("_rank", 0.0))
-            def _pid_of(res: dict) -> str | None:
-                pid = (res.get("id") or "").strip()
-                if not pid:
-                    m = _PAGEID_RE.search(res.get("url") or "")
-                    pid = m.group(1) if m else ""
-                return pid or None
-            best_pid = _pid_of(best)
-            if best_pid:
-                return [r for r in scored 
-                        if _url_has_page_id(r.get("url"), best_pid) or str(r.get("id") or "") == best_pid]
+    # === 하드락 대상 선택 로직 보강: combo → exact_key 순으로 우선 잠금 ===
+    def _pid_of(res: dict) -> str | None:
+        pid = (res.get("id") or "").strip()
+        if not pid:
+            m = _PAGEID_RE.search(res.get("url") or "")
+            pid = m.group(1) if m else ""
+        return pid or None
+
+    best_exact = None
+    if combo:
+        exact_combo_hits = [r for r in scored if _norm_ko_text(r.get("title") or "") == combo]
+        if exact_combo_hits:
+            best_exact = max(exact_combo_hits, key=lambda x: x.get("_rank", 0.0))
+    if (not best_exact) and exact_key:
+        exact_title_hits = [r for r in scored if _norm_ko_text(r.get("title") or "") == exact_key]
+        if exact_title_hits:
+            best_exact = max(exact_title_hits, key=lambda x: x.get("_rank", 0.0))
+
+    if best_exact:
+        best_pid = _pid_of(best_exact)
+        if best_pid:
+            return [r for r in scored
+                    if _url_has_page_id(r.get("url"), best_pid) or str(r.get("id") or "") == best_pid]
 
     return scored
 
