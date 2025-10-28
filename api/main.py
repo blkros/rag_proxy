@@ -135,6 +135,12 @@ ACRONYM_BODY_BONUS  = float(getattr(settings, "ACRONYM_BODY_BONUS", 0.25))
 _A_HREF_RE = re.compile(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I|re.S)
 _RAW_URL_RE = re.compile(r'https?://[^\s"\']+pageId=\d+[^\s"\']*', re.I)
 
+PAGEID_ABS = re.compile(r"https?://[^\s]+?\bpageId=(\d{6,})")
+PAGEID_REL = re.compile(r"(?m)(?:^|\s)/pages/viewpage\.action\?[^ \n]*\bpageId=(\d{6,})")
+PAGEID_KV  = re.compile(r"(?i)\bpageid\s*[:=]\s*(\d{6,})")
+PAGEID_ANY = re.compile(r"[?&]pageId=(\d{6,})")
+
+
 # 세션별 sticky 저장 (session_id -> (source, expires))
 _sticky_lock = threading.Lock()
 _sticky_map: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
@@ -413,12 +419,8 @@ def _guess_main_pid_from_contexts(contexts: list[dict], q: str) -> Optional[str]
                 return ln.get("pageId")
     return None
 
-# 빠른 MCP 폴백: 여러 후보 질의를 '동시에' 던지고 '첫 성공'만 사용
 async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_mcp: list[Optional[str]]) -> list[dict]:
-    import asyncio, time
     start = time.monotonic()
-
-    # 1) 질의 후보 구성 (id → 원문 → 키워드화 → 한글 최장토큰)
     cand: list[str] = []
     if forced_page_id:
         cand.append(f"id={forced_page_id}")
@@ -429,69 +431,36 @@ async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_
     ko = re.findall(r"[가-힣]{2,}", q)
     if ko:
         cand.append(_strip_josa(sorted(ko, key=len, reverse=True)[0]))
-
-    # 중복 제거 + 상한
+    # dedup & cap
     seen = set()
     qlist = [x for x in cand if x and not (x in seen or seen.add(x))][:MCP_MAX_TASKS]
 
     spaces = spaces_for_mcp or [None]
-    tasks: list[asyncio.Task] = []
-    for sp in spaces:
-        for qq in qlist:
-            tasks.append(asyncio.create_task(
-                mcp_search(qq, limit=10, timeout=MCP_TIMEOUT, space=sp, langs=SEARCH_LANGS)
-            ))
-
-    # 2) 벽시계 제한 내에서 '첫 성공'만 받기
-    deadline = start + MAX_FALLBACK_SECS
-    while tasks and time.monotonic() < deadline:
-        done, pending = await asyncio.wait(tasks, timeout=deadline - time.monotonic(),
-                                           return_when=asyncio.FIRST_COMPLETED)
-        if not done:
-            break
-        for t in done:
-            try:
-                part = t.result() or []
-                if part:
-                    # 나머지 취소
-                    for p in pending: p.cancel()
-                    return part
-            except Exception:
-                pass
-        tasks = list(pending)
+    tasks = [asyncio.create_task(mcp_search(qq, limit=10, timeout=MCP_TIMEOUT, space=sp, langs=SEARCH_LANGS))
+             for sp in spaces for qq in qlist]
 
     deadline = start + MAX_FALLBACK_SECS
-    pending = set(tasks)  # 바깥에서 초기화
-
     try:
-        while pending and time.monotonic() < deadline:
-            done, pending = await asyncio.wait(
-                pending, timeout=deadline - time.monotonic(),
-                return_when=asyncio.FIRST_COMPLETED
-            )
+        while tasks and time.monotonic() < deadline:
+            done, pending = await asyncio.wait(tasks, timeout=deadline - time.monotonic(),
+                                               return_when=asyncio.FIRST_COMPLETED)
             if not done:
                 break
             for t in done:
                 try:
                     part = t.result() or []
+                    if part:
+                        for p in pending: p.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        return part
                 except Exception:
-                    part = []
-                if part:
-                    # 나머지 취소 + 수거  ← 추가
-                    for p in pending: p.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    return part
-
-        # 타임아웃/무응답 → 모두 취소 후 수거  ← 정리
-        for p in pending: p.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        return []
-
+                    pass
+            tasks = list(pending)
     finally:
-        # 혹시 남아있으면 한 번 더 안전 정리
-        if pending:
-            for p in pending: p.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return []
 
 def _anchor_tokens_from_query(q: str) -> list[str]:
     # _tokenize_query는 파일에 이미 정의되어 있음
@@ -579,19 +548,8 @@ def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16, prefer
 
     return out
 
-def _page_id_from_messages(msgs: list[dict]) -> Optional[str]:
-    for m in reversed(msgs or []):
-        text = (m.get("content") or "")
-        if not text:
-            continue
-        m_pid = _PAGEID_RE.search(text)
-        if m_pid:
-            return m_pid.group(1)
-        links = _extract_confluence_links(text)
-        if links:
-            return links[-1]["pageId"]
-    return None
-
+def extract_page_id_from_messages(msgs: list[dict]) -> Optional[str]:
+    return _page_id_from_messages(msgs)
 
 def _pid_from_meta(md: dict) -> Optional[str]:
     if not isinstance(md, dict): 
@@ -666,6 +624,7 @@ async def _call_llm(messages: list[dict], **kwargs) -> str:
         if inspect.iscoroutinefunction(call_chat_completions):
             return await call_chat_completions(messages)
         return call_chat_completions(messages)
+
 
 def _extract_page_id_strict(s: str|None) -> str|None:
     if not s: return None
@@ -882,6 +841,37 @@ _STOP_SUFFIX_RE = re.compile(
     r"설명해\s*주세요|설명해주세요|설명해줘|알려줘|해줘요?|주세요)$"
 )
 
+def _page_id_from_messages(msgs: list[dict]) -> Optional[str]:
+    """
+    최근 user 메시지 기준으로 pageId 탐색하되, 없으면 전체 메시지에서도 보조로 탐색.
+    """
+    msgs = msgs or []
+    # 1) 최근 user 메시지부터
+    for m in reversed(msgs):
+        if (m.get("role") or "").lower() != "user":
+            continue
+        text = (m.get("content") or "")
+        if not text:
+            continue
+        m_pid = _PAGEID_RE.search(text)
+        if m_pid:
+            return m_pid.group(1)
+        links = _extract_confluence_links(text)
+        if links:
+            return links[-1]["pageId"]
+    # 2) 보조: 모든 메시지
+    for m in reversed(msgs):
+        text = (m.get("content") or "")
+        if not text:
+            continue
+        m_pid = _PAGEID_RE.search(text)
+        if m_pid:
+            return m_pid.group(1)
+        links = _extract_confluence_links(text)
+        if links:
+            return links[-1]["pageId"]
+    return None
+
 def _preseg_stop_phrases(q: str) -> str:
     # 붙여쓰기일 때도 뭉친 꼬리를 띄우거나 제거
     return _STOP_SUFFIX_RE.sub(" ", q)
@@ -1092,16 +1082,6 @@ _HANGUL_BLOCK = r"[가-힣0-9A-Za-z]"
 def _collapse_korean_compounds(text: str) -> str:
     # 한글/숫자/영문 사이의 단일 공백 제거
     return re.sub(fr"(?<={_HANGUL_BLOCK})\s+(?={_HANGUL_BLOCK})", "", text)
-
-# 3) 도메인 동의어/약어 매핑 (좌변 패턴 → 우변 표준형)
-# CANON_MAP = {
-#     r"\bNIA\b": "한국지능정보사회진흥원",
-#     r"한국\s*지능\s*정보\s*사회\s*진흥원": "한국지능정보사회진흥원",
-#     r"국가\s*정보화\s*진흥원": "한국지능정보사회진흥원",  # 옛 명칭
-#     r"지역\s*정보": "지역정보",
-#     r"아파트\s*누리": "아파트누리",
-#     r"개발\s*서버\s*정보": "개발서버정보",
-# }
 
 CANON_MAP = {
     r"한국\s*지능\s*정보\s*사회\s*진흥원": "NIA",   # ← 길->짧
@@ -1522,8 +1502,6 @@ async def update_index(request: Request, payload: dict):
 
     parser = (payload or {}).get("parser", "auto")
 
-    # (주의) 여기서 last_source 건드리지 말 것!  ←←← 기존의 임시 sticky 라인 삭제
-
     # 1) 문서 로딩
     try:
         docs = await asyncio.to_thread(
@@ -1746,7 +1724,7 @@ async def query(request: Request, payload: dict = Body(...)):
 
     # 대화 메시지 배열에서도 보조로 탐색
     if not page_id and isinstance((payload or {}).get("messages"), list):
-        page_id = _page_id_from_messages(payload["messages"])
+        page_id = extract_page_id_from_messages(payload["messages"])
 
     page_id = str(page_id) if page_id is not None else None
 
@@ -2494,7 +2472,7 @@ async def query(request: Request, payload: dict = Body(...)):
     src_urls = _collect_source_urls_from_contexts(
     contexts, top_n=1 if prefer_pid_for_sources else 16, prefer_page_id=prefer_pid_for_sources
     )
-    
+
     return {
         "hits": len(items),
         "items": items,
