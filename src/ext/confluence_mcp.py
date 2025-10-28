@@ -9,6 +9,10 @@ from mcp.client.sse import sse_client
 
 log = logging.getLogger(__name__)
 
+base = (os.getenv("CONFLUENCE_BASE_URL") or
+        os.getenv("CONFLUENCE_BASE") or
+        os.getenv("CONFLUENCE_URL"))
+
 MCP_PROTOCOL_VERSION = os.getenv("MCP_PROTOCOL_VERSION", "2025-06-18")
 
 def _with_version(url: str) -> str:
@@ -102,10 +106,21 @@ async def mcp_search(query: str, limit: int = 5, timeout: int = 20,
     return _dedup(results_all)
 
 def _collect_payload(out: List[Dict[str, Any]], payload: Any) -> None:
+    # 리스트면 그대로 normalize
     if isinstance(payload, list):
         for it in payload:
             out.append(_normalize_item(it))
-    elif isinstance(payload, dict):
+        return
+
+    # 딕셔너리면 흔한 컨테이너 키를 우선 플래튼
+    if isinstance(payload, dict):
+        for k in ("results", "items", "pages", "data"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                for it in v:
+                    out.append(_normalize_item(it))
+                return
+        # 플래튼할 게 없으면 단일 아이템으로 처리
         out.append(_normalize_item(payload))
 
 def _normalize_item(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -113,27 +128,41 @@ def _normalize_item(d: Dict[str, Any]) -> Dict[str, Any]:
         return {"id":"", "space":"", "version":0, "title":"", "url":"", "body": str(d)}
 
     title = (d.get("title") or d.get("name") or "").strip()
-    url   = (d.get("url") or d.get("link") or d.get("webui") or "").strip()
-    body  =  (d.get("body") or d.get("content") or d.get("excerpt") or d.get("text") or "")
 
-    # body가 dict면 value 계층을 파고 들어감
+    # URL 후보를 넓게 탐색
+    url = (
+        d.get("url") or d.get("link") or d.get("webui")
+        or (d.get("_links") or {}).get("webui")
+        or ""
+    ).strip()
+
+    # body 후보 확대: excerpt, content, text 등
+    body = (
+        d.get("body") or d.get("content") or d.get("excerpt")
+        or d.get("text") or ""
+    )
+
     if isinstance(body, dict):
-        body = body.get("storage") or body.get("view") or body.get("plain") or body.get("value") or ""
+        body = (
+            body.get("storage") or body.get("view") or body.get("plain")
+            or body.get("value") or ""
+        )
         if isinstance(body, dict):
             body = body.get("value") or ""
     body = str(body or "")
-    # 하이라이트 태그 제거
-    body = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
+    body = re.sub(r"@@@(?:hl|endhl)@@@", "", body)  # 하이라이트 표식 제거
 
-    # 메타 보존: id/space/version
     pid = str(d.get("id") or d.get("page") or "").strip()
-    space = (d.get("space") or d.get("spaceKey") or "").strip()
+    space = (d.get("space") or d.get("spaceKey") or "")
+    if isinstance(space, dict):
+        space = space.get("key") or space.get("name") or ""
+    space = str(space).strip()
+
     try:
         version = int(d.get("version") or d.get("ver") or 0)
     except Exception:
         version = 0
 
-    # URL에서 pageId 보강
     if (not pid) and url:
         m = re.search(r"[?&]pageId=(\d+)", url)
         if m:

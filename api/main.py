@@ -355,12 +355,12 @@ def _resolve_allowed_spaces(client_spaces: list | None) -> list | None:
         return inter or ENV_SPACES
     return ENV_SPACES or (cs or None)
 
-# [REPLACE] 기존 _mcp_results_to_items 시그니처/내부 일부 교체
-def _mcp_results_to_items(
+
+async def _mcp_results_to_items(
     mcp_results: list[dict],
     k: int,
     *,
-    fetch_full: bool = False   # ← [ADD] 본문 강제 읽기 플래그
+    fetch_full: bool = False
 ) -> tuple[list[dict], list[dict], list[Document]]:
     items, contexts, up_docs = [], [], []
     for r in (mcp_results or [])[:k]:
@@ -368,19 +368,18 @@ def _mcp_results_to_items(
         body  = (r.get("body") or r.get("excerpt") or r.get("text") or "")
         body  = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
 
-        # [ADD] pageId 확보
         pid = (r.get("id") or "").strip()
         if not pid:
             m_pid = re.search(r"[?&]pageId=(\d+)", (r.get("url") or ""))
             if m_pid: pid = m_pid.group(1)
 
-        # [ADD] 보고서/연-월/pageId 강제 등 '본문 읽기'가 필요한 경우, 발췌가 짧으면 본문 조회
         if fetch_full and pid:
             try:
-                if (not body) or (len(body) < 600):  # excerpt만 온 케이스 방지
-                    full = mcp_read_page(pid, timeout=MCP_TIMEOUT) or ""
-                    if full and len(full) > len(body or ""):
-                        body = full
+                # 동기 I/O를 워커 스레드로
+                page = await asyncio.to_thread(mcp_read_page, pid, MCP_TIMEOUT)
+                full = page.get("body_html") or page.get("html") or page.get("body") or ""
+                if full and len(full) > len(body or ""):
+                    body = full
             except Exception:
                 pass
 
@@ -398,13 +397,11 @@ def _mcp_results_to_items(
             "space": space,
             "title": title,
         }
-
         score = float(r.get("_rank") or r.get("score") or 0.5)
 
         items.append({"text": text, "metadata": md, "score": score})
         contexts.append({"text": text, "source": md["source"], "page": md["page"], "kind": md["kind"], "score": score, "title": title})
 
-        # 업서트용 문서 구성
         if title:
             up_docs.append(Document(
                 page_content=title,
@@ -416,6 +413,7 @@ def _mcp_results_to_items(
                 metadata={"source": src_url, "title": title, "space": space, "kind": "chunk", "page": pid or None, "pageId": pid or None}
             ))
     return items, contexts, up_docs
+
 
 def _guess_main_pid_from_contexts(contexts: list[dict], q: str) -> Optional[str]:
     key = _norm_ko_text(_longest_ko_phrase(q) or "")
@@ -908,6 +906,21 @@ def _page_id_from_messages(msgs: list[dict]) -> Optional[str]:
 def _preseg_stop_phrases(q: str) -> str:
     # 붙여쓰기일 때도 뭉친 꼬리를 띄우거나 제거
     return _STOP_SUFFIX_RE.sub(" ", q)
+
+async def mcp_search_with_variants(q: str, **kw):
+    variants = {q}
+    if "-" in q:
+        v = q.replace("-", " ")
+        variants |= {v, q.replace("-", ""), f'"{q}"', f'"{v}"'}
+    if " " in q:
+        v2 = q.replace(" ", "-")
+        variants |= {v2, q.replace(" ", ""), f'"{v2}"'}
+    # 필요 시 ko/en 동시
+    for cand in variants:
+        rows = await mcp_search(cand, **kw)
+        if rows:
+            return rows
+    return []
 
 def _tokenize_query(q: str) -> List[str]:
     q = _preseg_stop_phrases(_basic_normalize(q))
@@ -1867,8 +1880,10 @@ async def query(request: Request, payload: dict = Body(...)):
 
         # 화면 items/contexts 생성 + (옵션) 인덱스 업서트
         if mcp_results:
-            items, contexts, up_docs = _mcp_results_to_items(
-                mcp_results, k=int(k) if isinstance(k, int) else 5
+            items, contexts, up_docs = await _mcp_results_to_items(
+                mcp_results,
+                k=int(k) if isinstance(k, int) else 5,
+                fetch_full=_must_read_full(q, forced_page_id=forced_page_id)
             )
             
             # 단일 page 강제 (prefer: forced_page_id -> 없으면 다수결 Top-1)
@@ -2304,6 +2319,16 @@ async def query(request: Request, payload: dict = Body(...)):
     client_spaces = (payload or {}).get("spaces")
     allowed_spaces = _resolve_allowed_spaces(client_spaces)
 
+    if page_id and not items:
+        try:
+            p = mcp_read_page(page_id)
+            if p and (p.get("body_html") or p.get("title")):
+                # TODO: 필요하면 여기서 upsert 로직 호출
+                pass
+        except Exception:
+            pass
+
+
     reasons = []
     if len(items) == 0: reasons.append("no_items")
     if len(pool_hits) < max(10, k*2): reasons.append("small_pool")
@@ -2388,11 +2413,8 @@ async def query(request: Request, payload: dict = Body(...)):
                 _set_sticky_for(session_id, target)
 
         if mcp_results:
-            items, contexts, up_docs = _mcp_results_to_items(
-                mcp_results,
-                k=int(k) if isinstance(k, int) else 5,
-                fetch_full=_must_read_full(q, forced_page_id=forced_page_id)
-            )
+            items, contexts, up_docs = await _mcp_results_to_items(mcp_results, k=int(k) if isinstance(k, int) else 5)
+
             # 단일 page 강제 (prefer: forced_page_id)
             items, contexts, main_pid = _enforce_single_page(items, contexts, prefer_pid=forced_page_id)
 
@@ -2452,10 +2474,10 @@ async def query(request: Request, payload: dict = Body(...)):
                             or str(r.get("id") or "") == forced_page_id]
 
             if mcp_results:
-                items, contexts, up_docs = _mcp_results_to_items(
-                mcp_results,
-                k=int(k) if isinstance(k, int) else 5,
-                fetch_full=_must_read_full(q, forced_page_id=forced_page_id)   # ← 본문 강제 읽기
+                items, contexts, up_docs = await _mcp_results_to_items(
+                    mcp_results,
+                    k=int(k) if isinstance(k, int) else 5,
+                    fetch_full=_must_read_full(q, forced_page_id=forced_page_id)
                 )
 
                 added = 0
@@ -2532,36 +2554,35 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
 
 _URL_CANON_RE = re.compile(r"(pageId=\d+)")
 
+from urllib.parse import urlsplit
+
 def _canon_url(u: Optional[str], pid: Optional[str] = None) -> str:
-    """
-    Confluence URL을 표준화한다.
-    - 이미 pageId=가 있으면 쿼리만 정리해 반환
-    - pid만 주어진 경우: 주어진 host나 환경변수를 이용해 표준 viewpage URL 생성
-    """
     if not u and not pid:
         return ""
     s = (u or "").split("#")[0].strip().rstrip("/")
 
-    # 이미 pageId가 있으면 ?pageId=만 남긴 canonical 형태로
     m = _URL_CANON_RE.search(s)
     if m:
         base = s.split("?", 1)[0]
         return f"{base}?{m.group(1)}"
 
-    # pid가 주어진 경우 호스트를 추출해 canonical URL 생성
     if pid:
-        mhost = _URL_HOST_RE.match(s)
-        host = mhost.group(1) if mhost else None
-        if host:
-            base = f"https://{host}/pages/viewpage.action"
-        elif CONFLUENCE_BASE_URL:
-            base = f"{CONFLUENCE_BASE_URL}/pages/viewpage.action"
+        if s:
+            parts = urlsplit(s)
+            scheme = parts.scheme or "https"
+            host = parts.hostname
+            if host:
+                base = f"{scheme}://{host}/pages/viewpage.action"
+            elif CONFLUENCE_BASE_URL:
+                base = f"{CONFLUENCE_BASE_URL}/pages/viewpage.action"
+            else:
+                base = "/pages/viewpage.action"
         else:
-            base = "/pages/viewpage.action"
+            base = f"{CONFLUENCE_BASE_URL}/pages/viewpage.action" if CONFLUENCE_BASE_URL else "/pages/viewpage.action"
         return f"{base}?pageId={pid}"
 
-    # 그 외는 원본 반환
     return s
+
 
 def _collect_source_urls(items: list[dict]) -> list[str]:
     """items[*].metadata.url or metadata.source에서 고유 URL만 추출"""
