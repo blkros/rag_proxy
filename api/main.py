@@ -54,11 +54,6 @@ MCP_MAX_TASKS     = int(os.getenv("MCP_MAX_TASKS", "4"))       # 동시 질의 �
 
 TZ_NAME = getattr(settings, "TZ_NAME", "Asia/Seoul")
 
-CONFL_HINT_RE = re.compile(
-    r"(?<![가-힣A-Za-z0-9])(컨플루언스|컨플|confluence)(?=(?:\s*(?:에서|문서|페이지))|[^가-힣A-Za-z0-9]|$)",
-    re.I
-)
-
 CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL", "").rstrip("/")
 
 LOCAL_FIRST = bool(getattr(settings, "LOCAL_FIRST", True))
@@ -131,6 +126,10 @@ _DOMAIN_STATS = {
     "purity": {},                                # token -> max(space_count)/total
 }
 
+_BAD_TITLE_RE = re.compile(r"(회의록|스크럼|stand[-\s]?up|데일리|일일\s*회의|주간\s*회의|스프린트\s*플래닝|미팅\s*노트)", re.I)
+
+CONFL_HINT_WORDS = [w.strip() for w in os.getenv("CONFL_HINT_WORDS","컨플루언스,컨플,confluence").split(",") if w.strip()]
+
 # 언어 강제 공통 래퍼
 REPLY_LANG = os.getenv("REPLY_LANG", "ko").lower()
 
@@ -181,6 +180,10 @@ def rebuild_domain_stats_from_index():
     stats["purity"] = purity
     _DOMAIN_STATS = stats
 
+    global CANON_MAP
+    if not os.getenv("CANON_MAP_JSON"):  # 환경에서 고정하지 않은 경우만
+        CANON_MAP = derive_canon_map_from_index()
+
 def _domainish_dynamic(q: str) -> bool:
     """
     질의가 내부 도메인(사내 문서) 냄새가 나는지 동적으로 판별:
@@ -222,6 +225,12 @@ _PDF_EXT_RE = re.compile(r"\.pdf($|\?)", re.I)
 
 def _is_pdf_mime(m):
     return bool(m and str(m).lower().startswith("application/pdf"))
+
+def _is_meeting_like(title: str, body: str = "") -> bool:
+    s = (title + " " + body[:400]).lower()
+    date_hit = bool(re.search(r"\b20\d{2}[-./]\d{1,2}[-./]\d{1,2}\b", s))
+    attendee_hit = any(k in s for k in ("참석자","회의 일시","agenda","minutes"))
+    return date_hit and attendee_hit
 
 def _looks_blocked_source(u):
     if not u: 
@@ -338,6 +347,17 @@ def _filter_mcp_by_strong_tokens(results: list[dict], q: str) -> list[dict]:
             out.append(r)
     return out or results
 
+def _should_apply_local_bonus(q: str, allowed_spaces: list[str] | None) -> bool:
+    """
+    로컬 업로드(pool_hits) 가산점 적용 여부를 동적으로 결정.
+    - 사용자가 space를 박아줬으면(allowed_spaces) 로컬 보너스 끔
+    - 질의가 '도메인 냄새'(_domainish_dynamic) 나면 끔
+    - 그 외(일반/모호 질문)엔 켬
+    """
+    if allowed_spaces:
+        return False
+    # 내부 도메인 냄새(약어, 토큰-순도 기반)가 나면 로컬 보너스 비활성화
+    return not _domainish_dynamic(q or "")
 
 def _should_use_mcp(
     q: str,
@@ -468,6 +488,33 @@ async def _mcp_search_fast(q: str, *, forced_page_id: Optional[str], spaces_for_
         t.cancel()
     return []
 
+# PDF 관련 질의 감지 (파일/업로드/확장자/미imetype 기반)
+def _is_pdf_related_response(r: dict) -> bool:
+    def _meta_is_pdf(md: dict) -> bool:
+        mime = (md or {}).get("mimetype") or (md or {}).get("mime") or (md or {}).get("content_type") or ""
+        src  = (md or {}).get("source") or (md or {}).get("url") or ""
+        return _is_pdf_mime(mime) or bool(_PDF_EXT_RE.search(str(src)))
+
+    # items / contexts 에서 로컬 업로드나 PDF 형태가 섞였는지 확인
+    for coll in (r.get("items") or [], r.get("contexts") or []):
+        md = (coll.get("metadata") if isinstance(coll, dict) else None) or {}
+        if isinstance(coll, dict):  # 단일 hit(dict)인 경우
+            src = str(md.get("source") or md.get("url") or "")
+            if _is_local_source(src) or _looks_blocked_source(src) or _meta_is_pdf(md):
+                return True
+        else:  # 리스트인 경우
+            for it in coll:
+                md = (it.get("metadata") or {})
+                src = str(md.get("source") or md.get("url") or "")
+                if _is_local_source(src) or _looks_blocked_source(src) or _meta_is_pdf(md):
+                    return True
+
+    # source_urls 에 PDF/업로드 흔적이 있으면 역시 PDF 관련으로 간주
+    for u in (r.get("source_urls") or []):
+        if _looks_blocked_source(u) or _PDF_EXT_RE.search(str(u)):
+            return True
+
+    return False
 
 def _anchor_tokens_from_query(q: str) -> list[str]:
     # _tokenize_query는 파일에 이미 정의되어 있음
@@ -525,8 +572,6 @@ def _is_datetime_question(q: str) -> bool:
     return bool(_DATE_TIME_NEED_RE.search(q))
 
 
-_BAD_TITLE_RE = re.compile(r"(scrum|스크럼|회의록|daily|stand\s*up|스탠드업)", re.I)
-
 def _collect_source_urls_from_contexts(ctxs: list[dict], top_n: int = 16) -> list[str]:
     rows, seen, out = [], set(), []
     for c in ctxs or []:
@@ -580,6 +625,10 @@ def _extract_page_id(src: Optional[str]) -> Optional[str]:
     m = _PAGEID_RE.search(str(src))
     return m.group(1) if m else None
 
+def _has_confl_hint(q: str) -> bool:
+    return any(w.lower() in q.lower() for w in CONFL_HINT_WORDS)
+
+
 def _url_has_page_id(url: Optional[str], page_id: Optional[str]) -> bool:
     """url 이 해당 pageId 를 가리키는지 여부"""
     if not url or not page_id:
@@ -599,7 +648,7 @@ def _norm_source(s: str) -> str:
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=getattr(settings, "CORS_ORIGINS", ["*"]),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -972,29 +1021,26 @@ def _collapse_korean_compounds(text: str) -> str:
     # 한글/숫자/영문 사이의 단일 공백 제거
     return re.sub(fr"(?<={_HANGUL_BLOCK})\s+(?={_HANGUL_BLOCK})", "", text)
 
-# 3) 도메인 동의어/약어 매핑 (좌변 패턴 → 우변 표준형)
-# CANON_MAP = {
-#     r"\bNIA\b": "한국지능정보사회진흥원",
-#     r"한국\s*지능\s*정보\s*사회\s*진흥원": "한국지능정보사회진흥원",
-#     r"국가\s*정보화\s*진흥원": "한국지능정보사회진흥원",  # 옛 명칭
-#     r"지역\s*정보": "지역정보",
-#     r"아파트\s*누리": "아파트누리",
-#     r"개발\s*서버\s*정보": "개발서버정보",
-# }
+# ① 환경변수 주입식(운영에서 교체 가능)
+CANON_MAP = json.loads(os.getenv("CANON_MAP_JSON", "{}") or "{}")
 
-CANON_MAP = {
-    r"한국\s*지능\s*정보\s*사회\s*진흥원": "NIA",   # ← 길->짧
-    r"국가\s*정보화\s*진흥원": "NIA",              # 옛 명칭도 NIA로
-    r"지역\s*정보": "지역정보",
-    r"아파트\s*누리": "아파트누리",
-    r"개발\s*서버\s*정보": "개발서버정보",
-}
+# ② 없으면 동적 유도(타이틀 n-gram 빈도 기반)
+def derive_canon_map_from_index(top_k: int = 50) -> dict[str, str]:
+    ds = getattr(vectorstore, "docstore", None)
+    dct = getattr(ds, "_dict", {}) if ds else {}
+    freq = Counter()
+    for d in dct.values():
+        t = str((d.metadata or {}).get("title",""))
+        # '지역 정보' → '지역정보' 같은 케이스만 수집
+        m = re.findall(r"[가-힣]{2,}\s+[가-힣]{2,}", t)
+        for phrase in m: freq[phrase] += 1
+    cmap = {}
+    for p, _ in freq.most_common(top_k):
+        cmap[p] = re.sub(r"\s+", "", p)
+    return cmap
 
-# CANON_MAP 보강
-CANON_MAP.update({
-    r"개발\s*서버\s*정보": "개발서버정보",
-    r"\bDEV\b": "개발",   # 내부 문서에 DEV만 있는 경우 대비 (선택)
-})
+if not CANON_MAP:
+    CANON_MAP = derive_canon_map_from_index()
 
 
 def _apply_canon_map(text: str) -> str:
@@ -1646,7 +1692,7 @@ async def query(payload: dict = Body(...)):
             page_id = m_pid.group(1)
     page_id = str(page_id) if page_id is not None else None
 
-    confl_hint = bool(CONFL_HINT_RE.search(q))
+    confl_hint = _has_confl_hint(q)
 
     # 메타태스크는 RAG/MCP 건너뜀 (맨 앞 유지)
     if re.match(r"(?is)^\s*#{3}\s*task\s*:", q):
@@ -1975,7 +2021,7 @@ async def query(payload: dict = Body(...)):
     _apply_space_hint(pool_hits, space)
     _apply_page_hint(pool_hits, page_id)
     if not _is_title_like(q):
-        if not (_COMPANY_HINT_RE.search(q) or allowed_spaces):
+        if _should_apply_local_bonus(q, allowed_spaces) and not _is_title_like(q):
             _apply_local_bonus(pool_hits)
     _apply_acronym_bonus(pool_hits, q)
 
@@ -2052,6 +2098,7 @@ async def query(payload: dict = Body(...)):
 
     # 3-E) rerank + 의도기반 주입선택
     chosen = pick_for_injection(q, pool_hits, k_default=int(k) if isinstance(k, int) else 5)
+    had_pdf_ctx = any(_blocked_item(h) for h in chosen)
     chosen = _coalesce_single_source(chosen, q)
     # 소스 한쪽 쏠림 방지 기본은 0(비활성) 운영에서 켜고 싶을 때만 설정으로 조정
     if PER_SOURCE_CAP > 0:
@@ -2342,7 +2389,7 @@ async def query(payload: dict = Body(...)):
         "documents": items,
         "chunks": items,
         "source_urls": src_urls,
-        "notes": base_notes,
+        "notes": base_notes | {"had_pdf_ctx": bool(had_pdf_ctx)},
     }
 
 
@@ -2518,6 +2565,11 @@ async def v1_chat(payload: dict = Body(...)):
 
     # 3) 이 응답에서 컨텍스트를 '실제로' 쓸지 결정
     notes = r.get("notes", {}) or {}
+    pdf_related = bool(notes.get("had_pdf_ctx")) \
+                or _is_pdf_related_response(r) \
+                or bool(_PDF_EXT_RE.search(q or "")) \
+                or bool(THIS_FILE_PAT.search(q or ""))
+
     use_contexts = bool(r.get("contexts")) and not notes.get("low_relevance", False)
 
     # RAG가 부적합(low_relevance)하면 stock direct_answer는 버리고 일반지식 모드로 넘어가도록 content를 비움
@@ -2551,13 +2603,17 @@ async def v1_chat(payload: dict = Body(...)):
             msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
             content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
 
-    # 5) (중요) 출처는 '컨텍스트를 실제로 사용한 경우'에만, 그리고 http(s)만 붙이기
-    if use_contexts:
+    # 5) PDF 관련 질의면 사용자 화면에 출처를 표시하지 않는다.
+    pdf_related = _is_pdf_related_response(r) or bool(_PDF_EXT_RE.search(q or "")) or bool(THIS_FILE_PAT.search(q or ""))
+
+    if use_contexts and not pdf_related:
         allowed_list = _filter_urls_by_host(r.get("source_urls", []) or [])
         allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://", "https://"))]
         if allowed_http:
             src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_http)
             content = (content or "") + src_block
+    # (pdf_related 인 경우엔 출처 블록을 아예 생성하지 않음)
+
 
     # 6) OpenAI 호환 응답은 그대로 유지
     return {
