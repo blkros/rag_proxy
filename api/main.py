@@ -1026,22 +1026,26 @@ CANON_MAP = json.loads(os.getenv("CANON_MAP_JSON", "{}") or "{}")
 
 # ② 없으면 동적 유도(타이틀 n-gram 빈도 기반)
 def derive_canon_map_from_index(top_k: int = 50) -> dict[str, str]:
-    ds = getattr(vectorstore, "docstore", None)
+    # 보강: vectorstore가 아직 없을 때 안전하게 빈 맵 반환
+    try:
+        ds = getattr(vectorstore, "docstore", None)
+    except NameError:
+        return {}
     dct = getattr(ds, "_dict", {}) if ds else {}
     freq = Counter()
     for d in dct.values():
         t = str((d.metadata or {}).get("title",""))
-        # '지역 정보' → '지역정보' 같은 케이스만 수집
         m = re.findall(r"[가-힣]{2,}\s+[가-힣]{2,}", t)
-        for phrase in m: freq[phrase] += 1
+        for phrase in m:
+            freq[phrase] += 1
     cmap = {}
     for p, _ in freq.most_common(top_k):
         cmap[p] = re.sub(r"\s+", "", p)
     return cmap
 
+# 여기서 즉시 유도하지 말고 비워둠 (startup에서 채워짐)
 if not CANON_MAP:
-    CANON_MAP = derive_canon_map_from_index()
-
+    CANON_MAP = {}
 
 def _apply_canon_map(text: str) -> str:
     t = text
