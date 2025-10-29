@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
-import shutil, os, logging, re, uuid
+import shutil, os, logging, re, uuid, json
 from fastapi.responses import RedirectResponse
 from fastapi import Body
 import time
@@ -14,14 +14,14 @@ from zoneinfo import ZoneInfo
 import inspect
 import unicodedata
 
-from src.utils import proxy_get, call_chat_completions, drop_think
+from src.utils import proxy_get, call_chat_completions
 from src.rag_pipeline import build_rag_chain, Document
 from src.loaders import load_docs_any
 from fastapi.middleware.cors import CORSMiddleware
 from src.config import settings
 from src.ext.confluence_mcp import mcp_search
 import asyncio, hashlib
-from collections import Counter
+from collections import Counter, defaultdict
 from src.retrieval.rerank import parse_query_intent, pick_for_injection
 from api.smart_router import router as smart_router
 
@@ -54,7 +54,6 @@ MCP_MAX_TASKS     = int(os.getenv("MCP_MAX_TASKS", "4"))       # 동시 질의 �
 
 TZ_NAME = getattr(settings, "TZ_NAME", "Asia/Seoul")
 
-ACRONYM_RE2 = re.compile(r"\b[A-Z]{2,6}\b")
 CONFL_HINT_RE = re.compile(
     r"(?<![가-힣A-Za-z0-9])(컨플루언스|컨플|confluence)(?=(?:\s*(?:에서|문서|페이지))|[^가-힣A-Za-z0-9]|$)",
     re.I
@@ -114,13 +113,6 @@ _RETRIEVAL_HINT_RE = re.compile(r"(최근|이슈|목록|리스트|정리|요약|
 # 4) 날짜/시간을 '오늘' 기준으로 물어보는지
 _DATE_TIME_NEED_RE = re.compile(r"(날짜|요일|시간|시각|몇\s*시|몇\s*분|몇\s*월|몇\s*일|며칠)", re.I)
 
-_DOMAIN_HINT_RE = re.compile(r"(회의|마감|일정|보고서|티켓|이슈|장애|배포|회의록|결재|승인|요청|문서)", re.I)
-
-_COMPANY_HINT_RE = re.compile(
-    r"(NURIFLEX|NURI|니아|NIA|아파트\s*누리|아파트누리|컨플루언스|배포|현장점검|DR|CBL|설계|회의|회의록|마감|일정|이슈|요청|문서)",
-    re.I
-)
-
 # === v1_chat 출처 호스트 화이트리스트(환경변수) ===
 SOURCE_HOST_WHITELIST = [h.strip().lower() for h in os.getenv("ALLOWED_SOURCE_HOSTS","").split(",") if h.strip()]
 _URL_HOST_RE  = re.compile(r"^https?://([^/]+)")
@@ -128,9 +120,156 @@ _URL_HOST_RE  = re.compile(r"^https?://([^/]+)")
 ACRONYM_TITLE_BONUS = float(getattr(settings, "ACRONYM_TITLE_BONUS", 0.45))
 ACRONYM_BODY_BONUS  = float(getattr(settings, "ACRONYM_BODY_BONUS", 0.25))
 
+# --- Dynamic domain/space signals (no hardcoded lists) ---
+DOMAIN_PURITY_THRESHOLD = float(os.getenv("DOMAIN_PURITY_THRESHOLD", "0.6"))
+DOMAIN_MIN_STRONG_TOKENS = int(os.getenv("DOMAIN_MIN_STRONG_TOKENS", "1"))
+SPACE_SCORE_MIN = int(os.getenv("SPACE_SCORE_MIN", "2"))
+
+_DOMAIN_STATS = {
+    "space_token_counts": defaultdict(Counter),  # space -> token -> count
+    "global_token_counts": Counter(),            # token -> total count
+    "purity": {},                                # token -> max(space_count)/total
+}
+
+# 본문 내 약어(강한 도메인 신호) 감지용
+_ACRONYM_BLOB_RE = re.compile(r"\b[A-Z]{2,10}\b")
+
+def rebuild_domain_stats_from_index():
+    """
+    현재 벡터 인덱스의 문서 title/space를 훑어 토큰 통계를 만든다.
+    - 하드코딩 없이 '인덱스가 가진 분포'로 도메인/스페이스 힌트를 추론
+    """
+    global _DOMAIN_STATS
+    stats = {
+        "space_token_counts": defaultdict(Counter),
+        "global_token_counts": Counter(),
+        "purity": {},
+    }
+    try:
+        ds = getattr(vectorstore, "docstore", None)
+        dct = getattr(ds, "_dict", {}) if ds else {}
+    except Exception:
+        dct = {}
+
+    for d in dct.values():
+        md = getattr(d, "metadata", {}) or {}
+        title = str(md.get("title", "") or "")
+        space = str(md.get("space", "") or "")
+        if not (title and space):
+            continue
+        toks = [t for t in _tokenize_query(_basic_normalize(title))
+                if len(t) >= 2 and t not in _K_STOP]
+        for t in set(toks):  # DF 비슷하게
+            stats["space_token_counts"][space][t] += 1
+            stats["global_token_counts"][t] += 1
+
+    purity = {}
+    for t, tot in stats["global_token_counts"].items():
+        if tot <= 0:
+            continue
+        max_in_one_space = max((stats["space_token_counts"][s][t]
+                                for s in stats["space_token_counts"]), default=0)
+        purity[t] = max_in_one_space / float(tot)
+    stats["purity"] = purity
+    _DOMAIN_STATS = stats
+
+def _domainish_dynamic(q: str) -> bool:
+    """
+    질의가 내부 도메인(사내 문서) 냄새가 나는지 동적으로 판별:
+    - 대문자 약어가 있으면 즉시 True
+    - 아니면 질의 토큰 중 space-편중(purity)이 높은 토큰이 일정 개수 이상 있으면 True
+    """
+    if _ACRONYM_BLOB_RE.search(q or ""):
+        return True
+    toks = [t for t in _tokenize_query(_basic_normalize(q))
+            if len(t) >= 2 and t not in _K_STOP]
+    pur = _DOMAIN_STATS.get("purity", {})
+    strong = [t for t in toks if pur.get(t, 0.0) >= DOMAIN_PURITY_THRESHOLD]
+    return len(strong) >= DOMAIN_MIN_STRONG_TOKENS
+
+def _rank_spaces_for_query(q: str) -> list[str]:
+    """
+    질의 토큰을 기반으로, 인덱스에 기록된 title-토큰 통계와 겹치는 정도로 space를 점수화.
+    """
+    toks = [t for t in _tokenize_query(_basic_normalize(q))
+            if len(t) >= 2 and t not in _K_STOP]
+    stc = _DOMAIN_STATS.get("space_token_counts", {})
+    scores = Counter()
+    for s, counter in stc.items():
+        for t in toks:
+            if t in counter:
+                scores[s] += counter[t]
+    ranked = [s for s, sc in scores.most_common() if sc >= SPACE_SCORE_MIN]
+    return ranked
+
+
 # 상단 유틸/정규식 근처
 _A_HREF_RE = re.compile(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I|re.S)
 _RAW_URL_RE = re.compile(r'https?://[^\s"\']+pageId=\d+[^\s"\']*', re.I)
+
+# === PDF/업로드 컨텍스트 차단 토글 & 필터 유틸 ===
+ALLOW_PDF_CONTEXT = os.getenv("ALLOW_PDF_CONTEXT","0").lower() not in ("0","false","no")
+UPLOAD_BLOCK_PREFIX = os.getenv("UPLOAD_BLOCK_PREFIX","uploads/").strip()
+_PDF_EXT_RE = re.compile(r"\.pdf($|\?)", re.I)
+
+def _is_pdf_mime(m):
+    return bool(m and str(m).lower().startswith("application/pdf"))
+
+def _looks_blocked_source(u):
+    if not u: 
+        return False
+    s = str(u).strip().replace("\\","/")
+    if UPLOAD_BLOCK_PREFIX and s.startswith(UPLOAD_BLOCK_PREFIX):
+        return True
+    if _PDF_EXT_RE.search(s):
+        return True
+    return False
+
+def _blocked_item(x: dict) -> bool:
+    if ALLOW_PDF_CONTEXT:
+        return False
+    if not isinstance(x, dict):
+        return False
+    # top-level
+    for k in ("url","source","source_url","link","path"):
+        v = x.get(k)
+        if isinstance(v, str) and _looks_blocked_source(v):
+            return True
+    # metadata
+    md = x.get("metadata") or {}
+    if isinstance(md, dict):
+        for k in ("url","source","path"):
+            v = md.get(k)
+            if isinstance(v, str) and _looks_blocked_source(v):
+                return True
+        if _is_pdf_mime(md.get("mimetype") or md.get("mime") or md.get("content_type")):
+            return True
+    # payload/data
+    pl = x.get("payload") or x.get("data") or {}
+    if isinstance(pl, dict):
+        for k in ("url","source_url","link","source","path"):
+            v = pl.get(k)
+            if isinstance(v, str) and _looks_blocked_source(v):
+                return True
+        if _is_pdf_mime(pl.get("mimetype") or pl.get("mime") or pl.get("content_type")):
+            return True
+    return False
+
+def _filter_items_for_router(seq):
+    if not isinstance(seq, list):
+        return seq
+    out = []
+    for x in seq:
+        try:
+            if _blocked_item(x):
+                continue
+        except Exception:
+            continue
+        out.append(x)
+    return out
+
+def _filter_urls(urls: list[str]) -> list[str]:
+    return [u for u in (urls or []) if not _looks_blocked_source(u)]
 
 def _extract_confluence_links(html_or_text: str) -> list[dict]:
     out, seen = [], set()
@@ -199,30 +338,14 @@ def _should_use_mcp(
     reasons: list[str] | None = None,
     local_ok: bool | None = None,
 ) -> bool:
-    # 1) 명시 space/클라이언트 spaces 있으면 허용
+    """
+    MCP 호출 게이트를 '동적 도메인 판별'로 단순화:
+    - 명시 space/클라이언트 spaces가 있으면 True
+    - 아니면 _domainish_dynamic(q) 결과만 사용
+    """
     if space or (client_spaces and len(client_spaces) > 0):
         return True
-
-    rs = set([ (reasons or []) and r.strip().lower() for r in (reasons or []) ])
-    # 도메인/약어 힌트
-    has_acronym = bool(re.search(r"\b[A-Z]{2,10}\b", q or ""))
-    domainish   = bool(_COMPANY_HINT_RE.search(q or ""))
-
-    def domain_gate() -> bool:
-        # 도메인 키워드 있거나, 강한 대문자 약어가 있을 때만 MCP 허용
-        return domainish or has_acronym
-
-    # 품질 저하 사유(풀 작음/미싱 등)는 '도메인 게이트' 아래에서만 허용
-    if rs & {"no_items", "small_pool", "missing_article", "pid_miss"}:
-        return domain_gate()
-
-    # 약어/앵커 미스도 도메인 게이트 아래에서만 허용
-    if ("acronym_miss" in rs) or ("anchor_miss" in rs):
-        return domain_gate()
-
-    # 최종 기본: 도메인 힌트가 있을 때만
-    return domainish
-
+    return _domainish_dynamic(q or "")
 
 def _spaces_from_env():
     raw = os.getenv("CONFLUENCE_SPACE", "").strip()
@@ -387,9 +510,10 @@ def _is_datetime_question(q: str) -> bool:
     # '오늘/지금/현재' 같은 지시어가 반드시 있어야 함
     if not _DEICTIC_RE.search(q):
         return False
-    if _DOMAIN_HINT_RE.search(q):
+    # 도메인 냄새가 강하면(사내 문서 맥락) 즉답 대신 RAG/MCP로 보내기
+    if _domainish_dynamic(q):
         return False
-    # 실제로 날짜/시간을 묻는지 확인
+    # 실제로 날짜/시간 질의인지
     return bool(_DATE_TIME_NEED_RE.search(q))
 
 
@@ -692,10 +816,16 @@ def _sparse_keyword_hits(q: str, limit: int = 150, space: Optional[str] = None) 
         return []
 
     out = []
+    max_scan = 20000  # 문서 청크가 매우 많은 경우 상한
+    count = 0
     for d in dct.values():
         md = dict(d.metadata or {})
         src = str(md.get("source", ""))
-
+        
+        count += 1
+        if count >= max_scan and len(out) >= limit:
+            break
+        
         # (옵션) space 하드필터
         if space and SPACE_FILTER_MODE.lower() == "hard":
             s = (md.get("space") or "").strip()
@@ -975,8 +1105,6 @@ def _reload_retriever():
 
 # 인덱싱 동시성 방지 락
 index_lock = asyncio.Lock()
-# [ADD] MCP 폴백 동시 호출을 막는 락
-mcp_lock = asyncio.Lock()
 
 # 문서 고유 ID (중복 방지용)
 def _doc_id(d: Document) -> str:
@@ -1081,12 +1209,11 @@ def _startup():
     ensure_dirs()
     try:
         # CSV가 있으면 기존 파이프라인으로 로딩
-        if Path(DATA_CSV).exists():
+        if DATA_CSV and isinstance(DATA_CSV, str) and Path(DATA_CSV).exists():
             _rag_chain, _retr, vectorstore, drop_think_fn = build_rag_chain(
                 data_path=DATA_CSV, index_dir=INDEX_DIR
             )
         else:
-            # 빈 인덱스 (PDF 등 업로드 후 /update로 채우기)
             vectorstore = _load_or_init_vectorstore()
         _reload_retriever()
         logger.info("Startup complete. Index at %s", INDEX_DIR)
@@ -1094,6 +1221,7 @@ def _startup():
         logger.exception("Startup failed: %s", e)
     VS.vectorstore = vectorstore
     VS.retriever = retriever
+    rebuild_domain_stats_from_index()
 
 
 @app.get("/health")
@@ -1250,6 +1378,7 @@ async def ingest(
             # ← 여기서 전역 업데이트 & sticky (전역선언은 함수 맨 위에서 이미 했음)
             last_source = _norm_source(str(dest))
             _set_sticky(last_source)
+            rebuild_domain_stats_from_index()
 
         return {
             "saved": {"path": str(dest), "bytes": dest.stat().st_size},
@@ -1312,6 +1441,7 @@ async def update_index(payload: dict):
             # 업서트 성공 후에만 최근 소스/sticky 갱신
             last_source = _norm_source(str(candidate))
             _set_sticky(last_source)
+            rebuild_domain_stats_from_index()
 
         return {
             "ok": True,
@@ -1352,7 +1482,9 @@ async def delete_index(payload: Optional[dict] = None):
             return {"deleted": "all", "doc_count": len(vectorstore.docstore._dict)}
         except Exception as e:
             raise HTTPException(500, f"delete all failed: {e}")
-
+    
+    rebuild_domain_stats_from_index()
+    
     if source:
         try:
             async with index_lock:
@@ -1579,7 +1711,10 @@ async def query(payload: dict = Body(...)):
     if confl_hint and not DISABLE_INTERNAL_MCP:
         fallback_attempted = True
         try:
-            spaces_for_mcp = allowed_spaces or ([space] if space else [None])
+            spaces_for_mcp = allowed_spaces or ([space] if space else None)
+            if not spaces_for_mcp:
+                ranked = _rank_spaces_for_query(q)
+                spaces_for_mcp = ranked[:3] if ranked else [None]
             mcp_results = await _mcp_search_fast(
                 q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
             )
@@ -1619,6 +1754,11 @@ async def query(payload: dict = Body(...)):
                     _reload_retriever()
 
             src_urls = _collect_source_urls_from_contexts(contexts)
+            # PDF/업로드 필터 (안전망)
+            items    = _filter_items_for_router(items)
+            contexts = _filter_items_for_router(contexts)
+            src_urls = _filter_urls(src_urls)
+
             return {
                 "hits": len(items),
                 "items": items,
@@ -1947,6 +2087,10 @@ async def query(payload: dict = Body(...)):
             "score": round(sc, 4),
             "title": md.get("title", ""),
         })
+    
+    # PDF/업로드 필터
+    items    = _filter_items_for_router(items)
+    contexts = _filter_items_for_router(contexts)
 
     try:
         log.info(
@@ -2052,7 +2196,10 @@ async def query(payload: dict = Body(...)):
         mcp_results = []
         try:
             log.info("MCP fallback (fast): q=%r", q)
-            spaces_for_mcp = allowed_spaces or ([space] if space else [None])
+            spaces_for_mcp = allowed_spaces or ([space] if space else None)
+            if not spaces_for_mcp:
+                ranked = _rank_spaces_for_query(q)
+                spaces_for_mcp = ranked[:3] if ranked else [None]
             mcp_results = await _mcp_search_fast(
                 q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
             )
@@ -2120,7 +2267,10 @@ async def query(payload: dict = Body(...)):
         # 비었을 때의 보조 폴백도 fast 버전으로
         if not items and not DISABLE_INTERNAL_MCP and _should_use_mcp(q, client_spaces, space, reasons, local_ok):
             fallback_attempted = True
-            spaces_for_mcp = allowed_spaces or ([space] if space else [None])
+            spaces_for_mcp = allowed_spaces or ([space] if space else None)
+            if not spaces_for_mcp:
+                ranked = _rank_spaces_for_query(q)
+                spaces_for_mcp = ranked[:3] if ranked else [None]
             mcp_results = await _mcp_search_fast(
                 q, forced_page_id=forced_page_id, spaces_for_mcp=spaces_for_mcp
             )
@@ -2174,6 +2324,7 @@ async def query(payload: dict = Body(...)):
 
 
     src_urls = _collect_source_urls_from_contexts(contexts)
+    src_urls = _filter_urls(src_urls)
 
     return {
         "hits": len(items),
@@ -2320,12 +2471,14 @@ async def v1_upsert_alias(payload: dict = Body(...)):
 
 app.include_router(smart_router)
 
-from api.smart_router import ask_smart
-
 @app.post("/v1/chat/completions")
 async def v1_chat(payload: dict = Body(...)):
     import time as _time
 
+    if not CONFLUENCE_BASE_URL:
+        log.warning("CONFLUENCE_BASE_URL 미설정: http(s) 링크가 아닌 /pages/... 로 생성될 수 있습니다. "
+                    "출처 렌더링이 제거될 수 있으니 운영에서는 반드시 설정하세요.")
+        
     # 마지막 user 메시지 추출
     q = ""
     for m in payload.get("messages", []):
@@ -2348,7 +2501,7 @@ async def v1_chat(payload: dict = Body(...)):
         "space": space,
         "source": source,
         "sources": sources,
-        "spaces": spaces,  # ← 추가
+        "spaces": spaces,
         "sticky": False,  # 대화형 라우팅은 매질의 전환이 잦으므로 sticky 비활성
     })
 

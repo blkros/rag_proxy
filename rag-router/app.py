@@ -66,14 +66,18 @@ ROUTER_READ_TIMEOUT    = float(os.getenv("ROUTER_READ_TIMEOUT", "180"))  # <- 12
 ROUTER_WRITE_TIMEOUT   = float(os.getenv("ROUTER_WRITE_TIMEOUT", "60"))
 ROUTER_POOL_TIMEOUT    = float(os.getenv("ROUTER_POOL_TIMEOUT", "180"))
 
-_JOSA_RE = re.compile(r'(에서|에게|으로써|으로서|으로부터|로부터|부터|까지|만큼|보다|처럼|부터|까지|은|는|이|가|을|를|에|에서|에게|와|과|도|로|으로|의)$')
+_JOSA_RE = re.compile(
+    r"(으로써|으로서|으로부터|라고는|라고도|라고|처럼|까지|부터|에게서|한테서|에게|한테|께|이며|이자|"
+    r"으로|로서|로써|로부터|께서|와는|과는|에서는|에는|에서|에게|한테|와|과|을|를|은|는|이|가|의|에|도|만|랑|하고)$"
+)
 
 ALLOWED_SOURCE_HOSTS = [h.strip().lower() for h in os.getenv("ALLOWED_SOURCE_HOSTS","").split(",") if h.strip()]
 
 # --- token budget (approx) ------------------------------------
-MODEL_LIMIT_TOKENS = int(os.getenv("ROUTER_MODEL_LIMIT_TOKENS", "16384"))  # qwen3-30b-a3b-fp8 한계
-OUTPUT_TOKENS      = int(os.getenv("ROUTER_MAX_TOKENS", str(ROUTER_MAX_TOKENS if 'ROUTER_MAX_TOKENS' in globals() else 2048)))
-SAFETY_MARGIN      = int(os.getenv("ROUTER_CTX_SAFETY_MARGIN", "512"))     # 여유
+MODEL_LIMIT_TOKENS = int(os.getenv("ROUTER_MODEL_LIMIT_TOKENS", "16384"))  # context+prompt+output 총 한계
+ROUTER_MAX_TOKENS  = int(os.getenv("ROUTER_MAX_TOKENS", "2048"))           # 하위 호환(기존 이름 유지)
+OUTPUT_TOKENS      = int(os.getenv("ROUTER_OUTPUT_TOKENS", str(ROUTER_MAX_TOKENS)))  # 실제 생성 토큰 상한
+SAFETY_MARGIN      = int(os.getenv("ROUTER_CTX_SAFETY_MARGIN", "512"))     # 컨텍스트 오차 여유
 
 def _est_tokens(s: str) -> int:
     # UTF-8 바이트 기반 러프 추정(한국어 기준 꽤 보수적으로 잡힘)
@@ -208,7 +212,8 @@ async def _auto_pick_spaces(q: str, client: httpx.AsyncClient) -> list[str] | No
 
             j = r.json()
             # 컨텍스트 텍스트를 조금 모아서 질문과의 토큰 겹침(relevance_ratio)로 스코어링
-            ctx = "\n\n".join(extract_texts(j.get("items") or j.get("contexts") or []))[:1500]
+            probe = j.get("items") or j.get("contexts") or j.get("documents") or j.get("chunks") or []
+            ctx = "\n\n".join(extract_texts(probe))[:1500]
             score = float(j.get("hits") or 0) + relevance_ratio(probe_q, ctx)  # 간단 복합 점수
             scores.append((score, sp))
     except Exception as e:
@@ -340,10 +345,9 @@ def pick_answer_mode(user_msg: str, ctx_text: str) -> str:
 
 # --- utils ----------------------------------------------------
 
-def normalize_query(q: str) -> str:
+def normalize_query_router(q: str) -> str:
     if not q: return ""
     s = q.strip()
-    # s = re.sub(r'(?i)\bstep\b', 'SFTP', s)
     s = re.sub(r'(?i)\bstfp\b|\bsfttp\b|\bsfpt\b|\bsftp\b', 'SFTP', s)
     s = s.replace("스텝", "SFTP")
     return s
@@ -360,8 +364,8 @@ def _expand_synonyms(s: str) -> list[str]:
 
 # [PATCH] 변형 개수 제한 + 동의어 확장 ON/OFF
 def generate_query_variants(q: str, limit: int | None = None) -> List[str]:
-    limit = limit or VARIANTS_MAX  # ← 기본 4
-    s = normalize_query(q)
+    limit = limit or VARIANTS_MAX
+    s = normalize_query_router(q)
     cand: list[str] = []
 
     def add(x: str):
@@ -615,13 +619,9 @@ async def chat(req: ChatReq):
                 continue
 
             qa_json  = best
-            qa_items = items
-            qa_urls = _limit_urls(best.get("source_urls")) if best.get("source_urls") \
-                      else _urls_from_contexts(best.get("contexts"))
+            qa_items = best.get("items") or []
+            qa_urls = _limit_urls(best.get("source_urls")) if best.get("source_urls") else _collect_urls_from_items(qa_items)
             break
-
-
-
 
     # 2-A) QA 성공
     if qa_json:
@@ -642,7 +642,7 @@ async def chat(req: ChatReq):
         ctx_for_prompt = _fit_ctx_to_budget(sys_prefix, user_for_budget, ctx_for_prompt)
 
         system_prompt = build_system_with_context(ctx_for_prompt, mode)
-        max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
+        max_tokens = req.max_tokens or OUTPUT_TOKENS
         payload = {
             "model": OPENAI_MODEL,
             "messages": [{"role":"system","content":system_prompt}] + limited_msgs,
@@ -661,8 +661,9 @@ async def chat(req: ChatReq):
 
         content = sanitize(strip_reasoning(raw).strip()) or "인덱스에 근거 없음"
 
+        full_ctx_for_check = sanitize(ctx_text)
         strict = bool(spaces_hint) and ROUTER_STRICT_RAG
-        if strict and not supported_by_context(content, ctx_for_prompt):
+        if strict and not supported_by_context(content, full_ctx_for_check):
             content = "인덱스에 근거 없음"
             qa_urls = []
         # 출처는 허용 호스트만(환경변수로 제어)
@@ -707,8 +708,7 @@ async def chat(req: ChatReq):
             # 여기서 바로 평가/갱신 (바깥에 동일 코드 두지 말기)
             for qj in (j1, j2):
                 items = (qj.get("items") or qj.get("contexts") or [])
-                urls = _limit_urls(qj.get("source_urls")) if qj.get("source_urls") \
-                       else _urls_from_contexts(qj.get("contexts"))
+                urls  = _limit_urls(qj.get("source_urls")) if qj.get("source_urls") else _collect_urls_from_items(items)
                 ctx_list = (qj.get("context_texts")
                             or [c.get("text","") for c in (qj.get("contexts") or [])]
                             or [it.get("text","") for it in (qj.get("items") or [])])
@@ -728,9 +728,6 @@ async def chat(req: ChatReq):
                             is_relevant(used_q_for_relevance or orig_user_msg, best_ctx)):
             best_ctx = ""
             src_urls = []
-
-
-
 
     if not best_ctx:
         # 스페이스 힌트 있으면 기존 STRICT 응답, 없으면 일반 LLM 직답
@@ -757,7 +754,7 @@ async def chat(req: ChatReq):
                 "‘인덱스에 근거 없음’ 같은 말은 하지 마세요."
             )
         }
-        max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
+        max_tokens = req.max_tokens or OUTPUT_TOKENS
         limited_msgs = _limited_messages(req.messages)
         payload = {
             "model": OPENAI_MODEL,
@@ -788,28 +785,32 @@ async def chat(req: ChatReq):
         }
 
     
-    # QUERY 경로 LLM 호출
+    # ===== QUERY 경로 LLM 호출 정리본 =====
     ctx_text = best_ctx
-    ctx_text = mark_lonely_numbers_as_total(ctx_text) 
-    ctx_for_prompt = sanitize(ctx_text)
-    mode = pick_answer_mode(orig_user_msg, ctx_for_prompt)
-    system_prompt = build_system_with_context(ctx_for_prompt, mode)
-    max_tokens = req.max_tokens or ROUTER_MAX_TOKENS
-    
-    limited_msgs = _limited_messages(req.messages)
+    ctx_text = mark_lonely_numbers_as_total(ctx_text)
+    full_ctx_for_check = sanitize(ctx_text)
 
+    # 모드 결정은 트림 전 컨텍스트로
+    mode = pick_answer_mode(orig_user_msg, full_ctx_for_check)
+
+    # 예산 계산에 필요한 메시지/프리픽스 준비
+    limited_msgs = _limited_messages(req.messages)
     sys_prefix = _build_system_prefix(mode)
-    user_for_budget = next((m["content"] for m in reversed(limited_msgs) if m["role"]=="user"), "")
-    ctx_for_prompt = _fit_ctx_to_budget(sys_prefix, user_for_budget, ctx_for_prompt)
+    user_for_budget = next((m["content"] for m in reversed(limited_msgs) if m["role"] == "user"), "")
+
+    # 컨텍스트를 토큰 예산에 맞춰 컷
+    ctx_for_prompt = _fit_ctx_to_budget(sys_prefix, user_for_budget, full_ctx_for_check)
     system_prompt = build_system_with_context(ctx_for_prompt, mode)
+    max_tokens = req.max_tokens or OUTPUT_TOKENS
 
     payload = {
         "model": OPENAI_MODEL,
-        "messages": [{"role":"system","content":system_prompt}] + limited_msgs,
+        "messages": [{"role": "system", "content": system_prompt}] + limited_msgs,
         "stream": False,
         "temperature": 0,
-        "max_tokens": max_tokens
+        "max_tokens": max_tokens,
     }
+
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -824,7 +825,7 @@ async def chat(req: ChatReq):
 
     #  STRICT는 스페이스 힌트 있을 때만, 출처 필터 적용
     strict = bool(spaces_hint) and ROUTER_STRICT_RAG
-    if strict and not supported_by_context(content, ctx_for_prompt):
+    if strict and not supported_by_context(content, full_ctx_for_check):
         content = "인덱스에 근거 없음"
         src_urls = []
 

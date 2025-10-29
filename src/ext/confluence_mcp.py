@@ -1,10 +1,11 @@
 # rag-proxy/src/ext/confluence_mcp.py
 from __future__ import annotations
-import os, asyncio, json, logging, re
+import os, asyncio, json, logging, re, urllib.parse
 from typing import Any, Dict, List
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+from src.config import settings  # ← 설정 연동
 
 log = logging.getLogger(__name__)
 
@@ -12,36 +13,65 @@ MCP_PROTOCOL_VERSION = os.getenv("MCP_PROTOCOL_VERSION", "2025-06-18")
 
 def _with_version(url: str) -> str:
     if not url:
-        return f"http://mcp-confluence:9000/sse?version={MCP_PROTOCOL_VERSION}"
+        return f"http://mcp-confluence:{os.getenv('MCP_PORT','9000')}/sse?version={MCP_PROTOCOL_VERSION}"
     if "version=" in url:
         return url
     sep = "&" if ("?" in url) else "?"
     return f"{url}{sep}version={MCP_PROTOCOL_VERSION}"
 
-RAW_MCP_URL = (os.getenv("MCP_URL") or os.getenv("MCP_CONFLUENCE_URL") or "http://mcp-confluence:9000/sse")
+RAW_MCP_URL = (
+    os.getenv("MCP_URL")
+    or os.getenv("MCP_CONFLUENCE_URL")
+    or f"http://mcp-confluence:{os.getenv('MCP_PORT','9000')}/sse"
+)
 MCP_URL = _with_version(RAW_MCP_URL)
-TOOL_OVERRIDE = (os.getenv("CONFLUENCE_MCP_TOOL", "") or "").strip()
+
+# 툴명 오버라이드(신규) + 과거 호환키(구버전 환경)
+TOOL_OVERRIDE = (os.getenv("CONFLUENCE_MCP_TOOL") or os.getenv("CONFLUENCE_TOOL_SEARCH") or "").strip()
+
+# 허용 도메인 화이트리스트(쉼표구분)
+_ALLOWED_HOSTS = [h.strip().lower() for h in (os.getenv("ALLOWED_SOURCE_HOSTS", "").split(",")) if h.strip()]
+
 _LOGIN_PAT = re.compile(r"(Confluence에\s*로그인|로그인\s*-\s*Confluence|name=[\"']os_username[\"'])", re.I)
 
 def _looks_like_login(s: str) -> bool:
     return bool(_LOGIN_PAT.search(s or ""))
 
 def _tool_name(item):
-    # dict
     if isinstance(item, dict):
         return item.get("name")
-    # (name, something) tuple/list
     if isinstance(item, (list, tuple)) and item:
         return item[0]
-    # 객체 (dataclass 등)
     return getattr(item, "name", None)
 
-# [MOD] space/langs를 선택 인자로 받기
-async def mcp_search(query: str, limit: int = 5, timeout: int = 20,
-                     space: str | None = None, langs: list[str] | None = None) -> List[Dict[str, Any]]:
+def _host_allowed(url: str) -> bool:
+    if not _ALLOWED_HOSTS:
+        return True
+    if not url:
+        return True
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except Exception:
+        return False
+    host = host.lower()
+    return any(host == h or host.endswith("." + h) for h in _ALLOWED_HOSTS)
+
+async def mcp_search(
+    query: str,
+    limit: int = 5,
+    timeout: int | None = None,
+    space: str | None = None,
+    langs: List[str] | None = None
+) -> List[Dict[str, Any]]:
     results_all: List[Dict[str, Any]] = []
 
-    # 툴 실행 순서를 결정: override가 있으면 그거만, 없으면 search → search_pages
+    # 설정 연동 기본값
+    if timeout is None:
+        timeout = int(getattr(settings, "MCP_TIMEOUT", 20))
+    if langs is None:
+        langs = list(getattr(settings, "SEARCH_LANGS", [])) or None
+
+    # 툴 실행 순서
     if TOOL_OVERRIDE in ("search", "search_pages"):
         tool_order = [TOOL_OVERRIDE]
     else:
@@ -51,14 +81,22 @@ async def mcp_search(query: str, limit: int = 5, timeout: int = 20,
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
 
+            # 서버가 제공하는 툴 목록을 보고 순서를 조정(존재하지 않는 툴은 제거)
+            try:
+                tools = await session.list_tools()
+                available = { _tool_name(t) for t in tools.tools }
+                tool_order = [t for t in tool_order if t in available] or list(available)
+            except Exception as e:
+                log.debug("tools.list failed, keep default order: %s", e)
+
             for tool_name in tool_order:
                 try:
                     payload = {"query": query, "limit": limit}
-                    if space: payload["space"] = space          # [ADD]
-                    if langs: payload["langs"] = langs          # [ADD]
+                    if space: payload["space"] = space
+                    if langs: payload["langs"] = langs
 
                     resp = await asyncio.wait_for(
-                        session.call_tool(tool_name, payload),  # [MOD]
+                        session.call_tool(tool_name, payload),
                         timeout=timeout
                     )
                 except Exception as e:
@@ -90,11 +128,16 @@ async def mcp_search(query: str, limit: int = 5, timeout: int = 20,
                     else:
                         tmp.append({"title": "", "url": "", "body": str(c)})
 
-                # 로그인 화면/빈 텍스트 제외
-                tmp = [r for r in tmp if (r.get("body") or "").strip() and not _looks_like_login(r.get("body"))]
+                # 로그인 화면·빈 텍스트 제외 + 호스트 화이트리스트 적용
+                tmp = [
+                    r for r in tmp
+                    if (r.get("body") or "").strip()
+                    and not _looks_like_login(r.get("body"))
+                    and _host_allowed(r.get("url") or "")
+                ]
                 results_all.extend(tmp)
 
-                # search에서 이미 결과가 있으면 더 안 내려가도 됨
+                # 첫 툴에서 결과가 있으면 더 내려가지 않음
                 if results_all:
                     break
 
@@ -115,16 +158,13 @@ def _normalize_item(d: Dict[str, Any]) -> Dict[str, Any]:
     url   = (d.get("url") or d.get("link") or d.get("webui") or "").strip()
     body  =  (d.get("body") or d.get("content") or d.get("excerpt") or d.get("text") or "")
 
-    # body가 dict면 value 계층을 파고 들어감
     if isinstance(body, dict):
         body = body.get("storage") or body.get("view") or body.get("plain") or body.get("value") or ""
         if isinstance(body, dict):
             body = body.get("value") or ""
     body = str(body or "")
-    # 하이라이트 태그 제거
     body = re.sub(r"@@@(?:hl|endhl)@@@", "", body)
 
-    # 메타 보존: id/space/version
     pid = str(d.get("id") or d.get("page") or "").strip()
     space = (d.get("space") or d.get("spaceKey") or "").strip()
     try:
@@ -132,7 +172,6 @@ def _normalize_item(d: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         version = 0
 
-    # URL에서 pageId 보강
     if (not pid) and url:
         m = re.search(r"[?&]pageId=(\d+)", url)
         if m:
@@ -151,7 +190,6 @@ def _dedup(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen, out = set(), []
     for r in items:
         body = (r.get("body") or "").strip()
-        # 본문이 없어도 허용. 로그인 화면만 제외
         if _looks_like_login(body):
             continue
         key = (
