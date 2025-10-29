@@ -131,6 +131,14 @@ _DOMAIN_STATS = {
     "purity": {},                                # token -> max(space_count)/total
 }
 
+# 언어 강제 공통 래퍼
+REPLY_LANG = os.getenv("REPLY_LANG", "ko").lower()
+
+def lang_wrap(s: str) -> str:
+    if REPLY_LANG.startswith("ko"):
+        return s + "\n\n항상 한국어로 답하세요. 영어로 장황하게 설명하지 마세요."
+    return s + "\n\nAlways answer in English."
+
 # 본문 내 약어(강한 도메인 신호) 감지용
 _ACRONYM_BLOB_RE = re.compile(r"\b[A-Z]{2,10}\b")
 
@@ -1187,7 +1195,7 @@ def build_openai_messages(question: str, k: int = 5) -> Tuple[List[Dict[str, Any
     context = "\n\n---\n\n".join(d.page_content for d in docs[:k_eff]) if docs else ""
 
     # 7) 시스템 프롬프트
-    system = (
+    system = lang_wrap(
         "너의 사고과정은 절대로 출력하지 말고, 다음 컨텍스트로만 간결하고 정확하게 한국어로 답하라. "
         "모르면 정확히 다음 문장을 출력하라: 주어진 정보에서 질문에 대한 정보를 찾을 수 없습니다"
     )
@@ -2522,11 +2530,10 @@ async def v1_chat(payload: dict = Body(...)):
             ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()
             ctx = ctx[:8000]
             if ctx:
-                sys = (
+                sys = lang_wrap(
                     "사고과정을 출력하지 말고, 아래 컨텍스트에 **근거한 사실만** 한국어로 답하라. "
                     "질문에 '제 N장' 또는 '제 N조'가 있으면, 컨텍스트에서 해당 장/조를 먼저 **그대로 인용(>)**하고, "
-                    "다음 줄에 한 문장 요약을 붙여라. "
-                    "컨텍스트에 없는 내용은 절대 추측하지 말고, 부족하면 '컨텍스트에 해당 정보가 없습니다'라고 말하라.\n\n"
+                    "다음 줄에 한 문장 요약을 붙여라. 컨텍스트에 없는 내용은 '컨텍스트에 해당 정보가 없습니다'라고 말하라.\n\n"
                     "컨텍스트:\n" + ctx
                 )
                 msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
@@ -2537,10 +2544,9 @@ async def v1_chat(payload: dict = Body(...)):
 
         if not use_contexts:
             # 4) 일반지식/비도메인 질문 → RAG 없이 모델 지식으로 답변 (출처 금지)
-            sys = (
+            sys = lang_wrap(
                 "너는 내부 문서를 인용하지 않고도 답할 수 있는 일반 지식 질문에 답하는 어시스턴트다. "
-                "사고과정은 출력하지 말고, 한국어로 간결하고 정확하게 답하라. "
-                "출처나 링크는 붙이지 마라."
+                "사고과정은 출력하지 말고, 한국어로 간결하고 정확하게 답하라. 출처나 링크는 붙이지 마라."
             )
             msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
             content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
