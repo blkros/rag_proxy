@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import inspect
 import unicodedata
 
-from src.utils import proxy_get, call_chat_completions
+from src.utils import proxy_get, call_chat_completions, drop_think
 from src.rag_pipeline import build_rag_chain, Document
 from src.loaders import load_docs_any
 from fastapi.middleware.cors import CORSMiddleware
@@ -129,6 +129,53 @@ _DOMAIN_STATS = {
 _BAD_TITLE_RE = re.compile(r"(회의록|스크럼|stand[-\s]?up|데일리|일일\s*회의|주간\s*회의|스프린트\s*플래닝|미팅\s*노트)", re.I)
 
 CONFL_HINT_WORDS = [w.strip() for w in os.getenv("CONFL_HINT_WORDS","컨플루언스,컨플,confluence").split(",") if w.strip()]
+
+CITATION_STRIP = os.environ.get("CITATION_STRIP", "auto").lower()
+
+_URL_RE = re.compile(r'(?im)^\s*(?:[-*•]\s*)?(?:https?://\S+)\s*$')
+_CITE_HEAD_RE = re.compile(r'(?im)^\s*(?:[-*•]\s*)?(출처|참고|참조|reference|references|sources?)\s*:?.*$')
+
+def _all_sources_are_uploads(sources):
+    return bool(sources) and all(str(s).startswith("uploads/") for s in sources)
+
+def _user_requested_citation(q: str) -> bool:
+    ql = (q or "").lower()
+    return any(x in ql for x in ["출처", "근거", "링크", "url", "레퍼런스", "reference"])
+
+def _strip_citation_block(text: str) -> str:
+    if not text:
+        return text
+    lines = text.splitlines()
+    out, skipping = [], False
+    for line in lines:
+        if _CITE_HEAD_RE.match(line):
+            skipping = True
+            continue
+        if skipping:
+            # cite 블록이 끝날 때까지 URL/불릿/빈줄은 건너뜀
+            if line.strip() == "" or _URL_RE.match(line) or line.strip().startswith(("-", "*", "•")):
+                continue
+            # 다른 정상 본문 줄이 나오면 블록 종료
+            skipping = False
+        if not skipping:
+            out.append(line)
+    # 꼬리의 단독 URL/빈줄/인용헤더 정리
+    while out and (_URL_RE.match(out[-1]) or out[-1].strip() == "" or _CITE_HEAD_RE.match(out[-1])):
+        out.pop()
+    return "\n".join(out).strip()
+
+def _maybe_strip_citations(answer: str, q: str, sources) -> str:
+    mode = CITATION_STRIP  # 'auto' | 'always' | 'off'
+    if mode == "off":
+        return answer
+    cond = (mode == "always") or (mode == "auto" and _all_sources_are_uploads(sources) and not _user_requested_citation(q))
+    if cond:
+        cleaned = _strip_citation_block(answer)
+        if cleaned != answer:
+            import logging
+            logging.getLogger("api.main").info("citation_strip: applied (mode=%s)", mode)
+        return cleaned
+    return answer
 
 # 언어 강제 공통 래퍼
 REPLY_LANG = os.getenv("REPLY_LANG", "ko").lower()
@@ -1311,7 +1358,7 @@ def v1_models():
     }
 
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 class AskPayload(BaseModel):
     """
@@ -2537,8 +2584,8 @@ async def v1_chat(payload: dict = Body(...)):
     if not CONFLUENCE_BASE_URL:
         log.warning("CONFLUENCE_BASE_URL 미설정: http(s) 링크가 아닌 /pages/... 로 생성될 수 있습니다. "
                     "출처 렌더링이 제거될 수 있으니 운영에서는 반드시 설정하세요.")
-        
-    # 마지막 user 메시지 추출
+
+    # 마지막 user 메시지
     q = ""
     for m in payload.get("messages", []):
         if m.get("role") == "user" and m.get("content"):
@@ -2548,12 +2595,13 @@ async def v1_chat(payload: dict = Body(...)):
     if not q.strip():
         raise HTTPException(400, "user message required")
 
-    # 1) 내부 /query 직접 호출
+    # 1) 내부 /query 호출
     page_id = payload.get("pageId") or payload.get("page_id")
     space   = payload.get("space") or payload.get("spaceKey")
     source  = payload.get("source")
     sources = payload.get("sources")
-    spaces = payload.get("spaces")
+    spaces  = payload.get("spaces")
+
     r = await query({
         "question": q,
         "pageId": page_id,
@@ -2561,14 +2609,16 @@ async def v1_chat(payload: dict = Body(...)):
         "source": source,
         "sources": sources,
         "spaces": spaces,
-        "sticky": False,  # 대화형 라우팅은 매질의 전환이 잦으므로 sticky 비활성
+        "sticky": False,
     })
 
-    # 2) direct_answer가 있으면 그대로 사용
+    # notes를 '가장 먼저' 확보 (이후 로직에서 참조)
+    notes = r.get("notes", {}) or {}
+
+    # 2) direct_answer 우선 사용 (예: 날짜/시간 즉답 라우팅)
     content = r.get("direct_answer")
 
-    # 3) 이 응답에서 컨텍스트를 '실제로' 쓸지 결정
-    notes = r.get("notes", {}) or {}
+    # 3) 이 응답에서 컨텍스트를 쓸지/말지 결정
     pdf_related = bool(notes.get("had_pdf_ctx")) \
                 or _is_pdf_related_response(r) \
                 or bool(_PDF_EXT_RE.search(q or "")) \
@@ -2576,15 +2626,14 @@ async def v1_chat(payload: dict = Body(...)):
 
     use_contexts = bool(r.get("contexts")) and not notes.get("low_relevance", False)
 
-    # RAG가 부적합(low_relevance)하면 stock direct_answer는 버리고 일반지식 모드로 넘어가도록 content를 비움
+    # RAG 부적합(low_relevance)이면 direct_answer는 버리고 아래로 진행
     if content and notes.get("low_relevance") and not notes.get("forced_confluence") and notes.get("routed") != "no_rag":
         content = None
 
+    # 4) content가 없으면 컨텍스트 요약 또는 일반지식 경로로 생성
     if not content:
         if use_contexts:
-            # (현행) 컨텍스트 요약 경로 유지
-            ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()
-            ctx = ctx[:8000]
+            ctx = "\n\n---\n\n".join(c.get("text", "") for c in r.get("contexts", [])[:6]).strip()[:8000]
             if ctx:
                 sys = lang_wrap(
                     "사고과정을 출력하지 말고, 아래 컨텍스트에 **근거한 사실만** 한국어로 답하라. "
@@ -2595,11 +2644,9 @@ async def v1_chat(payload: dict = Body(...)):
                 msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
                 content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
             else:
-                # 컨텍스트가 비정상적으로 비었으면 일반지식 모드로 폴백
-                use_contexts = False
+                use_contexts = False  # 컨텍스트가 비정상적으로 비면 일반지식으로 폴백
 
         if not use_contexts:
-            # 4) 일반지식/비도메인 질문 → RAG 없이 모델 지식으로 답변 (출처 금지)
             sys = lang_wrap(
                 "너는 내부 문서를 인용하지 않고도 답할 수 있는 일반 지식 질문에 답하는 어시스턴트다. "
                 "사고과정은 출력하지 말고, 한국어로 간결하고 정확하게 답하라. 출처나 링크는 붙이지 마라."
@@ -2607,19 +2654,29 @@ async def v1_chat(payload: dict = Body(...)):
             msgs = [{"role": "system", "content": sys}, {"role": "user", "content": q}]
             content = await _call_llm(messages=msgs, max_tokens=700, temperature=0.2)
 
-    # 5) PDF 관련 질의면 사용자 화면에 출처를 표시하지 않는다.
-    pdf_related = _is_pdf_related_response(r) or bool(_PDF_EXT_RE.search(q or "")) or bool(THIS_FILE_PAT.search(q or ""))
+    # 5) 최종 출력 후처리: 생각 제거 → (조건적) 인라인 출처 제거
+    if content:
+        try:
+            content = drop_think(content)
+        except Exception:
+            pass
 
+        sources_for_strip = r.get("source_urls") or []
+        # 로컬 업로드/PDF 맥락이면 'auto' 모드 트리거를 위해 업로드 형태를 주입
+        if notes.get("had_pdf_ctx") or _is_pdf_related_response(r) or THIS_FILE_PAT.search(q) or _PDF_EXT_RE.search(q):
+            sources_for_strip = ["uploads/__local__.pdf"]
+
+        content = _maybe_strip_citations(content, q, sources_for_strip)
+
+    # 6) 화면용 '출처:' 블록은 (컨텍스트 사용 & PDF 관련 아님)일 때만 추가
     if use_contexts and not pdf_related:
         allowed_list = _filter_urls_by_host(r.get("source_urls", []) or [])
         allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://", "https://"))]
         if allowed_http:
             src_block = "\n\n출처:\n" + "\n".join(f"- {u}" for u in allowed_http)
             content = (content or "") + src_block
-    # (pdf_related 인 경우엔 출처 블록을 아예 생성하지 않음)
 
-
-    # 6) OpenAI 호환 응답은 그대로 유지
+    # 7) OpenAI 호환 응답
     return {
         "object": "chat.completion",
         "model": "qwen3-30b-a3b-fp8-router",
