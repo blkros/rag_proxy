@@ -2617,20 +2617,41 @@ async def v1_chat(payload: dict = Body(...)):
     # notes를 '가장 먼저' 확보 (이후 로직에서 참조)
     notes = r.get("notes", {}) or {}
 
+    use_contexts = bool(r.get("contexts")) and not notes.get("low_relevance", False)
+
+    def _has_uploads_in_response(resp: dict) -> bool:
+        # source_urls 에 업로드/ PDF 흔적이 있으면 즉시 True
+        for u in (resp.get("source_urls") or []):
+            if _looks_blocked_source(u) or _PDF_EXT_RE.search(str(u or "")):
+                return True
+        # contexts / items 메타데이터에도 업로드/ PDF 흔적 있는지 확인
+        for coll in (resp.get("contexts") or [], resp.get("items") or []):
+            if isinstance(coll, list):
+                for it in coll:
+                    md = (it.get("metadata") or {})
+                    src = str(md.get("source") or md.get("url") or "")
+                    mime = (md.get("mimetype") or md.get("mime") or md.get("content_type") or "")
+                    if _looks_blocked_source(src) or _PDF_EXT_RE.search(src) or _is_pdf_mime(mime):
+                        return True
+        return False
+
     # 2) direct_answer 우선 사용 (예: 날짜/시간 즉답 라우팅)
     content = r.get("direct_answer")
 
     # 3) 이 응답에서 컨텍스트를 쓸지/말지 결정
     pdf_related = bool(notes.get("had_pdf_ctx")) \
-                or _is_pdf_related_response(r) \
-                or bool(_PDF_EXT_RE.search(q or "")) \
-                or bool(THIS_FILE_PAT.search(q or ""))
+        or _is_pdf_related_response(r) \
+        or bool(_PDF_EXT_RE.search(q or "")) \
+        or bool(THIS_FILE_PAT.search(q or ""))
 
-    use_contexts = bool(r.get("contexts")) and not notes.get("low_relevance", False)
+    # 안전망: 위 조건이 False라도 응답 안에 업로드/ PDF 흔적이 있으면 True로 확정
+    if not pdf_related and _has_uploads_in_response(r):
+        pdf_related = True
 
-    # RAG 부적합(low_relevance)이면 direct_answer는 버리고 아래로 진행
-    if content and notes.get("low_relevance") and not notes.get("forced_confluence") and notes.get("routed") != "no_rag":
-        content = None
+    # 디버그 로그로 실제 판정값 확인
+    log.info("v1_chat gate: pdf_related=%s had_pdf_ctx=%s use_contexts=%s src_urls=%s",
+            pdf_related, notes.get("had_pdf_ctx"), bool(r.get("contexts")) and not notes.get("low_relevance", False),
+            r.get("source_urls"))
 
     # 4) content가 없으면 컨텍스트 요약 또는 일반지식 경로로 생성
     if not content:
