@@ -88,6 +88,7 @@ STICKY_MODE   = str(getattr(settings, "STICKY_MODE", "bonus")).lower()   # filte
 STICKY_BONUS  = float(getattr(settings, "STICKY_BONUS", 0.18))           # bonus 모드에서 가산점
 PER_SOURCE_CAP = int(getattr(settings, "PER_SOURCE_CAP", 0))             # 0=off, >0이면 소스당 최대 N개
 
+SHOW_SOURCE_BLOCK = os.getenv("SHOW_SOURCE_BLOCK", "auto").lower()  # auto|never|always
 
 # ← [ADD] 앵커 추출(질문 핵심어) + sticky 유효성 검사
 _GENERIC = set("보고 보고서 리포트 정보 정리 페이지 자료 문서 요약 정책 통계 항목 사이트 url 링크 출처".split())
@@ -2149,7 +2150,8 @@ async def query(payload: dict = Body(...)):
 
     # 3-E) rerank + 의도기반 주입선택
     chosen = pick_for_injection(q, pool_hits, k_default=int(k) if isinstance(k, int) else 5)
-    had_pdf_ctx = any(_blocked_item(h) for h in chosen)
+    had_pdf_ctx = any(_blocked_item(h) for h in (chosen or [])) \
+           or any(_blocked_item(h) for h in (pool_hits or []))
     chosen = _coalesce_single_source(chosen, q)
     # 소스 한쪽 쏠림 방지 기본은 0(비활성) 운영에서 켜고 싶을 때만 설정으로 조정
     if PER_SOURCE_CAP > 0:
@@ -2669,7 +2671,7 @@ async def v1_chat(payload: dict = Body(...)):
         content = _maybe_strip_citations(content, q, sources_for_strip)
 
     # 6) 화면용 '출처:' 블록은 (컨텍스트 사용 & PDF 관련 아님)일 때만 추가
-    if use_contexts and not pdf_related:
+    if SHOW_SOURCE_BLOCK != "never" and use_contexts and not pdf_related:
         allowed_list = _filter_urls_by_host(r.get("source_urls", []) or [])
         allowed_http = [u for u in allowed_list if isinstance(u, str) and u.startswith(("http://", "https://"))]
         if allowed_http:
