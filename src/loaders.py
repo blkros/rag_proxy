@@ -530,12 +530,12 @@ def _load_pdf_auto(path: Path) -> List[Document]:
             if pi == 1:
                 first_text_lines = lines[:10]
             if lines:
-                snippet = " ".join(lines[:20])[:1200]
-                if snippet:
-                    docs.append(Document(
-                        page_content=f"[SOURCE:{path.name}] {snippet}",
-                        metadata={"source": str(path), "page": pi, "kind": "page_text"},
-                    ))
+                # 페이지 전체 텍스트를 사용 (잘림 방지)
+                full_text = " ".join(lines)
+                docs.append(Document(
+                    page_content=f"[SOURCE:{path.name}] {full_text}",
+                    metadata={"source": str(path), "page": pi, "kind": "page_text"},
+                ))
 
     # 3) 표가 거의 없으면 기본 파서와 병합
     threshold = settings.PDF_TABLE_THRESHOLD

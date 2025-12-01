@@ -1483,7 +1483,7 @@ async def ingest(
 
             # ← 여기서 전역 업데이트 & sticky (전역선언은 함수 맨 위에서 이미 했음)
             last_source = _norm_source(str(dest))
-            _set_sticky(last_source)
+            # _set_sticky(last_source)
             rebuild_domain_stats_from_index()
 
         return {
